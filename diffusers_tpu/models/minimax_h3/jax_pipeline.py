@@ -60,6 +60,25 @@ def parse_args():
   ap.add_argument("--height", type=int, default=480)
   ap.add_argument("--width", type=int, default=832)
   ap.add_argument("--steps", type=int, default=8)
+  ap.add_argument("--text-offload", action="store_true",
+                  help="Stream only the text tower from host memory, keeping "
+                       "the DiT resident (four chips: the 62 GiB tower does "
+                       "not fit beside the step's temporaries).")
+  ap.add_argument("--adaln-host", action="store_true",
+                  help="Compute every block's AdaLN modulation for every step "
+                       "on the host while loading, and never place adaln_proj "
+                       "(26 of the DiT's 66 GB) on the chips. The modulation "
+                       "depends on the timestep levels alone.")
+  ap.add_argument("--int8-weights", action="store_true",
+                  help="Weight-only int8 for the six big Linears of every "
+                       "block (per-output-channel scales, quantized on the host "
+                       "as the checkpoint is read): 66 -> 33 GB of DiT to hold "
+                       "or stream. For hosts that cannot hold the bf16 DiT.")
+  ap.add_argument("--pika-adapter", default=None,
+                  help="A Pika-H3-Flex adapter directory (fl2va/ or ref2va/ with "
+                       "manifest.json + adapter.safetensors). Merges the LoRA into "
+                       "the DiT and samples its six-step re-noising ladder; "
+                       "--steps, --shift and the step cache are ignored.")
   ap.add_argument("--seed", type=int, default=42)
   ap.add_argument("--init-latents", default="",
                   help="Load `hidden_states.npy` / `audio_hidden_states.npy` "
@@ -209,6 +228,21 @@ def sigma_schedule(steps, shift):
   return sigmas[keep]
 
 
+def _step_sigmas(args, pika=None):
+  """Video and audio sigma grids, terminal 0 included.
+
+  Pika's adapters fix their own ladder (`H3SigmaSchedule`): the knots
+  / 1000 through each modality's shift, in float64, stored float32.
+  """
+  if pika is not None:
+    q = np.asarray(pika["sampling"]["knots"], np.float64) / 1000.0
+    shift = lambda q, s: (s * q / (1 + (s - 1) * q)).astype(np.float32)
+    return (shift(q, pika["sampling"]["video_shift"]),
+            shift(q, pika["sampling"]["audio_shift"]))
+  return (sigma_schedule(args.steps, args.shift),
+          sigma_schedule(args.steps, args.audio_shift))
+
+
 def scheduler_step(sample, model_output, timestep, sigma, sigma_next):
   """One Euler step of H3's scheduler, in float32.
 
@@ -306,7 +340,8 @@ def main():
   # On 1 chip (even a 95 GiB v7x), compiling the 62 GiB text tower resident
   # in HBM needs 119 GiB of temporaries; streaming it from pinned_host takes
   # ~9 s and leaves HBM free for a resident 31 GiB FP8 DiT.
-  text_host = "pinned_host" if (args.offload or len(devices) == 1) else None
+  text_host = ("pinned_host" if (args.offload or args.text_offload
+                                or len(devices) == 1) else None)
 
   def dit_host(name):
     """Which DiT weights live on the host. All of them, or the first N blocks."""
@@ -341,7 +376,8 @@ def main():
   # on chip 0 before any weight is read.
   encoder, cfg_text = jtext.build(text_dir, dtype=dtype, abstract=True)
   jtext.load(encoder, text_dir, mesh=mesh, spec_fn=jtext.param_spec,
-             memory_kind=text_host)
+             memory_kind=text_host, int8=args.int8_weights,
+             keep_layers=TEXT_ENCODER_LAYER if args.int8_weights else None)
   print(f"text encoder loaded  {time.perf_counter() - began:.0f}s", flush=True)
 
   if args.reference:
@@ -561,7 +597,15 @@ def main():
     from diffusers.utils.torch_utils import randn_tensor as _randn
     from diffusers.modular_pipelines.minimax_h3.before_denoise import (
         patchify_video_latents as _patchify)
-    _noise = _randn(tuple(cond.shape), generator=tgen, dtype=_torch.float32)
+    if args.pika_adapter:
+      # Pika's anchor noise: its own generator (seed + 7919), drawn in
+      # frame-major [B, F, C, H, W] (`evaluation_noise_scope`).
+      _c = cond.shape
+      _noise = _torch.randn((_c[0], _c[2], _c[1], _c[3], _c[4]),
+                            generator=_torch.Generator().manual_seed(args.seed + 7919),
+                            dtype=_torch.float32).permute(0, 2, 1, 3, 4)
+    else:
+      _noise = _randn(tuple(cond.shape), generator=tgen, dtype=_torch.float32)
     _noised = r2v.NOISE_AUG * _torch.from_numpy(cond) + (1 - r2v.NOISE_AUG) * _noise
     cond_rows = _patchify(_noised, (1, 2, 2)).numpy().astype(np.float32)
     r2v_enc_s = time.perf_counter() - began_enc
@@ -644,10 +688,29 @@ def main():
       lambda: Transformer(**dit.CONFIG_FULL, dtype=dtype, rngs=nnx.Rngs(0)))
   # ref2va reads the `transformer_ref` partition: same config, 638 keys
   # by the same names, different weights.
-  dit.load_transformer(transformer, os.path.join(
-      snapshot, "transformer_ref" if args.reference else "transformer"),
+  trunk = "transformer_ref" if args.reference else "transformer"
+  lora = None
+  if args.pika_adapter:
+    lora, pika = dit.load_lora(args.pika_adapter)
+    if pika["trunk"] != trunk:
+      raise ValueError(f"adapter {pika['task']} wants {pika['trunk']}, "
+                       f"this request reads {trunk}")
+  adaln_temb = None
+  if args.adaln_host:
+    _sv, _sa = _step_sigmas(args, pika if args.pika_adapter else None)
+    _levels = [[1.0 - _sv[i], 1.0 - _sa[i]]
+               + ([max(1.0 - float(_sv[i]), 0.999)] if args.reference else [])
+               for i in range(len(_sv) - 1)]
+    adaln_temb = dit.host_temb(os.path.join(snapshot, trunk), _levels)
+  dit.load_transformer(transformer, os.path.join(snapshot, trunk),
                        mesh=mesh, memory_kind=dit_host,
-                       round_bf16=args.bf16_weights)
+                       round_bf16=args.bf16_weights, lora=lora,
+                       int8=args.int8_weights, adaln_temb=adaln_temb)
+  adaln_mods = None
+  if args.adaln_host:
+    adaln_mods = [jax.device_put(m, jax.sharding.NamedSharding(
+        mesh, jax.sharding.PartitionSpec())) for m in dit.ADALN_MODS.pop("last")]
+  del lora
   if args.fp8:
     dit.quantize_transformer_fp8(transformer, mesh=mesh)
   if host is not None:
@@ -773,6 +836,38 @@ def main():
     audio = jnp.asarray(_a.numpy())[None]
     if video.shape[1] != video_idx.shape[0] - n_ref:
       raise ValueError(f"torch noise {video.shape} does not match {video_idx.shape[0] - n_ref} rows")
+  pika_eps = None
+  if args.pika_adapter:
+    # Pika's draws (`sample_evaluation_ladder`), on the host: video then
+    # audio from seed, in its external layouts ([B, F, 24, H, W] and
+    # [B, T, 64]); the re-noising eps from seed + 1, video then audio per
+    # step. Same generators on CPU means a reference run on any backend
+    # can see exactly these numbers.
+    from diffusers.modular_pipelines.minimax_h3.before_denoise import (
+        patchify_video_latents as _patchify3)
+    _vs = (1, latent_frames, dit.CONFIG_FULL["in_channels"], latent_h, latent_w)
+    _T = audio_idx.shape[0] // 2
+    _ach = dit.CONFIG_FULL["audio_in_channels"]
+
+    def _vrows(x):
+      return jnp.asarray(_patchify3(x.permute(0, 2, 1, 3, 4), (1, 2, 2))
+                         .reshape(1, -1, 4 * _vs[2]).numpy())
+
+    def _arows(x):
+      return jnp.asarray(x.view(1, _T, 2, _ach).permute(0, 2, 1, 3)
+                         .reshape(1, 2 * _T, _ach).numpy())
+
+    _g = _torch.Generator().manual_seed(args.seed)
+    video = _vrows(_torch.randn(_vs, generator=_g, dtype=_torch.float32))
+    audio = _arows(_torch.randn((1, _T, 2 * _ach), generator=_g,
+                                dtype=_torch.float32))
+    _g = _torch.Generator().manual_seed(args.seed + 1)
+    pika_eps = []
+    for _ in range(len(pika["sampling"]["knots"]) - 2):
+      _ev = _vrows(_torch.randn(_vs, generator=_g, dtype=_torch.float32))
+      _ea = _arows(_torch.randn((1, _T, 2 * _ach), generator=_g,
+                                dtype=_torch.float32))
+      pika_eps.append((_ev, _ea))
   if n_ref:
     # ref2va: the reference's rows lead the video block, held at t = 0.999.
     video = jnp.concatenate([jnp.asarray(cond_rows)[None], video], axis=1)
@@ -789,9 +884,10 @@ def main():
   # Video and audio rows follow different schedules. The reference builds a
   # per-row timestep (`build_row_timesteps`) and hands the transformer the
   # distinct values plus a per-row index.
-  sigmas = sigma_schedule(args.steps, args.shift)
+  sigmas, a_sigmas = _step_sigmas(args, pika if args.pika_adapter else None)
+  if args.pika_adapter:
+    args.cache_threshold = 0.0
   timesteps = 1.0 - sigmas[:-1]
-  a_sigmas = sigma_schedule(args.steps, args.audio_shift)
   a_timesteps = 1.0 - a_sigmas[:-1]
   if len(a_timesteps) != len(timesteps):
     raise ValueError(
@@ -811,8 +907,20 @@ def main():
       lv.append(max(float(timesteps[i]), r2v.NOISE_AUG))
     return jnp.asarray(lv, jnp.float32)
 
+  def pika_step(x, v, sigma, sigma_next, eps):
+    """Re-noising step: x0 = x + sigma v, then fresh noise at sigma_next."""
+    x0 = x.astype(jnp.float32) + float(sigma) * v.astype(jnp.float32)
+    if eps is None:
+      return x0
+    return (1.0 - float(sigma_next)) * x0 + float(sigma_next) * eps
+
   def video_step(video, dv, i):
     """Euler step on the generated rows only; reference rows are held."""
+    if pika_eps is not None:
+      eps = pika_eps[i][0] if i < len(pika_eps) else None
+      gen = pika_step(video[:, n_ref:], dv[:, n_ref:], sigmas[i],
+                      sigmas[i + 1], eps)
+      return jnp.concatenate([video[:, :n_ref], gen], axis=1) if n_ref else gen
     if not n_ref:
       return scheduler_step(video, dv, float(timesteps[i]), float(sigmas[i]),
                             float(sigmas[i + 1]))
@@ -841,13 +949,13 @@ def main():
 
   def make_call(attn):
     @functools.partial(jax.jit, static_argnums=())
-    def call(state, video, audio, text, t):
+    def call(state, video, audio, text, t, mods=None):
       if host is not None:
         state = jax.tree.map(jax.device_put, state, state_dev)
       model = nnx.merge(graphdef, state)
       return model(video, audio, text, t, row_step, token_tags, position_ids,
                    video_idx, audio_idx, text_idx, sdpa=attn,
-                   segments=segments)
+                   segments=segments, adaln_mods=mods)
     return call
 
   call = make_call(sdpa)
@@ -864,7 +972,8 @@ def main():
     tt0 = step_levels(0)
     v0, a0 = video, audio
     for _ in range(2):
-      dv, da = call(state, v0, a0, prompt_embeds, tt0)
+      dv, da = call(state, v0, a0, prompt_embeds, tt0,
+                    None if adaln_mods is None else adaln_mods[0])
       v0 = video_step(v0, dv, 0)
       a0 = scheduler_step(a0, da, float(timesteps[0]), float(sigmas[0]),
                           float(sigmas[1]))
@@ -873,7 +982,9 @@ def main():
       # Use the *stepped* latents: they come out of a jitted step with a
       # different sharding than the initial ones, which is what the
       # request's sparse calls see (otherwise they recompile mid-request).
-      jax.block_until_ready(call_sparse(state, v0, a0, prompt_embeds, tt0))
+      jax.block_until_ready(call_sparse(
+          state, v0, a0, prompt_embeds, tt0,
+          None if adaln_mods is None else adaln_mods[0]))
     print(f"  warmup {time.perf_counter() - warm:.1f}s", flush=True)
     del v0, a0, dv, da
 
@@ -965,12 +1076,17 @@ def main():
       else:
         fn = (call_sparse if call_sparse is not None
               and i >= args.sparse_dense_steps else call)
-        dv, da = fn(state, video, audio, prompt_embeds, tt)
+        dv, da = fn(state, video, audio, prompt_embeds, tt,
+                    None if adaln_mods is None else adaln_mods[i])
         if cache is not None:
           cache["last_out"] = (dv, da)
       video = video_step(video, dv, i)
-      audio = scheduler_step(audio, da, float(a_timesteps[i]),
-                             float(a_sigmas[i]), float(a_sigmas[i + 1]))
+      if pika_eps is not None:
+        audio = pika_step(audio, da, a_sigmas[i], a_sigmas[i + 1],
+                          pika_eps[i][1] if i < len(pika_eps) else None)
+      else:
+        audio = scheduler_step(audio, da, float(a_timesteps[i]),
+                               float(a_sigmas[i]), float(a_sigmas[i + 1]))
       jax.block_until_ready(video)
       if _prof and i == _prof_step:
         jax.profiler.stop_trace()
@@ -1243,11 +1359,24 @@ def main():
         1, -1, 1, 1, 1)
     pixel_std = jnp.asarray((0.229, 0.224, 0.225), jnp.float32).reshape(
         1, -1, 1, 1, 1)
-    frames = jnp.clip(frames.astype(jnp.float32) * pixel_std + pixel_mean,
-                      0.0, 1.0)
-    # uint8, matching the torch pipeline's output (and 4x smaller than float32).
-    frames = np.asarray(
-        jnp.round(jnp.transpose(frames[0], (1, 2, 3, 0)) * 255.0), np.uint8)
+    if len(devices) == 1:
+      # One small chip (v5e: 16 GB) cannot hold a float32 copy of the clip
+      # beside the decoder; finish on the host, a few frames at a time.
+      _f = np.asarray(frames)[0]
+      _m = np.asarray(pixel_mean).reshape(-1, 1, 1, 1)
+      _sd = np.asarray(pixel_std).reshape(-1, 1, 1, 1)
+      out_frames = np.empty(_f.shape[1:] + (_f.shape[0],), np.uint8)
+      for _a in range(0, _f.shape[1], 16):
+        _c = np.clip(_f[:, _a:_a + 16].astype(np.float32) * _sd + _m, 0.0, 1.0)
+        out_frames[_a:_a + 16] = np.round(
+            np.transpose(_c, (1, 2, 3, 0)) * 255.0).astype(np.uint8)
+      frames = out_frames
+    else:
+      frames = jnp.clip(frames.astype(jnp.float32) * pixel_std + pixel_mean,
+                        0.0, 1.0)
+      # uint8, matching the torch pipeline's output (and 4x smaller than float32).
+      frames = np.asarray(
+          jnp.round(jnp.transpose(frames[0], (1, 2, 3, 0)) * 255.0), np.uint8)
 
     os.makedirs(args.out, exist_ok=True)
     path = os.path.join(args.out, f"{args.tag}_frames.npy")

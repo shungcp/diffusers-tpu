@@ -85,7 +85,7 @@ def param_spec(keys, ndim):
 
 
 def load(model, text_encoder_dir, mesh=None, spec_fn=param_spec, place=None,
-         memory_kind=None):
+         memory_kind=None, int8=False, keep_layers=None):
   """Read the language half of H3's checkpoint into the nnx module.
 
   64 layers at 5120 wide is 24 GiB in bfloat16, which does not fit a
@@ -103,7 +103,10 @@ def load(model, text_encoder_dir, mesh=None, spec_fn=param_spec, place=None,
 
   if (os.environ.get("DT_FAST_LOAD", "1") == "1" and mesh is not None
       and spec_fn is not None and place is None):
-    return _load_parallel(model, shards, mesh, spec_fn, memory_kind)
+    return _load_parallel(model, shards, mesh, spec_fn, memory_kind,
+                          int8=int8, keep_layers=keep_layers)
+  if int8 or keep_layers:
+    raise NotImplementedError("int8 / keep_layers need the parallel loader")
 
   loaded = 0
   for shard in shards:
@@ -142,7 +145,8 @@ def load(model, text_encoder_dir, mesh=None, spec_fn=param_spec, place=None,
   return loaded
 
 
-def _load_parallel(model, shards, mesh, spec_fn, memory_kind):
+def _load_parallel(model, shards, mesh, spec_fn, memory_kind, int8=False,
+                   keep_layers=None):
   """Parallel version of `load`: one thread per shard, each tensor placed
   directly onto its sharding after the host read.
 
@@ -165,6 +169,11 @@ def _load_parallel(model, shards, mesh, spec_fn, memory_kind):
     want = param.value if hasattr(param, "value") else param[...]
     return param, want
 
+  if keep_layers is not None:
+    # H3 conditions on `hidden_states[50]`: layers 50..63 never run, and
+    # dropping them saves 14 of the tower's 64 layers of weight.
+    model.layers = nnx.List(list(model.layers)[:keep_layers])
+
   def one_shard(shard):
     out = []
     with safe_open(shard, framework="pt") as reader:
@@ -172,8 +181,21 @@ def _load_parallel(model, shards, mesh, spec_fn, memory_kind):
         if not key.startswith(PREFIX):
           continue
         name = key[len(PREFIX):]
+        parts = name.split(".")
+        if (keep_layers is not None and parts[0] == "layers"
+            and int(parts[1]) >= keep_layers):
+          continue
         _, want = target(name)
         t = reader.get_tensor(key)
+        if int8 and parts[0] == "layers" and name.endswith("_proj.weight"):
+          from .jax_dit import _quantize_int8
+          q, sc = _quantize_int8(t)
+          sh = NamedSharding(mesh, spec_fn(parts, 2), memory_kind=memory_kind)
+          sc_sh = NamedSharding(mesh, jax.sharding.PartitionSpec(),
+                                memory_kind=memory_kind)
+          out.append((name, (jax.device_put(q.numpy(), sh),
+                             jax.device_put(sc.numpy(), sc_sh))))
+          continue
         arr = (t.view(torch.int16).numpy().view(ml_dtypes.bfloat16)
                if t.dtype == torch.bfloat16 else t.numpy())
         arr = arr.astype(np.dtype(want.dtype), copy=False)
@@ -186,15 +208,26 @@ def _load_parallel(model, shards, mesh, spec_fn, memory_kind):
   with cf.ThreadPoolExecutor(max_workers=len(shards)) as ex:
     results = list(ex.map(one_shard, shards))
   loaded = 0
+  n_scales = 0
   for out in results:
     for name, value in out:
       param, _ = target(name)
+      if isinstance(value, tuple):
+        node = model
+        for part in name.split(".")[:-1]:
+          node = node[int(part)] if part.isdigit() else getattr(node, part)
+        node.weight = nnx.Param(value[0])
+        node.weight_scale = nnx.data(nnx.Param(value[1]))
+        loaded += 1
+        n_scales += 1
+        continue
       if hasattr(param, "value"):
         param.value = value
       else:
         param[...] = value
       loaded += 1
   expected = len(jax.tree.leaves(nnx.state(model, nnx.Param)))
+  expected -= n_scales
   if loaded != expected:
     raise ValueError(f"loaded {loaded} tensors into {expected} parameters")
   return loaded

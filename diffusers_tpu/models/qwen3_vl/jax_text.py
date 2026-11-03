@@ -77,9 +77,15 @@ def _build_modules():
 
     def __init__(self, in_f, out_f, *, dtype, rngs=None):
       self.weight = nnx.Param(jnp.zeros((out_f, in_f), dtype))
+      self.weight_scale = nnx.data(None)
 
     def __call__(self, x):
-      return x @ self.weight[...].T
+      w = self.weight[...]
+      if w.dtype == jnp.int8 and self.weight_scale is not None:
+        # Weight-only int8 (MiniMax-H3 `jax_text.load(int8=True)`).
+        y = x @ w.astype(x.dtype).T
+        return (y.astype(jnp.float32) * self.weight_scale[...]).astype(x.dtype)
+      return x @ w.T
 
   def rotate_half(x):
     half = x.shape[-1] // 2

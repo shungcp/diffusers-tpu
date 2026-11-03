@@ -200,6 +200,13 @@ def _build_modules():
 
     def __call__(self, x):
       w = self.weight[...]
+      if w.dtype == jnp.int8 and self.weight_scale is not None:
+        # Weight-only int8 (`load_transformer(int8=True)`): half the bytes
+        # to hold and to stream from host; the matmul stays bfloat16.
+        y = jax.lax.dot_general(x, w.astype(x.dtype),
+                                (((x.ndim - 1,), (1,)), ((), ())))
+        y = (y.astype(jnp.float32) * self.weight_scale[...]).astype(x.dtype)
+        return y + self.bias[...] if self.bias is not None else y
       if w.dtype == jnp.float8_e4m3fn and self.weight_scale is not None:
         f8_max = jnp.float32(448.0)
         x32 = x.astype(jnp.float32)
@@ -373,9 +380,15 @@ def _build_modules():
                                         dtype=dtype, rngs=rngs)
 
     def __call__(self, x, temb, adaln_indices, rope, sdpa=None,
-                 segments=None, true_len=None):
-      shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-          self.adaln_proj(temb))
+                 segments=None, true_len=None, mod=None):
+      if mod is None:
+        mods = self.adaln_proj(temb)
+      else:
+        # Precomputed on the host (`load_transformer(adaln_temb=)`): the
+        # modulation depends on the timestep levels alone.
+        mods = jnp.split(mod.reshape(-1, 6 * self.adaln_proj.hidden_size), 6,
+                         axis=-1)
+      shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mods
 
       def apply(h, combine):
         """Modulate by run rather than by row.
@@ -567,7 +580,7 @@ def _build_modules():
     def __call__(self, video, audio, text, timestep, timestep_indices,
                  token_tags, position_ids, video_indices, audio_indices,
                  text_indices, sdpa=None, segments=None, seq_len=None,
-                 text_len=None):
+                 text_len=None, adaln_mods=None):
       """`seq_len` / `text_len` (optional, traced scalars): true lengths of
       the packed sequence / text. When given, inputs use bucketed shapes and
       attention masks by the true length (`jax_server`)."""
@@ -618,7 +631,8 @@ def _build_modules():
         if _barrier and _i > 0:
           x, temb = jax.lax.optimization_barrier((x, temb))
         x = block(x, temb, adaln_indices, rope, sdpa, segments,
-                  seq if seq_len is None else seq_len)
+                  seq if seq_len is None else seq_len,
+                  None if adaln_mods is None else adaln_mods[_i])
         if os.environ.get("DT_DUMP_BLOCKS") and _i in (0, 4, 9, 19, 29, 39,
                                                        49):
           jax.debug.callback(functools.partial(_blk_save, f"b{_i:02d}"), x)
@@ -834,8 +848,129 @@ def build_sharded(mesh, dtype=None, config=None):
   return model
 
 
+def load_lora(adapter_dir):
+  """A PEFT LoRA adapter (e.g. Pika-H3-Flex) as `{checkpoint key: (A, B, scale)}`.
+
+  `adapter_dir` holds `adapter.safetensors` and a `manifest.json` with
+  `rank` and `alpha`. Keys are the checkpoint's own (`...to_q.weight`),
+  so the merge happens before `_RENAMES`, on the tensor as read.
+  """
+  import json
+  import os
+
+  from safetensors.torch import load_file
+
+  with open(os.path.join(adapter_dir, "manifest.json")) as f:
+    manifest = json.load(f)
+  scale = float(manifest["alpha"]) / float(manifest["rank"])
+  state = load_file(os.path.join(adapter_dir, "adapter.safetensors"))
+  out = {}
+  for key, a in state.items():
+    if ".lora_A." not in key:
+      continue
+    base = key.split(".lora_A.")[0]
+    b = state[key.replace(".lora_A.", ".lora_B.")]
+    out[base + ".weight"] = (a, b, scale)
+  return out, manifest
+
+
+def _merge_lora(key, t, lora):
+  """`W + scale * B @ A` in float32, back in `W`'s dtype.
+
+  The reference keeps the adapter unmerged and in bfloat16
+  (`apply_lora(master_dtype=bfloat16)`); merging in float32 and rounding
+  once is the closer of the two to the trained function.
+  """
+  import torch
+
+  if not lora or key not in lora:
+    return t
+  a, b, scale = lora[key]
+  with torch.no_grad():
+    return (t.float() + scale * (b.float() @ a.float())).to(t.dtype)
+
+
+_INT8_TARGETS = ("attn.to_q.weight", "attn.to_k.weight", "attn.to_v.weight",
+                 "attn.to_out.0.weight", "ff.net.0.proj.weight",
+                 "ff.net.2.weight")
+
+
+def _quantize_int8(t, rows=1024):
+  """Per-output-channel symmetric int8 of an `(out, in)` weight, by slabs."""
+  import torch
+
+  q = torch.empty(t.shape, dtype=torch.int8)
+  scale = torch.empty((t.shape[0],), dtype=torch.float32)
+  for r in range(0, t.shape[0], rows):
+    w = t[r:r + rows].float()
+    sc = w.abs().amax(dim=1).clamp_min(1e-12) / 127.0
+    q[r:r + rows] = torch.round(w / sc[:, None]).clamp(-127, 127).to(torch.int8)
+    scale[r:r + rows] = sc
+  return q, scale
+
+
+# `load_transformer(adaln_temb=)` leaves its `(steps, blocks, levels, out)`
+# modulation here rather than on the nnx module, which holds jax arrays only.
+ADALN_MODS = {}
+
+
+def host_temb(transformer_dir, levels_per_step, freq_dim=256):
+  """`time_embedder(timestep_embedding(levels))` on the host, per step.
+
+  Float64 through the tiny float32 MLP; returns one `(levels, 2688)`
+  float32 array per step. This is what lets `load_transformer` turn the
+  26 GB of `adaln_proj` weights into a few hundred MB of modulation.
+  """
+  import json
+  import os
+
+  import numpy as np
+  from safetensors import safe_open
+
+  index = json.load(open(os.path.join(
+      transformer_dir, "diffusion_pytorch_model.safetensors.index.json")))
+  w = {}
+  for k in ("linear_1.weight", "linear_1.bias", "linear_2.weight",
+            "linear_2.bias"):
+    key = "time_embedder." + k
+    with safe_open(os.path.join(transformer_dir, index["weight_map"][key]),
+                   framework="np") as r:
+      w[k] = r.get_tensor(key).astype(np.float64)
+  half = freq_dim // 2
+  freqs = np.exp(-np.log(10000.0) * np.arange(half, dtype=np.float32) / half)
+  out = []
+  for levels in levels_per_step:
+    e = np.asarray(levels, np.float32)[:, None] * freqs[None, :]
+    e = np.concatenate([np.cos(e), np.sin(e)], -1).astype(np.float64)
+    h = e @ w["linear_1.weight"].T + w["linear_1.bias"]
+    h = h / (1 + np.exp(-h))
+    out.append((h @ w["linear_2.weight"].T + w["linear_2.bias"]).astype(np.float32))
+  return out
+
+
+def _adaln_mods(t, temb_steps):
+  """`adaln_proj.linear(silu(temb))` without the bias, every step: `(S, L, out)`.
+
+  As the module does it: silu in float32, input rounded to the weight's
+  bfloat16, product rounded to bfloat16 (the bias is added later, and
+  rounded again, in `load_transformer`).
+  """
+  import ml_dtypes
+  import numpy as np
+  import torch
+
+  w = t.float()
+  res = []
+  for temb in temb_steps:
+    a = temb / (1 + np.exp(-temb))
+    a = torch.from_numpy(a.astype(ml_dtypes.bfloat16).astype(np.float32))
+    res.append((a @ w.T).numpy().astype(ml_dtypes.bfloat16).astype(np.float32))
+  return np.stack(res)
+
+
 def load_transformer(model, transformer_dir, mesh=None, verbose=False,
-                     place=None, memory_kind=None, round_bf16=False):
+                     place=None, memory_kind=None, round_bf16=False,
+                     lora=None, int8=False, adaln_temb=None):
   """Read the checkpoint into the nnx module, sharding as it goes.
 
   Every tensor must land and every parameter must be filled: a name that
@@ -871,7 +1006,10 @@ def load_transformer(model, transformer_dir, mesh=None, verbose=False,
   if (os.environ.get("DT_FAST_LOAD", "1") == "1" and mesh is not None
       and place is None and not round_bf16):
     return _load_transformer_parallel(model, shards, mesh, memory_kind,
-                                      resolve, verbose)
+                                      resolve, verbose, lora=lora, int8=int8,
+                                      adaln_temb=adaln_temb)
+  if lora or int8 or adaln_temb is not None:
+    raise NotImplementedError("lora= needs the parallel loader (DT_FAST_LOAD=1, a mesh)")
 
   loaded = 0
   for shard in shards:
@@ -917,7 +1055,8 @@ def load_transformer(model, transformer_dir, mesh=None, verbose=False,
 
 
 def _load_transformer_parallel(model, shards, mesh, memory_kind, resolve,
-                               verbose):
+                               verbose, lora=None, int8=False,
+                               adaln_temb=None):
   """Parallel `load_transformer`: one thread per safetensors file.
 
   Tensors are read as host numpy (bf16 via a zero-copy ml_dtypes view) and
@@ -949,35 +1088,98 @@ def _load_transformer_parallel(model, shards, mesh, memory_kind, resolve,
         for old, new in _RENAMES:
           name = name.replace(old, new)
         _, want = target(name)
-        t = reader.get_tensor(key)
+        t = _merge_lora(key, reader.get_tensor(key), lora)
+        if key in (lora or {}):
+          merged.append(key)
+        kind = memory_kind(name) if callable(memory_kind) else memory_kind
+        if adaln_temb is not None and ".adaln_proj.linear." in key:
+          b = int(key.split(".")[1])
+          if key.endswith(".weight"):
+            out.append((name, ("adaln_w", b, _adaln_mods(t, adaln_temb))))
+          else:
+            out.append((name, ("adaln_b", b, t.float().numpy())))
+          continue
+        if int8 and key.startswith("transformer_blocks.") and key.endswith(
+            _INT8_TARGETS):
+          q, sc = _quantize_int8(t)
+          value = jax.device_put(
+              q.numpy().reshape(want.shape),
+              jax.sharding.NamedSharding(mesh, _spec_for(name), memory_kind=kind))
+          s_name = name[:-len("weight")] + "weight_scale"
+          scale = jax.device_put(
+              sc.numpy(),
+              jax.sharding.NamedSharding(mesh, _spec_for(s_name), memory_kind=kind))
+          out.append((name, (value, scale)))
+          continue
         if t.dtype == torch.bfloat16:
           arr = t.view(torch.int16).numpy().view(ml_dtypes.bfloat16)
         else:
           arr = t.numpy()
         arr = arr.astype(np.dtype(want.dtype), copy=False).reshape(want.shape)
-        kind = memory_kind(name) if callable(memory_kind) else memory_kind
         value = jax.device_put(
             arr, jax.sharding.NamedSharding(mesh, _spec_for(name),
                                             memory_kind=kind))
         out.append((name, value))
     return out
 
-  with cf.ThreadPoolExecutor(max_workers=len(shards)) as ex:
+  merged = []
+  # A small host (v5e-1: 47 GB) cannot hold fourteen shards' worth of
+  # float32 temporaries at once; DT_LOAD_THREADS bounds them.
+  workers = int(os.environ.get("DT_LOAD_THREADS", len(shards)))
+  with cf.ThreadPoolExecutor(max_workers=workers) as ex:
     results = list(ex.map(one_shard, shards))
+  if lora and len(merged) != len(lora):
+    raise ValueError(f"LoRA merged into {len(merged)} of {len(lora)} modules")
+  if lora:
+    print(f"  [lora] merged {len(merged)} modules", flush=True)
   loaded = 0
+  n_scales = 0
+  adaln_w, adaln_b = {}, {}
   for out in results:
     for name, value in out:
       param, _ = target(name)
+      if isinstance(value, tuple) and value[0] in ("adaln_w", "adaln_b"):
+        (adaln_w if value[0] == "adaln_w" else adaln_b)[value[1]] = value[2]
+        # A placeholder keeps the module whole without 26 GB behind it.
+        ph = jax.device_put(np.zeros((1,) * len(param.value.shape),
+                                     np.dtype(param.value.dtype)),
+                            jax.sharding.NamedSharding(
+                                mesh, jax.sharding.PartitionSpec()))
+        param.value = ph
+        loaded += 1
+        continue
+      if isinstance(value, tuple):
+        value, scale = value
+        node = model
+        for part in name.split(".")[:-1]:
+          node = node[int(part)] if part.isdigit() else getattr(node, part)
+        node.weight = nnx.Param(value)
+        node.weight_scale = nnx.data(nnx.Param(scale))
+        loaded += 1
+        n_scales += 1
+        continue
       if hasattr(param, "value"):
         param.value = value
       else:
         param[...] = value
       loaded += 1
   expected = len(jax.tree.leaves(nnx.state(model, nnx.Param)))
+  expected -= n_scales
   if loaded != expected:
     raise ValueError(f"loaded {loaded} tensors into {expected} parameters")
+  if adaln_temb is not None:
+    import ml_dtypes
+    blocks = sorted(adaln_w)
+    # (S, blocks, L, out): bias added and rounded the way `y + bias` is.
+    mods = np.stack([(adaln_w[b] + adaln_b[b].astype(ml_dtypes.bfloat16)
+                      .astype(np.float32)[None, None]) for b in blocks], 1)
+    ADALN_MODS["last"] = mods.astype(ml_dtypes.bfloat16)
+    print(f"  [adaln-host] {len(blocks)} blocks x {mods.shape[0]} steps -> "
+          f"{ADALN_MODS['last'].nbytes / 2**20:.0f} MiB of modulation",
+          flush=True)
   if verbose:
-    print(f"loaded {loaded} tensors from {len(shards)} shards (parallel)")
+    print(f"loaded {loaded} tensors from {len(shards)} shards (parallel)"
+          + (f", {n_scales} int8" if n_scales else ""))
   return model
 
 
