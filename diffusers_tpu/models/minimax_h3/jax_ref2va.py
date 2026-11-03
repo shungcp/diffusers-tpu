@@ -210,16 +210,34 @@ def encode_text_with_vision(encoder, vision_model, p, positions, cfg_text,
   x = text_inputs(p, positions, cfg_text, dtype)
   if not jit:
     return text_forward(encoder, vision_model, x, stop_at_layer)
-  # Built once: `nnx.jit` returns a fresh callable with a fresh cache on
-  # every call, so building it here each time would recompile each time.
-  global _TEXT_JIT
-  if _TEXT_JIT is None:
+  # Split once and call a plain `jax.jit` on the states: `nnx.jit` walks both
+  # module graphs on every call, 0.3-0.4 s of host time around 0.67 s of
+  # device time. `release_text_jit()` drops the cached states so the towers'
+  # HBM can be freed.
+  key = (id(encoder), id(vision_model))
+  if key not in _TEXT_SPLIT:
+    import functools
+    import jax
     from flax import nnx
-    _TEXT_JIT = nnx.jit(text_forward, static_argnames=("stop_at_layer",))
-  return _TEXT_JIT(encoder, vision_model, x, stop_at_layer=stop_at_layer)
+    ge, se = nnx.split(encoder)
+    gv, sv = nnx.split(vision_model)
+
+    @functools.partial(jax.jit, static_argnames=("stop_at_layer",))
+    def _fwd(se_, sv_, x_, stop_at_layer):
+      return text_forward(nnx.merge(ge, se_), nnx.merge(gv, sv_), x_,
+                          stop_at_layer)
+
+    _TEXT_SPLIT[key] = (_fwd, se, sv)
+  fwd, se, sv = _TEXT_SPLIT[key]
+  return fwd(se, sv, x, stop_at_layer=stop_at_layer)
 
 
-_TEXT_JIT = None
+def release_text_jit():
+  """Forget the split text/vision states held by `encode_text_with_vision`."""
+  _TEXT_SPLIT.clear()
+
+
+_TEXT_SPLIT = {}
 _ENC_JIT = None
 
 

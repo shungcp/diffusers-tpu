@@ -508,6 +508,8 @@ def main():
   # The 62 GiB tower (7.75 GiB per chip on 8 chips) must be freed before
   # compiling the DiT step or compilation OOMs. Dropping the name is not
   # enough while a jitted closure holds it, hence `clear_caches`.
+  if args.reference:
+    r2v.release_text_jit()
   del encoder
   jax.clear_caches()
   prompt_embeds = jax.block_until_ready(prompt_embeds)

@@ -91,10 +91,10 @@ A resident server (`--runs`) keeps the model and decoder on the chips; these are
 |---|---|
 | text-to-video / 文生视频 | **10.6 s** |
 | reference-to-video, same reference image / 参考图生视频,参考图不变 | **13.5 s** |
-| reference-to-video, a new reference image every request / 参考图生视频,每次换新参考图 | **15.1 s** |
+| reference-to-video, a new reference image every request / 参考图生视频,每次换新参考图 | **14.9 s** |
 
-Reference-to-video uses `--sparse-window 16 --sparse-dense-steps 2`; a new image adds the text/vision encode (1.1 s) and the reference encode (0.5 s); preparing the image on the host takes another 0.2 s.
-参考图生视频使用 `--sparse-window 16 --sparse-dense-steps 2`;换新图时要加上文本/视觉编码(1.1 秒)和参考图编码(0.5 秒);在主机上准备图片另需 0.2 秒。
+Reference-to-video uses `--sparse-window 16 --sparse-dense-steps 2`; a new image adds the text/vision encode (0.9 s) and the reference encode (0.5 s); preparing the image on the host takes another 0.2 s.
+参考图生视频使用 `--sparse-window 16 --sparse-dense-steps 2`;换新图时要加上文本/视觉编码(0.9 秒)和参考图编码(0.5 秒);在主机上准备图片另需 0.2 秒。
 
 ### Fewer chips / 更少的 chip
 
