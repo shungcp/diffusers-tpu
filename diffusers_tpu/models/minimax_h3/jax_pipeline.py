@@ -1299,6 +1299,7 @@ def main():
     t_dec = t_blend = 0.0
     per_call = []
     pieces, carry = [], None
+    host_pieces = mesh.devices.size == 1
     # DT_DECODE_CHUNK_BATCH=K stacks K temporal chunks along the batch axis per
     # decode call. Chunks are independent (cross-fading happens afterwards).
     # 1 chip decodes one chunk at a time to save HBM; multi-chip picks K
@@ -1333,8 +1334,10 @@ def main():
         f = j * chunk_frames
         piece = out[:, :, f:f + chunk_frames][:, :, pre_pad:]
         if j == 0:
-          pieces.append(piece if carry is None
-                        else blend(carry, piece, frame_overlap))
+          done = piece if carry is None else blend(carry, piece, frame_overlap)
+          # One small chip cannot hold the whole decoded clip (362 frames at
+          # 480p: 6.3 GB on a 16 GB v5e); move each finished piece to host.
+          pieces.append(np.asarray(done) if host_pieces else done)
         else:
           carry = piece
       if dt_timing:
@@ -1343,8 +1346,9 @@ def main():
           pieces[-1] = jax.block_until_ready(pieces[-1])
         t_blend += time.perf_counter() - _t1
     if carry is not None:
-      pieces.append(carry)
-    frames = jnp.concatenate(pieces, axis=2)
+      pieces.append(np.asarray(carry) if host_pieces else carry)
+    frames = (np.concatenate(pieces, axis=2) if host_pieces
+              else jnp.concatenate(pieces, axis=2))
     if pad_tokens:
       intra_tail = clip_length % ratio
       before = z.shape[2] - pad_tokens
@@ -1352,7 +1356,8 @@ def main():
           intra_tail if intra_tail and (before + k) % tokens_chunk == 0 else ratio
           for k in range(pad_tokens))
       frames = frames[:, :, :-pad_frames]
-    frames = jax.block_until_ready(frames)
+    if not host_pieces:
+      frames = jax.block_until_ready(frames)
     del pieces, z
     decode_wall = time.perf_counter() - began_decode
     if dt_timing:

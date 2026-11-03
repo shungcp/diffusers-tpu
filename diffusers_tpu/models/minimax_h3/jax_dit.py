@@ -200,6 +200,17 @@ def _build_modules():
 
     def __call__(self, x):
       w = self.weight[...]
+      if w.dtype == jnp.int8 and self.weight_scale is not None and INT8_ACT:
+        # W8A8 (DT_INT8_ACT=1): per-row int8 activations into the int8 MXU
+        # path (v5e: twice the bf16 rate), int32 accumulation.
+        x32 = x.astype(jnp.float32)
+        xs = jnp.maximum(jnp.max(jnp.abs(x32), axis=-1, keepdims=True),
+                         jnp.float32(1e-12)) / 127.0
+        xq = jnp.clip(jnp.round(x32 / xs), -127, 127).astype(jnp.int8)
+        acc = jax.lax.dot_general(xq, w, (((x.ndim - 1,), (1,)), ((), ())),
+                                  preferred_element_type=jnp.int32)
+        y = (acc.astype(jnp.float32) * xs * self.weight_scale[...]).astype(x.dtype)
+        return y + self.bias[...] if self.bias is not None else y
       if w.dtype == jnp.int8 and self.weight_scale is not None:
         # Weight-only int8 (`load_transformer(int8=True)`): half the bytes
         # to hold and to stream from host; the matmul stays bfloat16.
@@ -908,6 +919,8 @@ def _quantize_int8(t, rows=1024):
     scale[r:r + rows] = sc
   return q, scale
 
+
+INT8_ACT = os.environ.get("DT_INT8_ACT", "0") == "1"
 
 # `load_transformer(adaln_temb=)` leaves its `(steps, blocks, levels, out)`
 # modulation here rather than on the nnx module, which holds jax arrays only.

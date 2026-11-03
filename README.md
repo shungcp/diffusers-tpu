@@ -99,6 +99,9 @@ Reference-to-video uses `--sparse-window 16 --sparse-dense-steps 2`; a new image
 Without the sparse attention, reference-to-video takes 14.7 s with the same image and 16.1 s with a new one.
 不用稀疏注意力时,参考图生视频在参考图不变时为 14.7 秒,每次换新图时为 16.1 秒。
 
+The same sparse attention brings text-to-video to 9.4 s.
+文生视频加上同样的稀疏注意力是 9.4 秒。
+
 ### Fewer chips / 更少的 chip
 
 Measured 2026-11-02 to 2026-11-03; "4 chips" means four chips of the same v6e-8 host.
@@ -261,6 +264,12 @@ A single v5e chip (47 GB of host memory) also works: add `--int8-weights --adaln
 
 `--int8-weights` changes the output a little; `--adaln-host` does not change the quality.
 `--int8-weights` 会让结果略有变化;`--adaln-host` 不影响画质。
+
+A 15-second 480p clip (362 frames) takes 272 s on one v5e chip with Pika-H3-Flex.
+用 Pika-H3-Flex 在单个 v5e chip 上生成一段 15 秒的 480p 视频(362 帧)需要 272 秒。
+
+On v5e, `DT_INT8_ACT=1` also quantizes activations and runs the int8 matrix units: denoising is 10-22% faster (251 s for that clip), and the output changes more.
+在 v5e 上,`DT_INT8_ACT=1` 会把激活也量化,使用 int8 矩阵单元:去噪快 10-22%(上面那段视频为 251 秒),结果的变化也更大。
 
 Every entry point lists all of its options with `--help`.
 每个入口都可以用 `--help` 查看全部选项。
