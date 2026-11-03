@@ -47,8 +47,8 @@ Software: jax 0.12.0.1, libtpu 0.0.51, torch_tpu 0.2.0, diffusers `cc8644b` (see
 |---|---|---|---|
 | text-to-video, lossless / 文生视频,无损 | **110.0 s** | 117.8 s | 139.0 s |
 | text-to-video, lossy / 文生视频,有损 | **36.9 s** | 42.9 s | 52.5 s |
-| reference-to-video, lossless / 参考图生视频,无损 | **139.5 s** | 186.7 s | 189 s |
-| reference-to-video, lossy / 参考图生视频,有损 | **53.2 s** | 77.3 s | 86 s |
+| reference-to-video, lossless / 参考图生视频,无损 | **139.2 s** | 186.7 s | 189 s |
+| reference-to-video, lossy / 参考图生视频,有损 | **52.3 s** | 77.3 s | 86 s |
 
 "Lossy" skips a DiT call while the timestep embedding barely changes, and lets each video frame attend only to nearby frames.
 "有损"是指:时间步嵌入几乎不变时跳过一次 DiT 计算,并且让每一帧只关注相邻的帧。
@@ -77,7 +77,7 @@ Measured 2026-11-03 on a TPU v6e-8, same size as the MiniMax-H3 table (768x1344,
 | | Pika-H3-Flex, 6 steps / 6 步 | MiniMax-H3, lossless / 无损 |
 |---|---|---|
 | text-to-video / 文生视频 | **40.3 s** | 110.0 s |
-| reference-to-video / 参考图生视频 | **51.8 s** | 139.5 s |
+| reference-to-video / 参考图生视频 | **51.7 s** | 139.2 s |
 
 Our six-step sampler matches Pika's own code within numerical noise, checked with the same initial noise.
 我们的六步采样与 Pika 官方代码一致,差异在数值噪声范围内(用相同的初始噪声核对过)。
