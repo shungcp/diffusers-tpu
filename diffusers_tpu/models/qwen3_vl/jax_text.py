@@ -55,6 +55,10 @@ def find_snapshot(model_id=MODEL_ID):
 
   return snapshot_download(model_id)
 
+
+# Text attention in float32 at highest precision (DT_TEXT_ATTN_F32, on by default).
+TEXT_ATTN_F32 = os.environ.get("DT_TEXT_ATTN_F32", "1") == "1"
+
 def _build_modules():
   """Imports flax lazily so the file can be read without it installed."""
   import jax
@@ -118,9 +122,18 @@ def _build_modules():
       k = apply_rope(k, cos, sin).astype(v.dtype)
       # jax's attention does grouped queries itself when the head counts
       # differ, so no explicit repeat.
-      out = jax.nn.dot_product_attention(q, k, v, mask=mask,
-                                         is_causal=mask is None,
-                                         scale=self.scale)
+      if TEXT_ATTN_F32:
+        # float32 at highest precision: the bfloat16 path loses accuracy on
+        # long prompts (7,518 tokens with a ref2va image) at the same speed.
+        with jax.default_matmul_precision("highest"):
+          out = jax.nn.dot_product_attention(
+              q.astype(jnp.float32), k.astype(jnp.float32),
+              v.astype(jnp.float32), mask=mask, is_causal=mask is None,
+              scale=self.scale).astype(v.dtype)
+      else:
+        out = jax.nn.dot_product_attention(q, k, v, mask=mask,
+                                           is_causal=mask is None,
+                                           scale=self.scale)
       return self.o_proj(out.reshape(b, s, -1))
 
   class MLP(nnx.Module):

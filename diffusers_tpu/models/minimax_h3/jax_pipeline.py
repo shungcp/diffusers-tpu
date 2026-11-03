@@ -305,6 +305,10 @@ def main():
   if (args.runs > 1 and (_small_hbm or args.chips == 1)
       and "DT_DECODE_TILE_SHARD" not in os.environ):
     args.decode_tile_shard = False      # replicated decoder does not fit beside a resident DiT on 32 GiB HBM
+    if not args.vae_tile_batch and args.chips != 1:
+      # The tensor-parallel decoder otherwise decodes one tile at a time:
+      # batching 8 takes a resident decode from 3.4 to 2.1 s.
+      args.vae_tile_batch = 8
   if not args.block_kv:
     # On v6e ref2va is 6 s faster with 2048 than 4096; on v7x 4096 is faster.
     args.block_kv = (2048 if args.num_frames <= 241 or (args.reference and _small_hbm)
@@ -401,6 +405,15 @@ def main():
     pos3 = r2v.text_positions(snapshot, pres["ids"], pres["grid_thw"],
                               pres["mm_token_type_ids"])
     ids = pres["ids"][None]
+    # Host-side per-image work (resize, processor, mRoPE positions): a new
+    # reference image pays it on every request, so it is reported too.
+    _t = time.perf_counter()
+    _ri = r2v.load_reference(args.reference)
+    _pr = r2v.presentation(snapshot, args.prompt, _ri)
+    r2v.text_positions(snapshot, _pr["ids"], _pr["grid_thw"], _pr["mm_token_type_ids"])
+    print(f"  [ref2va] host-side image preparation (warm) "
+          f"{time.perf_counter() - _t:.2f}s", flush=True)
+    del _ri, _pr
     vision, _ = jvision.build(text_dir, dtype=dtype, abstract=True)
     jvision.load(vision, text_dir, mesh=mesh, spec_fn=lambda k, n: _P(),
                  memory_kind=text_host)
@@ -565,16 +578,16 @@ def main():
     # Weights as arguments, not closed over (see the decoder below).
     @jax.jit
     def _encode_one(es, qs, tile):  # noqa: E306
-      with jax.default_matmul_precision(os.environ.get("DT_VAE_ENC_PRECISION", "highest")):
+      with jax.default_matmul_precision(os.environ.get("DT_VAE_ENC_PRECISION", "high")):
         return nnx.merge(_qg, qs)(nnx.merge(_eg, es)(tile))
 
     import json as _json
     with open(os.path.join(vae_dir, "config.json")) as f:
       _vcfg = _json.load(f)
     _ENC_ONE[0] = _encode_one
-    # Whole-encode jit (DT_ENC_JIT=1): warm 2.4 -> 2.1 s but first compile
-    # 12 -> 86 s, so off by default.
-    _jit_enc = os.environ.get("DT_ENC_JIT") == "1"
+    # Whole-encode jit (DT_ENC_JIT, on by default): 2.8 -> 0.5 s for a
+    # 3648x2048 reference, tiles in groups (DT_ENC_GROUP) so it compiles.
+    _jit_enc = os.environ.get("DT_ENC_JIT", "1") == "1"
     _enc_w = _ENC_W_FN if _jit_enc else (lambda t: _encode_one(_es, _qs, t))
     cond = r2v.encode_condition(_enc_w, ref_image,
                                 _vcfg["latents_mean"], _vcfg["latents_std"],

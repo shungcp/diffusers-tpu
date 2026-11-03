@@ -44,6 +44,18 @@ ATTN_CHUNK = 2048
 # axis; the caller must be inside `jax.set_mesh`. None = every chip computes
 # all heads.
 HEAD_SHARD_AXIS = None
+# Vision attention in float32 at highest precision (DT_VISION_ATTN_F32, on by
+# default). In bfloat16 the result at 29k patches depended on the chunk size
+# (cosine 0.86-0.99 against float32); float32 costs the same time.
+VISION_ATTN_F32 = os.environ.get("DT_VISION_ATTN_F32", "1") == "1"
+# Head-sharded vision attention through the splash kernel (DT_VISION_SPLASH,
+# on by default): 27 layers at 29k patches in 0.08 s instead of 0.54 s.
+VISION_SPLASH = os.environ.get("DT_VISION_SPLASH", "1") == "1"
+if VISION_SPLASH:
+  # Imported before any trace: Pallas registers config options on import,
+  # which changes the tracing context, so importing it inside the first
+  # trace made every later call retrace.
+  from ...kernels import splash as _splash_preload  # noqa: F401
 
 DEFAULTS = dict(depth=27, hidden_size=1152, num_heads=16, intermediate_size=4304,
                 patch_size=16, temporal_patch_size=2, spatial_merge_size=2,
@@ -200,10 +212,39 @@ def _build_modules():
     pad = n * ATTN_CHUNK - seq
     qp = jnp.pad(q, ((0, pad), (0, 0), (0, 0))) if pad else q
     qc = qp.reshape(n, ATTN_CHUNK, *q.shape[1:])
-    out = jax.lax.map(
-        lambda qi: jax.nn.dot_product_attention(qi[None], k[None], v[None],
-                                                scale=scale)[0], qc)
+    if VISION_ATTN_F32:
+      dt = qc.dtype
+      kf, vf = k.astype(jnp.float32), v.astype(jnp.float32)
+      with jax.default_matmul_precision("highest"):
+        out = jax.lax.map(
+            lambda qi: jax.nn.dot_product_attention(
+                qi[None].astype(jnp.float32), kf[None], vf[None],
+                scale=scale)[0], qc).astype(dt)
+    else:
+      out = jax.lax.map(
+          lambda qi: jax.nn.dot_product_attention(qi[None], k[None], v[None],
+                                                  scale=scale)[0], qc)
     return out.reshape(n * ATTN_CHUNK, *q.shape[1:])[:seq][None]
+
+  def _splash_local(q, k, v, scale):
+    """Device-local unmasked attention through the splash kernel.
+
+    q, k, v: `(seq, heads, head_dim)`. head_dim 72 is padded to 128 with
+    zeros (dot products unchanged, extra output columns dropped), keys to the
+    block with a runtime length.
+    """
+    from ...kernels import splash as csa
+
+    seq, _, d = q.shape
+    dp = (-d) % 128
+    blk = int(os.environ.get("DT_VISION_SPLASH_BLK", "2048"))
+    sp = (-seq) % blk
+    qh, kh, vh = (jnp.pad(t, ((0, sp), (0, 0), (0, dp))).transpose(1, 0, 2)[None]
+                  for t in (q, k, v))
+    out = csa.attention(qh, kh, vh, scale=scale, block_q=blk, block_kv=blk,
+                        block_kv_compute=min(blk, 512), use_fixed_m=False,
+                        kv_len=jnp.int32(seq) if sp else None)
+    return out[0].transpose(1, 0, 2)[:seq, :, :d]
 
   def rotate_half(x):
     half = x.shape[-1] // 2
@@ -232,10 +273,12 @@ def _build_modules():
         # of the 4.5 s text-encoding stage for a 28,672-patch image.
         from jax.sharding import PartitionSpec as P
         spec = P(None, HEAD_SHARD_AXIS, None)
-        out = jax.shard_map(
-            lambda a, b, c: _chunked_attention(a, b, c, self.scale)[0],
-            in_specs=(spec, spec, spec), out_specs=spec,
-            check_vma=False)(q, k, v)[None]
+        if VISION_SPLASH:
+          local = lambda a, b, c: _splash_local(a, b, c, self.scale)
+        else:
+          local = lambda a, b, c: _chunked_attention(a, b, c, self.scale)[0]
+        out = jax.shard_map(local, in_specs=(spec, spec, spec), out_specs=spec,
+                            check_vma=False)(q, k, v)[None]
       elif mask is None and seq > ATTN_CHUNK:
         out = _chunked_attention(q, k, v, self.scale)
       else:

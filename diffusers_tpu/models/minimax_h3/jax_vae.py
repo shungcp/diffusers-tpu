@@ -744,6 +744,8 @@ def tiled_encode(encode_one, x, tile_px=256, overlap_px=64,
   `batch` stacks tiles and runs `encode_one` under `vmap` in groups of
   that many -- every tile has the same size.
   """
+  import os
+
   import jax
   import jax.numpy as jnp
 
@@ -763,9 +765,22 @@ def tiled_encode(encode_one, x, tile_px=256, overlap_px=64,
     from jax.sharding import NamedSharding, PartitionSpec as P
     n = len(tiles)
     ndev = mesh.devices.size
-    stacked = jnp.stack(tiles + [tiles[-1]] * ((-n) % ndev))
-    stacked = jax.device_put(stacked, NamedSharding(mesh, P(mesh.axis_names[0])))
-    flat = jax.vmap(encode_one)(stacked)[:n]
+    group = int(os.environ.get("DT_ENC_GROUP", "5")) * ndev
+    if group and group < n:
+      # Groups of DT_ENC_GROUP tiles a chip, one after another under
+      # `lax.map`: as one program the 154-tile encode needs 34.7 GB of
+      # temporaries at `high` precision.
+      sh = NamedSharding(mesh, P(mesh.axis_names[0]))
+      stacked = jnp.stack(tiles + [tiles[-1]] * ((-n) % group))
+      grouped = stacked.reshape((-1, group) + stacked.shape[1:])
+      out = jax.lax.map(
+          lambda g: jax.vmap(encode_one)(jax.lax.with_sharding_constraint(g, sh)),
+          grouped)
+      flat = out.reshape((-1,) + out.shape[2:])[:n]
+    else:
+      stacked = jnp.stack(tiles + [tiles[-1]] * ((-n) % ndev))
+      stacked = jax.device_put(stacked, NamedSharding(mesh, P(mesh.axis_names[0])))
+      flat = jax.vmap(encode_one)(stacked)[:n]
     rows = [[flat[i * ncol + j] for j in range(ncol)] for i in range(len(ys))]
   elif batch:
     stacked = jnp.stack(tiles)
