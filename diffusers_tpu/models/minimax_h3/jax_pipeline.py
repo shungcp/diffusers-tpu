@@ -310,8 +310,10 @@ def main():
       # batching 8 takes a resident decode from 3.4 to 2.1 s.
       args.vae_tile_batch = 8
   if not args.block_kv:
-    # On v6e ref2va is 6 s faster with 2048 than 4096; on v7x 4096 is faster.
-    args.block_kv = (2048 if args.num_frames <= 241 or (args.reference and _small_hbm)
+    # On v6e ref2va at 768p is 6 s faster with 2048 than 4096, at 480p 4096
+    # is faster; on v7x 4096 is faster.
+    args.block_kv = (2048 if args.num_frames <= 241 or (args.reference and _small_hbm
+                                               and args.height >= 768)
                      else 4096)
     print(f"  [auto] --block-kv {args.block_kv}", flush=True)
   from . import jax_dit as dit
