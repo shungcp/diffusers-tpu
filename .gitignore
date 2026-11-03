@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.egg-info/
+out/
+*.npy
+*.mp4
+.venv/

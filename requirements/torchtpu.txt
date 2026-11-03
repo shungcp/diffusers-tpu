@@ -1,0 +1,14 @@
+# torch_tpu backend (Python 3.14). JAX is required too: the attention kernel is a Pallas kernel,
+# and without JAX the backend silently falls back to generic attention.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1+cpu
+torch_tpu==0.2.0
+jax==0.12.0.1
+jaxlib==0.12.0.1
+libtpu==0.0.51
+transformers==5.20.2
+safetensors==0.8.0
+accelerate==1.15.0
+numpy==2.5.4
+pillow==13.0.0
+diffusers @ git+https://github.com/huggingface/diffusers@cc8644b447d8f11074d3df06d0ee0e3e7c91bf75

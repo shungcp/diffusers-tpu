@@ -1,0 +1,16 @@
+# JAX and torchax backends (Python 3.12). Tested on TPU v6e-8 / v6e-1.
+--extra-index-url https://download.pytorch.org/whl/cpu
+jax==0.12.0.1
+jaxlib==0.12.0.1
+libtpu==0.0.51
+flax==0.12.12
+torch==2.10.0+cpu        # torchax runs PyTorch model code on JAX; no torch compute on TPU
+torchax==0.0.13
+torchvision==0.25.0+cpu
+transformers==5.22.1
+safetensors==0.8.0
+accelerate==1.15.0
+numpy==2.5.3
+pillow==12.3.0
+av==19.0.1               # mp4 export
+diffusers @ git+https://github.com/huggingface/diffusers@cc8644b447d8f11074d3df06d0ee0e3e7c91bf75

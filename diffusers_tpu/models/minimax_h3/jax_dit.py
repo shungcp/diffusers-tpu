@@ -1,0 +1,1207 @@
+"""MiniMax-H3's DiT in native JAX (flax nnx).
+
+`torchax_pipeline.py` traces the diffusers module; this native path writes
+the layers out. The model is 33 B at the shipped config -- 50 blocks of
+hidden 5376, 56 heads of 128, FFN 14336. Everything computed from tensor
+*contents* runs in a host prologue, so the module is jittable with all of
+it static.
+
+Running this file checks a small random configuration against diffusers
+on CPU:
+
+    JAX_PLATFORMS=cpu python -m diffusers_tpu.models.minimax_h3.jax_dit
+
+Three details of the PyTorch reference that are easy to get wrong:
+
+* **The modulation is not per-sample, it is per `(timestep, modality)`.**
+  `adaln_proj` projects one shared `temb` into `6 * hidden * 3` and the
+  block indexes the result with `timestep_indices * 3 + token_tags`, so
+  text, audio and video rows of the same step read different shift,
+  scale and gate. That gather is the reason the block takes
+  `adaln_indices` at all.
+* **`silu(temb)` runs in float32, the projection in bfloat16.** The
+  checkpoint is mixed precision and `time_embedder` is a float32 module.
+  Rounding before the activation biases every block identically at every
+  step, and that bias accumulates along the trajectory rather than
+  cancelling.
+* **RoPE rotates only the leading `rotary_dim` channels** and passes the
+  rest through. With `rope_freq_dim` 16 over three axes the rotated part
+  is 96 of the 128, so a third of every head is untouched.
+"""
+
+from __future__ import annotations
+
+import functools
+import math
+import os
+
+import numpy as np
+
+# The shipped configuration, from the checkpoint's `transformer/config.json`.
+CONFIG = dict(
+    num_attention_heads=56,
+    attention_head_dim=128,
+    hidden_size=5376,
+    num_layers=50,
+    ffn_dim=14336,
+    time_embed_dim=2688,
+    norm_eps=1e-5,
+    qk_norm_eps=1e-5,
+)
+MODALITY_NUM = 3  # text, audio, video
+
+# The full shipped config, as the checkpoint's `config.json` has it.
+CONFIG_FULL = dict(
+    num_attention_heads=56, attention_head_dim=128, hidden_size=5376,
+    num_layers=50, num_refiner_layers=2, ffn_dim=14336, in_channels=24,
+    audio_in_channels=32, patch_size=(1, 2, 2), text_dim=5120, freq_dim=256,
+    time_embed_hidden_dim=5376, time_embed_dim=2688, rope_freq_dim=16,
+    rope_theta=10000.0, norm_eps=1e-5, qk_norm_eps=1e-5, final_norm_eps=1e-5,
+)
+
+
+# Rotate all 128 lanes rather than slicing the leading 96 (see
+# `apply_rope_full_lane`). Off by default so the CPU equivalence check
+# compares the plain transcription.
+FULL_LANE_ROPE = os.environ.get("DT_FULL_LANE_ROPE") == "1"
+
+# Round the packed sequence up to a multiple of this before the block
+# stack runs, and hand attention the true length. 0 is off. Linears and
+# elementwise ops are row-independent, so padding rows cannot affect real
+# ones; attention gets k and v sliced back to the true length. On 4 chips
+# padding 57,290 tokens to 57,344 cut a step from 4.94 s to 3.64 s.
+PAD_SEQUENCE_TO = int(os.environ.get("DT_PAD_SEQUENCE_TO", "0"))
+
+# Sharding of the residual stream between layers (`DT_STREAM_SHARD`):
+#
+# * unset -- the SPMD partitioner decides (default, fastest);
+# * `seq` -- pin it to `P(None, "tp", None)` across the norms, modulation
+#   and gated adds, and gather it whole before attention and the two
+#   column-parallel linears (as `install_sequence_parallel` does for
+#   torchax);
+# * `whole` -- replicate it everywhere.
+#
+# `seq` is ~6% slower on 8 chips: attention and `ff.proj` both want whole
+# rows, so pinning the stream doubles the per-layer all-gather instead of
+# removing it.
+_STREAM = os.environ.get("DT_STREAM_SHARD", "")
+
+
+# DT_CMM=1: hand-written collective matmul for the qkv and first FF
+# projections. Instead of all-gathering the sequence-sharded `x` before a
+# column-sharded matmul, the shards of `x` are rotated around the ring in
+# a shard_map and each is multiplied as it arrives, interleaving ppermute
+# with compute. Mathematically identical to the full matmul.
+CMM = os.environ.get("DT_CMM") == "1"
+
+
+def _cmm(x, weights):
+  """`[x @ w.T for w in weights]`, x sharded on sequence, w on output dim.
+
+  `w` is sharded `P("tp", None)`. The output is sharded on its last axis,
+  the same layout the partitioner would produce.
+  """
+  import jax
+  import jax.numpy as jnp
+  from jax.sharding import PartitionSpec as P
+
+  def local(xl, *wl):
+    n = jax.lax.axis_size("tp")
+    me = jax.lax.axis_index("tp")
+    sl = xl.shape[1]
+    accs = [jnp.zeros((xl.shape[0], sl * n, w.shape[0]), xl.dtype) for w in wl]
+    xc = xl
+    perm = [(j, (j + 1) % n) for j in range(n)]
+    for step in range(n):          # unrolled so XLA can overlap the next transfer with this matmul
+      src = (me - step) % n        # xc currently holds shard `src`
+      nxt = jax.lax.ppermute(xc, "tp", perm) if step + 1 < n else None
+      for a_i, w in enumerate(wl):
+        y = jax.lax.dot_general(xc, w, (((2,), (1,)), ((), ())))
+        accs[a_i] = jax.lax.dynamic_update_slice(accs[a_i], y.astype(xl.dtype),
+                                                 (0, src * sl, 0))
+      xc = nxt
+    return tuple(accs)
+
+  outs = jax.shard_map(
+      local, in_specs=(P(None, "tp", None),) + (P("tp", None),) * len(weights),
+      out_specs=(P(None, None, "tp"),) * len(weights), check_vma=False)(x, *weights)
+  return list(outs)
+
+
+def _constrain(x, *spec):
+  """`with_sharding_constraint`, or the identity when the flag is off."""
+  if not _STREAM:
+    return x
+  import jax
+  from jax.sharding import PartitionSpec as P
+  if _STREAM == "whole":
+    spec = (None,) * len(spec)
+  return jax.lax.with_sharding_constraint(x, P(*spec))
+
+# DT_DUMP_BLOCKS=<dir>: debug dump of per-block activation statistics
+# (norm, mean, std and a strided slice) for comparing two runs layer by
+# layer. Full activations are ~1.3 GB each, so only summaries are saved.
+_BLK = {"n": -1}
+
+
+def _blk_save(tag, x):
+  d = os.environ.get("DT_DUMP_BLOCKS")
+  if not d:
+    return
+  import numpy as _np
+  if tag == "x0":
+    _BLK["n"] += 1
+  if _BLK["n"] != int(os.environ.get("DT_DUMP_BLOCK_CALL", "0")):
+    return
+  os.makedirs(d, exist_ok=True)
+  a = _np.asarray(x, _np.float32)
+  _np.savez(os.path.join(d, f"{tag}.npz"),
+            norm=_np.linalg.norm(a.astype(_np.float64)),
+            mean=a.mean(), std=a.std(),
+            slice=a.reshape(-1)[::max(1, a.size // 4096)].copy())
+  print(f"  [blk] {tag} norm={_np.linalg.norm(a.astype(_np.float64)):.6g}",
+        flush=True)
+
+
+def _build_modules():
+  """Imports flax lazily, so this file can be read without it installed."""
+  import jax
+  import jax.numpy as jnp
+  from flax import nnx
+
+  class RMSNorm(nnx.Module):
+    """Scale is `weight`; the reduction is in float32 whatever `x` is."""
+
+    def __init__(self, dim, eps=1e-5, *, dtype=jnp.bfloat16, rngs=None):
+      self.weight = nnx.Param(jnp.ones((dim,), jnp.float32))
+      self.eps = eps
+
+    def __call__(self, x):
+      dtype = x.dtype
+      x32 = x.astype(jnp.float32)
+      rrms = jax.lax.rsqrt(jnp.mean(x32**2, axis=-1, keepdims=True) + self.eps)
+      return (x32 * rrms * self.weight[...]).astype(dtype)
+
+  class Linear(nnx.Module):
+    """`y = x @ W.T (+ b)`, weight stored `(out, in)` as torch has it.
+
+    `precision` is for `TimestepEmbedder`: TPU runs float32 matmuls in
+    bfloat16 by default, and at timestep 0 the embedding is a cancelling
+    sum that bfloat16 moves by ~4%. It is not set globally because
+    `JAX_DEFAULT_MATMUL_PRECISION=highest` breaks the Pallas splash kernel.
+    """
+
+    def __init__(self, in_f, out_f, *, bias=False, dtype=jnp.bfloat16,
+                 rngs=None, precision=None):
+      self.weight = nnx.Param(jnp.zeros((out_f, in_f), dtype))
+      self.bias = nnx.Param(jnp.zeros((out_f,), dtype)) if bias else None
+      self.weight_scale = nnx.data(None)
+      self.precision = precision
+
+    def __call__(self, x):
+      w = self.weight[...]
+      if w.dtype == jnp.float8_e4m3fn and self.weight_scale is not None:
+        f8_max = jnp.float32(448.0)
+        x32 = x.astype(jnp.float32)
+        row_max = jnp.maximum(
+            jnp.max(jnp.abs(x32), axis=-1, keepdims=True), jnp.float32(1e-12))
+        x_scale = row_max / f8_max
+        q_x = jnp.clip(x32 / x_scale, -f8_max, f8_max).astype(
+            jnp.float8_e4m3fn)
+        acc = jax.lax.dot_general(
+            q_x, w, (((x.ndim - 1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32)
+        y = (acc * x_scale * self.weight_scale[...]).astype(x.dtype)
+        return y + self.bias[...] if self.bias is not None else y
+      y = jax.lax.dot_general(x, w,
+                              (((x.ndim - 1,), (1,)), ((), ())),
+                              precision=self.precision)
+      return y + self.bias[...] if self.bias is not None else y
+
+  def apply_rope(x, cos, sin):
+    """Rotate the leading `cos.shape[-1]` channels, pass the rest through.
+
+    `x` is `(batch, seq, heads, head_dim)`; `cos`/`sin` are `(seq, rotary)`.
+    """
+    rotary = cos.shape[-1]
+    rotated, passed = x[..., :rotary], x[..., rotary:]
+    cos = cos.astype(x.dtype)[None, :, None, :]
+    sin = sin.astype(x.dtype)[None, :, None, :]
+    x1, x2 = jnp.split(rotated, 2, axis=-1)
+    turned = jnp.concatenate([-x2, x1], axis=-1)
+    return jnp.concatenate([rotated * cos + turned * sin, passed], axis=-1)
+
+  @functools.lru_cache(maxsize=8)
+  def rotate_half_matrix(rotary, head_dim):
+    """R with `x @ R == cat(-x2, x1, 0)`, x1/x2 the halves of x[:rotary].
+
+    One +-1 per column, so the bf16 matmul is exact.
+
+    Built in numpy and converted at the use site: the `lru_cache` outlives
+    a trace, and a cached `jnp` array would leak a tracer into later
+    traces (`UnexpectedTracerError`).
+    """
+    index = np.arange(rotary // 2)
+    r = np.zeros((head_dim, head_dim), np.float32)
+    r[index + rotary // 2, index] = -1.0
+    r[index, index + rotary // 2] = 1.0
+    return r
+
+  def apply_rope_full_lane(x, cos, sin):
+    """The same rotation over all 128 lanes instead of the leading 96.
+
+    96 of 128 channels rotate, and slicing them, splitting in half and
+    concatenating back lands on none of the 128-lane vector register
+    boundaries, so XLA spends the time on relayouts rather than on the
+    multiply-add. Padding the tables (cos with 1, sin with 0) and
+    rotating by a signed permutation matmul keeps every operation on
+    whole vregs. The arithmetic is identical (~4% faster on the torchax
+    backend).
+    """
+    rotary, head_dim = cos.shape[-1], x.shape[-1]
+    cos = jnp.pad(cos.astype(x.dtype), ((0, 0), (0, head_dim - rotary)),
+                  constant_values=1.0)[None, :, None, :]
+    sin = jnp.pad(sin.astype(x.dtype), ((0, 0), (0, head_dim - rotary)),
+                  constant_values=0.0)[None, :, None, :]
+    rotate = jnp.asarray(rotate_half_matrix(rotary, head_dim), x.dtype)
+    return x * cos + (x @ rotate) * sin
+
+  class AdaLNModulation(nnx.Module):
+    """One `temb` into six modulation tensors, per `(timestep, modality)`."""
+
+    def __init__(self, time_embed_dim, hidden_size, *, dtype=jnp.bfloat16,
+                 rngs=None):
+      self.hidden_size = hidden_size
+      self.linear = Linear(time_embed_dim, 6 * hidden_size * MODALITY_NUM,
+                           bias=True, dtype=dtype, rngs=rngs)
+
+    def __call__(self, temb):
+      # float32 through the activation, the projection's dtype after it.
+      activated = jax.nn.silu(temb.astype(jnp.float32))
+      w_dtype = self.linear.weight[...].dtype
+      in_dtype = jnp.bfloat16 if w_dtype == jnp.float8_e4m3fn else w_dtype
+      out = self.linear(activated.astype(in_dtype))
+      out = out.reshape(-1, 6 * self.hidden_size)
+      return jnp.split(out, 6, axis=-1)
+
+  class Attention(nnx.Module):
+    """Full self-attention over the one packed sequence. No mask, no cross."""
+
+    def __init__(self, hidden_size, heads, dim_head, qk_norm_eps=1e-5, *,
+                 dtype=jnp.bfloat16, rngs=None):
+      self.heads = heads
+      self.head_dim = dim_head
+      inner = heads * dim_head
+      self.to_q = Linear(hidden_size, inner, dtype=dtype, rngs=rngs)
+      self.to_k = Linear(hidden_size, inner, dtype=dtype, rngs=rngs)
+      self.to_v = Linear(hidden_size, inner, dtype=dtype, rngs=rngs)
+      self.norm_q = RMSNorm(dim_head, qk_norm_eps, dtype=dtype, rngs=rngs)
+      self.norm_k = RMSNorm(dim_head, qk_norm_eps, dtype=dtype, rngs=rngs)
+      self.to_out = Linear(inner, hidden_size, dtype=dtype, rngs=rngs)
+
+    def __call__(self, x, rope, sdpa=None, true_len=None):
+      shape = x.shape[:-1] + (self.heads, self.head_dim)
+      if CMM and rope is not None and x.shape[1] % 8 == 0:
+        qx, kx, vx = _cmm(x, [self.to_q.weight[...], self.to_k.weight[...],
+                              self.to_v.weight[...]])
+      else:
+        qx, kx, vx = self.to_q(x), self.to_k(x), self.to_v(x)
+      q = self.norm_q(qx.reshape(shape))
+      k = self.norm_k(kx.reshape(shape))
+      v = vx.reshape(shape)
+      if rope is not None:
+        turn = apply_rope_full_lane if FULL_LANE_ROPE else apply_rope
+        q, k = turn(q, *rope), turn(k, *rope)
+      dynamic = true_len is not None and not isinstance(true_len, int)
+      if dynamic:
+        # A traced true length (`jax_server`'s bucketed shapes): keep the
+        # padded keys but zero them, and let the kernel mask them by
+        # `kv_len` -- one program for every length in the bucket.
+        keep = (jnp.arange(x.shape[1]) < true_len)[None, :, None, None]
+        k, v = jnp.where(keep, k, 0), jnp.where(keep, v, 0)
+      elif true_len is not None and true_len != x.shape[1]:
+        # The padded rows are keys to nobody. Queries stay padded: the
+        # kernel pads the query axis itself anyway and those output rows
+        # are never read.
+        k, v = k[:, :true_len], v[:, :true_len]
+      # `(b, s, h, d)` -> the kernels want `(b, h, s, d)`.
+      q, k, v = (jnp.swapaxes(t, 1, 2) for t in (q, k, v))
+      if dynamic:
+        out = sdpa(q, k, v, kv_len=true_len)
+        out = jnp.swapaxes(out, 1, 2).reshape(x.shape[:-1] + (-1,))
+        return self.to_out(out.astype(x.dtype))
+      if sdpa is None:
+        scale = self.head_dim ** -0.5
+        scores = jnp.einsum("bhqd,bhkd->bhqk", q.astype(jnp.float32),
+                            k.astype(jnp.float32)) * scale
+        out = jnp.einsum("bhqk,bhkd->bhqd",
+                         jax.nn.softmax(scores, axis=-1),
+                         v.astype(jnp.float32)).astype(q.dtype)
+      else:
+        out = sdpa(q, k, v)
+      out = jnp.swapaxes(out, 1, 2).reshape(x.shape[:-1] + (-1,))
+      return self.to_out(out.astype(x.dtype))
+
+  class FeedForward(nnx.Module):
+    """SwiGLU: one projection to `2 * ffn_dim`, split, `a * silu(b)`."""
+
+    def __init__(self, hidden_size, ffn_dim, *, dtype=jnp.bfloat16, rngs=None):
+      self.proj = Linear(hidden_size, 2 * ffn_dim, dtype=dtype, rngs=rngs)
+      self.out = Linear(ffn_dim, hidden_size, dtype=dtype, rngs=rngs)
+
+    def __call__(self, x):
+      if CMM and x.shape[1] % 8 == 0 and x.shape[1] > 50000:   # skip the token refiner
+        (y,) = _cmm(x, [self.proj.weight[...]])
+      else:
+        y = self.proj(x)
+      value, gate = jnp.split(y, 2, axis=-1)
+      return self.out(value * jax.nn.silu(gate))
+
+  class Block(nnx.Module):
+    """Pre-norm attention and feed-forward, each modulated per row."""
+
+    def __init__(self, hidden_size, num_attention_heads, attention_head_dim,
+                 ffn_dim, time_embed_dim, norm_eps, qk_norm_eps, *,
+                 dtype=jnp.bfloat16, rngs=None):
+      self.norm1 = RMSNorm(hidden_size, norm_eps, dtype=dtype, rngs=rngs)
+      self.attn = Attention(hidden_size, num_attention_heads,
+                            attention_head_dim, qk_norm_eps, dtype=dtype,
+                            rngs=rngs)
+      self.norm2 = RMSNorm(hidden_size, norm_eps, dtype=dtype, rngs=rngs)
+      self.ff = FeedForward(hidden_size, ffn_dim, dtype=dtype, rngs=rngs)
+      self.adaln_proj = AdaLNModulation(time_embed_dim, hidden_size,
+                                        dtype=dtype, rngs=rngs)
+
+    def __call__(self, x, temb, adaln_indices, rope, sdpa=None,
+                 segments=None, true_len=None):
+      shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+          self.adaln_proj(temb))
+
+      def apply(h, combine):
+        """Modulate by run rather than by row.
+
+        Gathering per row with `jnp.take` materialises a `(seq, hidden)`
+        tensor six times a block. Instead the last run (the video rows,
+        ~98% of the sequence) is broadcast over the whole tensor and the
+        few leading runs are written back over the front. Same arithmetic,
+        nothing of sequence length allocated.
+        """
+        if segments is None:
+          return combine(h, None)
+        *head_runs, (_, _, bulk) = segments
+        out = combine(h, bulk)
+        if not head_runs:
+          return out
+        head = jnp.concatenate(
+            [combine(h[:, start:stop], index)
+             for start, stop, index in head_runs], axis=1)
+        return out.at[:, :head.shape[1]].set(head)
+
+      def rows(param, index):
+        return param[index] if index is not None else jnp.take(
+            param, adaln_indices, axis=0)
+
+      # `_constrain` is the identity unless DT_STREAM_SHARD is set; see
+      # `_STREAM`. Attention and the two column-parallel linears
+      # (`to_q/k/v`, `ff.proj`) want whole rows, everything else here is
+      # row-independent and runs eight times narrower when cut.
+      x = _constrain(x, None, "tp", None)
+      residual = x
+      h = apply(self.norm1(x),
+                lambda t, i: t * (1.0 + rows(scale_msa, i)) + rows(shift_msa, i))
+      attended = self.attn(_constrain(h, None, None, None), rope, sdpa,
+                           true_len)
+      x = residual + apply(_constrain(attended, None, "tp", None),
+                           lambda t, i: t * rows(gate_msa, i))
+
+      residual = x
+      h = apply(self.norm2(x),
+                lambda t, i: t * (1.0 + rows(scale_mlp, i)) + rows(shift_mlp, i))
+      ff = _constrain(self.ff(_constrain(h, None, None, None)),
+                      None, "tp", None)
+      return residual + apply(ff, lambda t, i: t * rows(gate_mlp, i))
+
+  class TokenRefinerBlock(nnx.Module):
+    """Plain pre-norm block over the text stream. No AdaLN, no rotary."""
+
+    def __init__(self, hidden_size, heads, head_dim, ffn_dim, norm_eps,
+                 qk_norm_eps, *, dtype=jnp.bfloat16, rngs=None):
+      self.norm1 = RMSNorm(hidden_size, norm_eps, dtype=dtype, rngs=rngs)
+      self.attn = Attention(hidden_size, heads, head_dim, qk_norm_eps,
+                            dtype=dtype, rngs=rngs)
+      self.norm2 = RMSNorm(hidden_size, norm_eps, dtype=dtype, rngs=rngs)
+      self.ff = FeedForward(hidden_size, ffn_dim, dtype=dtype, rngs=rngs)
+
+    def __call__(self, x, sdpa=None, text_len=None):
+      x = x + self.attn(self.norm1(x), None, sdpa, text_len)
+      return x + self.ff(self.norm2(x))
+
+  class TokenRefiner(nnx.Module):
+    def __init__(self, hidden_size, heads, head_dim, ffn_dim, layers,
+                 norm_eps, qk_norm_eps, final_norm_eps, *,
+                 dtype=jnp.bfloat16, rngs=None):
+      self.refiner_blocks = nnx.List([
+          TokenRefinerBlock(hidden_size, heads, head_dim, ffn_dim, norm_eps,
+                            qk_norm_eps, dtype=dtype, rngs=rngs)
+          for _ in range(layers)])
+      self.final_norm = RMSNorm(hidden_size, final_norm_eps, dtype=dtype,
+                                rngs=rngs)
+
+    def __call__(self, x, sdpa=None, text_len=None):
+      for block in self.refiner_blocks:
+        x = block(x, sdpa, text_len)
+      return self.final_norm(x)
+
+  class AdaLNOut(nnx.Module):
+    """Final norm, shift and scale selected per row by its timestep."""
+
+    def __init__(self, hidden_size, time_embed_dim, eps, *,
+                 dtype=jnp.bfloat16, rngs=None):
+      self.norm = RMSNorm(hidden_size, eps, dtype=dtype, rngs=rngs)
+      self.linear = Linear(time_embed_dim, 2 * hidden_size, bias=True,
+                           dtype=dtype, rngs=rngs)
+
+    def __call__(self, x, temb, timestep_indices):
+      activated = jax.nn.silu(temb.astype(jnp.float32))
+      shift, scale = jnp.split(
+          self.linear(activated.astype(self.linear.weight[...].dtype)), 2, -1)
+      x = self.norm(x)
+      # Optional debug dump (DT_DUMP_BLOCKS) of the final modulation inputs.
+      if os.environ.get("DT_DUMP_BLOCKS"):
+        jax.debug.callback(functools.partial(_blk_save, "ada_temb"), temb)
+        jax.debug.callback(functools.partial(_blk_save, "ada_normed"), x)
+        jax.debug.callback(functools.partial(_blk_save, "ada_scale"), scale)
+        jax.debug.callback(functools.partial(_blk_save, "ada_shift"), shift)
+        jax.debug.callback(functools.partial(_blk_save, "ada_tsidx"),
+                           timestep_indices.astype(jnp.float32))
+      return (x * (1.0 + jnp.take(scale, timestep_indices, axis=0))
+              + jnp.take(shift, timestep_indices, axis=0))
+
+  def rope_angles(position_ids, rope_freq_dim=16, rope_theta=10000.0):
+    """`(seq, 3)` coordinates to `cos`/`sin` of `(seq, 6 * rope_freq_dim)`.
+
+    One `inv_freq` serves all three axes; the three blocks are
+    concatenated and then concatenated with themselves, so `rotate_half`
+    turns `2 * 3 * rope_freq_dim` = 96 of the 128 head channels.
+    """
+    inv = 1.0 / (rope_theta ** (
+        jnp.arange(0, 2 * rope_freq_dim, 2, dtype=jnp.float32)
+        / (2 * rope_freq_dim)))
+    freqs = position_ids.astype(jnp.float32)[..., None] * inv.reshape(1, 1, -1)
+    freqs = jnp.concatenate(
+        [freqs[:, 0], freqs[:, 1], freqs[:, 2]], axis=-1)
+    freqs = jnp.concatenate([freqs, freqs], axis=-1)
+    return jnp.cos(freqs), jnp.sin(freqs)
+
+  def timestep_embedding(timestep, channels=256):
+    """`Timesteps(flip_sin_to_cos=True, downscale_freq_shift=0)`.
+
+    Cosines first, then sines -- the flip is not cosmetic, it decides
+    which half of the embedding the MLP's first column sees.
+    """
+    half = channels // 2
+    exponent = -math.log(10000.0) * jnp.arange(half, dtype=jnp.float32)
+    emb = jnp.exp(exponent / half)
+    emb = timestep.astype(jnp.float32)[:, None] * emb[None, :]
+    return jnp.concatenate([jnp.cos(emb), jnp.sin(emb)], axis=-1)
+
+  class TimestepEmbedder(nnx.Module):
+    """`TimestepEmbedding`: linear, SiLU, linear. float32 in the checkpoint."""
+
+    def __init__(self, in_channels, hidden, out_dim, *, dtype=jnp.float32,
+                 rngs=None):
+      self.linear_1 = Linear(in_channels, hidden, bias=True, dtype=dtype,
+                             rngs=rngs, precision=jax.lax.Precision.HIGHEST)
+      self.linear_2 = Linear(hidden, out_dim, bias=True, dtype=dtype,
+                             rngs=rngs, precision=jax.lax.Precision.HIGHEST)
+
+    def __call__(self, x):
+      return self.linear_2(jax.nn.silu(self.linear_1(x)))
+
+  class Transformer(nnx.Module):
+    """The whole stack over one packed sequence.
+
+    The checkpoint is mixed precision and it matters: `proj_in`,
+    `audio_proj_in`, `time_embedder`, `proj_out` and `audio_proj_out`
+    are float32 while `context_embedder` and the fifty blocks are
+    bfloat16. The text stream's dtype is what the packed buffer takes.
+    """
+
+    def __init__(self, *, num_attention_heads=56, attention_head_dim=128,
+                 hidden_size=5376, num_layers=50, num_refiner_layers=2,
+                 ffn_dim=14336, in_channels=24, audio_in_channels=32,
+                 patch_size=(1, 2, 2), text_dim=5120, freq_dim=256,
+                 time_embed_hidden_dim=5376, time_embed_dim=2688,
+                 rope_freq_dim=16, rope_theta=10000.0, norm_eps=1e-5,
+                 qk_norm_eps=1e-5, final_norm_eps=1e-5,
+                 dtype=jnp.bfloat16, rngs=None):
+      patch = patch_size[0] * patch_size[1] * patch_size[2]
+      video_patch_dim = in_channels * patch
+      self.freq_dim = freq_dim
+      self.rope_freq_dim = rope_freq_dim
+      self.rope_theta = rope_theta
+      self.proj_in = Linear(video_patch_dim, hidden_size, bias=True,
+                            dtype=jnp.float32, rngs=rngs)
+      self.audio_proj_in = Linear(audio_in_channels, hidden_size, bias=True,
+                                  dtype=jnp.float32, rngs=rngs)
+      self.context_embedder = Linear(text_dim, hidden_size, bias=True,
+                                     dtype=dtype, rngs=rngs)
+      self.time_embedder = TimestepEmbedder(freq_dim, time_embed_hidden_dim,
+                                            time_embed_dim, rngs=rngs)
+      self.token_refiner = TokenRefiner(
+          hidden_size, num_attention_heads, attention_head_dim, ffn_dim,
+          num_refiner_layers, norm_eps, qk_norm_eps, final_norm_eps,
+          dtype=dtype, rngs=rngs)
+      self.transformer_blocks = nnx.List([
+          Block(hidden_size, num_attention_heads, attention_head_dim,
+                ffn_dim, time_embed_dim, norm_eps, qk_norm_eps,
+                dtype=dtype, rngs=rngs)
+          for _ in range(num_layers)])
+      self.norm_out = AdaLNOut(hidden_size, time_embed_dim, final_norm_eps,
+                               dtype=dtype, rngs=rngs)
+      self.proj_out = Linear(hidden_size, video_patch_dim, bias=True,
+                             dtype=jnp.float32, rngs=rngs)
+      self.audio_proj_out = Linear(hidden_size, audio_in_channels, bias=True,
+                                   dtype=jnp.float32, rngs=rngs)
+
+    def __call__(self, video, audio, text, timestep, timestep_indices,
+                 token_tags, position_ids, video_indices, audio_indices,
+                 text_indices, sdpa=None, segments=None, seq_len=None,
+                 text_len=None):
+      """`seq_len` / `text_len` (optional, traced scalars): true lengths of
+      the packed sequence / text. When given, inputs use bucketed shapes and
+      attention masks by the true length (`jax_server`)."""
+      seq = position_ids.shape[0]
+      # Everything outside attention is row-independent, so the stack may
+      # run on a rounded-up sequence and the extra rows are dropped at
+      # the end by `video_indices`/`audio_indices`, which never name them.
+      padded = seq
+      if PAD_SEQUENCE_TO:
+        padded = -(-seq // PAD_SEQUENCE_TO) * PAD_SEQUENCE_TO
+      rope = rope_angles(position_ids, self.rope_freq_dim, self.rope_theta)
+      if padded != seq:
+        if segments is not None:
+          # The padded rows sit at the end, where the bulk run is, so
+          # extending its stop is all the runs need.
+          *rest, (start, _, index) = segments
+          segments = (*rest, (start, padded, index))
+        extra = padded - seq
+        # cos 1 / sin 0 is the identity rotation, so the padded rows stay
+        # whatever the zero buffer and their modulation make them.
+        rope = (jnp.pad(rope[0], ((0, extra), (0, 0)), constant_values=1.0),
+                jnp.pad(rope[1], ((0, extra), (0, 0)), constant_values=0.0))
+        timestep_indices = jnp.pad(timestep_indices, (0, extra))
+        token_tags = jnp.pad(token_tags, (0, extra))
+
+      video_embeds = self.proj_in(video.astype(jnp.float32))
+      audio_embeds = self.audio_proj_in(audio.astype(jnp.float32))
+      text_embeds = self.context_embedder(
+          text.astype(self.context_embedder.weight[...].dtype))
+      text_embeds = self.token_refiner(text_embeds, sdpa, text_len)
+
+      dtype = text_embeds.dtype
+      x = jnp.zeros((text_embeds.shape[0], padded, text_embeds.shape[-1]),
+                    dtype)
+      x = x.at[:, text_indices].set(text_embeds)
+      x = x.at[:, video_indices].set(video_embeds.astype(dtype))
+      x = x.at[:, audio_indices].set(audio_embeds.astype(dtype))
+
+      temb = self.time_embedder(
+          timestep_embedding(timestep, self.freq_dim))
+      adaln_indices = timestep_indices * MODALITY_NUM + token_tags
+
+      if os.environ.get("DT_DUMP_BLOCKS"):
+        jax.debug.callback(functools.partial(_blk_save, "x0"), x)
+        jax.debug.callback(functools.partial(_blk_save, "temb"), temb)
+      _barrier = segments is not None or os.environ.get("DT_BLOCK_BARRIER") == "1"
+      for _i, block in enumerate(self.transformer_blocks):
+        if _barrier and _i > 0:
+          x, temb = jax.lax.optimization_barrier((x, temb))
+        x = block(x, temb, adaln_indices, rope, sdpa, segments,
+                  seq if seq_len is None else seq_len)
+        if os.environ.get("DT_DUMP_BLOCKS") and _i in (0, 4, 9, 19, 29, 39,
+                                                       49):
+          jax.debug.callback(functools.partial(_blk_save, f"b{_i:02d}"), x)
+
+      x = self.norm_out(x, temb, timestep_indices).astype(jnp.float32)
+      if os.environ.get("DT_DUMP_BLOCKS"):
+        jax.debug.callback(functools.partial(_blk_save, "normout"), x)
+      return (jnp.take(self.proj_out(x), video_indices, axis=1),
+              jnp.take(self.audio_proj_out(x), audio_indices, axis=1))
+
+  return Block, Transformer
+
+
+# --------------------------------------------------------------------------
+# numerical equivalence against diffusers
+# --------------------------------------------------------------------------
+
+
+def _torch_block(config, dtype):
+  import torch
+  from diffusers.models.transformers import transformer_minimax_h3 as h3
+
+  block = h3.MiniMaxH3TransformerBlock(**config)
+  return block.to(dtype).eval()
+
+
+def test_block(verbose=True):
+  """One block, random weights, JAX against PyTorch on CPU."""
+  import jax.numpy as jnp
+  import numpy as np
+  import torch
+  from flax import nnx
+
+  # Small enough to run on a laptop, same structure as the real thing.
+  config = dict(hidden_size=128, num_attention_heads=4, attention_head_dim=32,
+                ffn_dim=256, time_embed_dim=64, norm_eps=1e-5,
+                qk_norm_eps=1e-5)
+  torch.manual_seed(0)
+  reference = _torch_block(config, torch.float32)
+
+  Block, _ = _build_modules()
+  ours = Block(**config, dtype=jnp.float32, rngs=nnx.Rngs(0))
+
+  # The checkpoint names map one-to-one apart from the feed-forward, which
+  # diffusers nests as `ff.net.0.proj` and `ff.net.2`.
+  renames = {"ff.net.0.proj": "ff.proj", "ff.net.2": "ff.out",
+             "attn.to_out.0": "attn.to_out"}
+  state = dict(reference.named_parameters())
+  for name, tensor in state.items():
+    target = name
+    for old, new in renames.items():
+      target = target.replace(old, new)
+    node = ours
+    for part in target.split(".")[:-1]:
+      node = getattr(node, part)
+    leaf = target.split(".")[-1]
+    getattr(node, leaf)[...] = jnp.asarray(
+        tensor.detach().float().numpy(), jnp.float32)
+
+  seq, timesteps = 16, 2
+  rotary = 2 * (config["attention_head_dim"] // 4)   # an even, smaller dim
+  rng = np.random.default_rng(0)
+  x = rng.standard_normal((1, seq, config["hidden_size"]), np.float32)
+  temb = rng.standard_normal((timesteps, config["time_embed_dim"]), np.float32)
+  cos = rng.standard_normal((seq, rotary), np.float32)
+  sin = rng.standard_normal((seq, rotary), np.float32)
+  tags = rng.integers(0, MODALITY_NUM, seq)
+  steps = rng.integers(0, timesteps, seq)
+  indices = (steps * MODALITY_NUM + tags).astype(np.int32)
+
+  with torch.no_grad():
+    want = reference(
+        torch.from_numpy(x), torch.from_numpy(temb),
+        torch.from_numpy(indices).long(),
+        (torch.from_numpy(cos), torch.from_numpy(sin)),
+    ).numpy()
+  got = np.asarray(ours(
+      jnp.asarray(x), jnp.asarray(temb), jnp.asarray(indices),
+      (jnp.asarray(cos), jnp.asarray(sin)),
+  ))
+
+  diff = np.abs(want - got)
+  scale = np.abs(want).mean()
+  ok = diff.max() < 2e-4 * max(scale, 1.0)
+  if verbose:
+    print(f"  block {str(want.shape):18s} max|diff| {diff.max():.3e}  "
+          f"relative {diff.max() / scale:.3e}  "
+          + ("MATCH" if ok else "MISMATCH"))
+  return ok
+
+
+def test_transformer(verbose=True):
+  """The whole stack at a small config, JAX against diffusers on CPU."""
+  import jax.numpy as jnp
+  import numpy as np
+  import torch
+  from flax import nnx
+  from diffusers.models.transformers import transformer_minimax_h3 as h3
+
+  config = dict(num_attention_heads=4, attention_head_dim=32, hidden_size=128,
+                num_layers=2, num_refiner_layers=1, ffn_dim=256,
+                in_channels=8, audio_in_channels=6, patch_size=(1, 2, 2),
+                text_dim=64, freq_dim=32, time_embed_hidden_dim=128,
+                time_embed_dim=64, rope_freq_dim=4, rope_theta=10000.0,
+                norm_eps=1e-5, qk_norm_eps=1e-5, final_norm_eps=1e-5)
+  torch.manual_seed(0)
+  reference = h3.MiniMaxH3Transformer3DModel(**config).to(torch.float32).eval()
+
+  _, Transformer = _build_modules()
+  ours = Transformer(**config, dtype=jnp.float32, rngs=nnx.Rngs(0))
+
+  renames = (("ff.net.0.proj", "ff.proj"), ("ff.net.2", "ff.out"),
+             ("attn.to_out.0", "attn.to_out"))
+  for name, tensor in reference.named_parameters():
+    target = name
+    for old, new in renames:
+      target = target.replace(old, new)
+    node = ours
+    for part in target.split(".")[:-1]:
+      node = node[int(part)] if part.isdigit() else getattr(node, part)
+    getattr(node, target.split(".")[-1])[...] = jnp.asarray(
+        tensor.detach().float().numpy(), jnp.float32)
+
+  n_video, n_audio, n_text, n_steps = 12, 5, 4, 2
+  seq = n_video + n_audio + n_text
+  patch = config["in_channels"] * 4
+  rng = np.random.default_rng(0)
+  video = rng.standard_normal((1, n_video, patch), np.float32)
+  audio = rng.standard_normal((1, n_audio, config["audio_in_channels"]),
+                              np.float32)
+  text = rng.standard_normal((1, n_text, config["text_dim"]), np.float32)
+  timestep = rng.random(n_steps).astype(np.float32)
+  order = rng.permutation(seq)
+  text_i = np.sort(order[:n_text]).astype(np.int32)
+  video_i = np.sort(order[n_text:n_text + n_video]).astype(np.int32)
+  audio_i = np.sort(order[n_text + n_video:]).astype(np.int32)
+  tags = np.zeros(seq, np.int32)
+  tags[text_i], tags[audio_i] = 1, 2
+  steps = rng.integers(0, n_steps, seq).astype(np.int32)
+  pos = rng.integers(0, 7, (seq, 3)).astype(np.int32)
+
+  t = torch.from_numpy
+  with torch.no_grad():
+    want_v, want_a = reference(
+        t(video), t(audio), t(text), t(timestep), t(steps).long(),
+        t(tags).long(), t(pos).long(), t(video_i).long(), t(audio_i).long(),
+        t(text_i).long(), return_dict=False)
+  got_v, got_a = ours(
+      jnp.asarray(video), jnp.asarray(audio), jnp.asarray(text),
+      jnp.asarray(timestep), jnp.asarray(steps), jnp.asarray(tags),
+      jnp.asarray(pos), jnp.asarray(video_i), jnp.asarray(audio_i),
+      jnp.asarray(text_i))
+
+  ok = True
+  for label, want, got in (("video", want_v.numpy(), np.asarray(got_v)),
+                           ("audio", want_a.numpy(), np.asarray(got_a))):
+    diff = np.abs(want - got)
+    scale = np.abs(want).mean()
+    here = diff.max() < 2e-4 * max(scale, 1.0)
+    ok &= here
+    if verbose:
+      print(f"  {label:<6}{str(want.shape):18s} max|diff| {diff.max():.3e}  "
+            f"relative {diff.max() / scale:.3e}  "
+            + ("MATCH" if here else "MISMATCH"))
+  return ok
+
+
+# --------------------------------------------------------------------------
+# the checkpoint
+# --------------------------------------------------------------------------
+
+# Where our names differ from the checkpoint's. Only the feed-forward and
+# the attention output do: diffusers nests them in `net`/`to_out` lists.
+_RENAMES = (
+    ("ff.net.0.proj", "ff.proj"),
+    ("ff.net.2", "ff.out"),
+    ("attn.to_out.0", "attn.to_out"),
+)
+
+
+def find_snapshot(repo="MiniMaxAI/MiniMax-H3"):
+  """The local snapshot directory of `repo` (see `diffusers_tpu.hub.local_snapshot`)."""
+  from ...hub import local_snapshot
+
+  return local_snapshot(repo)
+
+
+def build_sharded(mesh, dtype=None, config=None):
+  """A model whose parameters are only ever allocated sharded.
+
+  Constructing it the plain way allocates every `jnp.zeros` on device 0
+  first -- 62 GB of it at the shipped config -- and the chip is out of
+  memory before a single weight is read. `nnx.eval_shape` builds the
+  tree abstractly, and each parameter is then materialised straight
+  into its shard.
+  """
+  import jax
+  import jax.numpy as jnp
+  from flax import nnx
+
+  _, Transformer = _build_modules()
+  dtype = dtype or jnp.bfloat16
+  config = config or CONFIG_FULL
+  model = nnx.eval_shape(
+      lambda: Transformer(**config, dtype=dtype, rngs=nnx.Rngs(0)))
+  state = nnx.state(model, nnx.Param)
+  for path, leaf in nnx.to_flat_state(state):
+    name = ".".join(str(part) for part in path).removesuffix(".value")
+    sharding = jax.sharding.NamedSharding(mesh, _spec_for(name))
+    leaf.value = jax.device_put(
+        jnp.zeros(leaf.value.shape, leaf.value.dtype), sharding)
+  nnx.update(model, state)
+  return model
+
+
+def load_transformer(model, transformer_dir, mesh=None, verbose=False,
+                     place=None, memory_kind=None, round_bf16=False):
+  """Read the checkpoint into the nnx module, sharding as it goes.
+
+  Every tensor must land and every parameter must be filled: a name that
+  does not resolve is an error, not a warning, because a silently
+  skipped tensor is the failure this is written to catch. The dtype each
+  parameter was built with wins, which is what keeps the mixed-precision
+  layout (`proj_in` and the output heads in float32, the stack in
+  bfloat16) intact.
+
+  `memory_kind="pinned_host"` parks the weights in host memory while
+  still splitting them across the mesh. `place=` puts every weight on one
+  device, which only suits a single chip (jit rejects single-device
+  arrays against a multi-device mesh).
+  """
+  import glob
+  import os
+
+  import jax
+  import jax.numpy as jnp
+  from flax import nnx
+  from safetensors import safe_open
+
+  shards = sorted(glob.glob(os.path.join(transformer_dir, "*.safetensors")))
+  if not shards:
+    raise FileNotFoundError(f"no safetensors in {transformer_dir}")
+
+  def resolve(name):
+    node = model
+    for part in name.split(".")[:-1]:
+      node = node[int(part)] if part.isdigit() else getattr(node, part)
+    return getattr(node, name.split(".")[-1])
+
+  if (os.environ.get("DT_FAST_LOAD", "1") == "1" and mesh is not None
+      and place is None and not round_bf16):
+    return _load_transformer_parallel(model, shards, mesh, memory_kind,
+                                      resolve, verbose)
+
+  loaded = 0
+  for shard in shards:
+    with safe_open(shard, framework="flax") as reader:
+      for key in reader.keys():
+        name = key
+        for old, new in _RENAMES:
+          name = name.replace(old, new)
+        param = resolve(name)
+        # `nnx.eval_shape` leaves each `Param` holding a
+        # `ShapeDtypeStruct`, which is not subscriptable; `.value`
+        # works for both that and a real array.
+        want = param.value if hasattr(param, "value") else param[...]
+        value = reader.get_tensor(key)
+        if round_bf16 and value.dtype == jnp.float32:
+          # Match the torchax backend, whose
+          # `from_pretrained(torch_dtype=torch.bfloat16)` also rounds the
+          # float32 `proj_in` and output heads, so outputs are comparable.
+          value = value.astype(jnp.bfloat16)
+        value = value.astype(want.dtype)
+        value = value.reshape(want.shape)
+        if place is not None:
+          value = jax.device_put(value, place)
+        elif mesh is not None:
+          # `memory_kind` may be a callable deciding per tensor, so only as
+          # many weights as needed are offloaded to host memory.
+          kind = memory_kind(name) if callable(memory_kind) else memory_kind
+          value = jax.device_put(
+              value, jax.sharding.NamedSharding(mesh, _spec_for(name),
+                                                memory_kind=kind))
+        if hasattr(param, "value"):
+          param.value = value
+        else:
+          param[...] = value
+        loaded += 1
+
+  expected = len(jax.tree.leaves(nnx.state(model, nnx.Param)))
+  if loaded != expected:
+    raise ValueError(f"loaded {loaded} tensors into {expected} parameters")
+  if verbose:
+    print(f"loaded {loaded} tensors from {len(shards)} shards")
+  return model
+
+
+def _load_transformer_parallel(model, shards, mesh, memory_kind, resolve,
+                               verbose):
+  """Parallel `load_transformer`: one thread per safetensors file.
+
+  Tensors are read as host numpy (bf16 via a zero-copy ml_dtypes view) and
+  `device_put` with a NamedSharding, so each chip receives only its shard.
+  The serial `framework="flax"` path instead lands every tensor whole on
+  chip 0 before splitting it, which is much slower at cold start.
+  """
+  import concurrent.futures as cf
+
+  import jax
+  import ml_dtypes
+  import numpy as np
+  import torch
+  from flax import nnx
+  from safetensors import safe_open
+
+  want_dtypes = {}
+
+  def target(name):
+    param = resolve(name)
+    want = param.value if hasattr(param, "value") else param[...]
+    return param, want
+
+  def one_shard(shard):
+    out = []
+    with safe_open(shard, framework="pt") as reader:
+      for key in reader.keys():
+        name = key
+        for old, new in _RENAMES:
+          name = name.replace(old, new)
+        _, want = target(name)
+        t = reader.get_tensor(key)
+        if t.dtype == torch.bfloat16:
+          arr = t.view(torch.int16).numpy().view(ml_dtypes.bfloat16)
+        else:
+          arr = t.numpy()
+        arr = arr.astype(np.dtype(want.dtype), copy=False).reshape(want.shape)
+        kind = memory_kind(name) if callable(memory_kind) else memory_kind
+        value = jax.device_put(
+            arr, jax.sharding.NamedSharding(mesh, _spec_for(name),
+                                            memory_kind=kind))
+        out.append((name, value))
+    return out
+
+  with cf.ThreadPoolExecutor(max_workers=len(shards)) as ex:
+    results = list(ex.map(one_shard, shards))
+  loaded = 0
+  for out in results:
+    for name, value in out:
+      param, _ = target(name)
+      if hasattr(param, "value"):
+        param.value = value
+      else:
+        param[...] = value
+      loaded += 1
+  expected = len(jax.tree.leaves(nnx.state(model, nnx.Param)))
+  if loaded != expected:
+    raise ValueError(f"loaded {loaded} tensors into {expected} parameters")
+  if verbose:
+    print(f"loaded {loaded} tensors from {len(shards)} shards (parallel)")
+  return model
+
+
+def load_transformer_from(model, params, mesh=None, place=None):
+  """Fill the nnx module from weights that are already on the chips.
+
+  The traced backend holds the whole transformer as a dict of jax
+  arrays keyed by the diffusers module path (the checkpoint names); this
+  reuses them instead of reading the checkpoint again. Names go through
+  `_RENAMES` as in `load_transformer`, and every parameter must be filled.
+  """
+  import jax
+  from flax import nnx
+
+  def resolve(name):
+    node = model
+    for part in name.split(".")[:-1]:
+      node = node[int(part)] if part.isdigit() else getattr(node, part)
+    return getattr(node, name.split(".")[-1])
+
+  filled, skipped = 0, []
+  for key, value in params.items():
+    name = key
+    for old, new in _RENAMES:
+      name = name.replace(old, new)
+    try:
+      param = resolve(name)
+    except AttributeError:
+      # Non-persistent buffers such as `rope.inv_freq`; this module
+      # computes its own.
+      skipped.append(key)
+      continue
+    # `.value` works for both real arrays and the `ShapeDtypeStruct`
+    # leaves `nnx.eval_shape` leaves behind.
+    want = param.value if hasattr(param, "value") else param[...]
+    value = value.astype(want.dtype).reshape(want.shape)
+    if place is not None:
+      value = jax.device_put(value, place)
+    elif mesh is not None:
+      value = jax.device_put(
+          value, jax.sharding.NamedSharding(mesh, _spec_for(name)))
+    if hasattr(param, "value"):
+      param.value = value
+    else:
+      param[...] = value
+    filled += 1
+
+  expected = len(jax.tree.leaves(nnx.state(model, nnx.Param)))
+  if filled != expected:
+    raise ValueError(
+        f"filled {filled} of {expected} parameters"
+        + (f"; skipped {skipped}" if skipped else ""))
+  if skipped:
+    print(f"  [native] skipped {len(skipped)} non-persistent buffers: {skipped}",
+          flush=True)
+  return model
+
+
+def _spec_for(name):
+  """Where each weight is cut over the one `tp` axis.
+
+  The head axis splits `q`, `k`, `v` and the feed-forward's gate; the
+  contraction splits `to_out` and the feed-forward's output, so each
+  block ends with one all-reduce. Norms and the timestep MLP are small
+  and stay whole. Same layout as the torchax path.
+  """
+  from jax.sharding import PartitionSpec as P
+
+  rows = ("attn.to_q.weight", "attn.to_k.weight", "attn.to_v.weight",
+          "ff.proj.weight", "adaln_proj.linear.weight")
+  row_scales = ("attn.to_q.weight_scale", "attn.to_k.weight_scale",
+                "attn.to_v.weight_scale", "ff.proj.weight_scale",
+                "adaln_proj.linear.weight_scale")
+  columns = ("attn.to_out.weight", "ff.out.weight")
+  if any(name.endswith(suffix) for suffix in rows):
+    return P("tp", None)
+  if any(name.endswith(suffix) for suffix in row_scales):
+    return P("tp")
+  if any(name.endswith(suffix) for suffix in columns):
+    return P(None, "tp")
+  if name.endswith("adaln_proj.linear.bias"):
+    return P("tp")
+  return P()
+
+
+def quantize_transformer_fp8(model, mesh=None):
+  """Quantize the 6 big Linears per transformer block to float8_e4m3fn."""
+  import jax
+  import jax.numpy as jnp
+  from flax import nnx
+
+  f8_max = jnp.float32(448.0)
+
+  @jax.jit
+  def _quant_w(w):
+    w32 = w.astype(jnp.float32)
+    scale = jnp.maximum(jnp.max(jnp.abs(w32), axis=1), jnp.float32(1e-12)) / f8_max
+    qw = jnp.clip(w32 / scale[:, None], -f8_max, f8_max).astype(jnp.float8_e4m3fn)
+    return qw, scale
+
+  targets = (
+      ("attn", "to_q"),
+      ("attn", "to_k"),
+      ("attn", "to_v"),
+      ("attn", "to_out"),
+      ("ff", "proj"),
+      ("ff", "out"),
+      ("adaln_proj", "linear"),
+  )
+  count = 0
+  for i, block in enumerate(model.transformer_blocks):
+    for parent_attr, leaf_attr in targets:
+      lin = getattr(getattr(block, parent_attr), leaf_attr)
+      w = lin.weight[...]
+      mem_kind = getattr(w.sharding, "memory_kind", None) if hasattr(w, "sharding") else None
+      w_name = f"transformer_blocks.{i}.{parent_attr}.{leaf_attr}.weight"
+      s_name = f"transformer_blocks.{i}.{parent_attr}.{leaf_attr}.weight_scale"
+      # Compute on device then place back in original memory_kind if offloaded
+      if mesh is not None and mem_kind == "pinned_host":
+        w_dev = jax.device_put(
+            w, jax.sharding.NamedSharding(mesh, _spec_for(w_name), memory_kind="device"))
+        qw_dev, scale_dev = _quant_w(w_dev)
+        qw = jax.device_put(
+            qw_dev, jax.sharding.NamedSharding(mesh, _spec_for(w_name), memory_kind="pinned_host"))
+        scale = jax.device_put(
+            scale_dev, jax.sharding.NamedSharding(mesh, _spec_for(s_name), memory_kind="pinned_host"))
+      else:
+        qw, scale = _quant_w(w)
+        if mesh is not None:
+          qw = jax.device_put(
+              qw, jax.sharding.NamedSharding(mesh, _spec_for(w_name), memory_kind=mem_kind))
+          scale = jax.device_put(
+              scale, jax.sharding.NamedSharding(mesh, _spec_for(s_name), memory_kind=mem_kind))
+      lin.weight = nnx.Param(qw)
+      lin.weight_scale = nnx.data(nnx.Param(scale))
+      count += 1
+  print(f"  [fp8] Quantized {count} Linear layers to float8_e4m3fn across "
+        f"{len(model.transformer_blocks)} blocks", flush=True)
+  return model
+
+
+def test_checkpoint_names(verbose=True):
+  """Every checkpoint key resolves, and every parameter is covered.
+
+  Checked against the index rather than by loading: the real config is
+  32 B parameters and the point is the name mapping, not the bytes.
+  `nnx.eval_shape` builds the module tree without allocating any of it.
+  """
+  import glob
+  import json
+  import os
+
+  import jax
+  import jax.numpy as jnp
+  from flax import nnx
+
+  try:
+    snapshot = find_snapshot()
+  except FileNotFoundError as missing:
+    if verbose:
+      print(f"  checkpoint names: skipped ({missing})")
+    return True
+  index = glob.glob(os.path.join(snapshot, "transformer", "*.index.json"))
+  if not index:
+    if verbose:
+      print("  checkpoint names: skipped (no index)")
+    return True
+  keys = sorted(json.load(open(index[0]))["weight_map"])
+
+  _, Transformer = _build_modules()
+  abstract = nnx.eval_shape(
+      lambda: Transformer(**CONFIG_FULL, dtype=jnp.bfloat16,
+                          rngs=nnx.Rngs(0)))
+  ours = set()
+  for path, _ in nnx.to_flat_state(nnx.state(abstract, nnx.Param)):
+    ours.add(".".join(str(part) for part in path).removesuffix(".value"))
+
+  renamed = []
+  for key in keys:
+    name = key
+    for old, new in _RENAMES:
+      name = name.replace(old, new)
+    renamed.append(name)
+
+  missing = sorted(set(renamed) - ours)
+  extra = sorted(ours - set(renamed))
+  ok = not missing and not extra
+  if verbose:
+    print(f"  checkpoint names: {len(keys)} keys, {len(ours)} parameters  "
+          + ("MATCH" if ok else "MISMATCH"))
+    for name in missing[:4]:
+      print(f"    in the checkpoint, not in our model: {name}")
+    for name in extra[:4]:
+      print(f"    in our model, not in the checkpoint: {name}")
+  return ok
+
+
+def parameter_count():
+  """What the shipped config comes to, as a check on the transcription."""
+  c = CONFIG
+  inner = c["num_attention_heads"] * c["attention_head_dim"]
+  per_block = (
+      3 * c["hidden_size"] * inner            # q, k, v
+      + inner * c["hidden_size"]              # out
+      + 2 * c["attention_head_dim"]           # q/k norms
+      + 2 * c["hidden_size"]                  # the two norms
+      + c["hidden_size"] * 2 * c["ffn_dim"]   # swiglu projection
+      + c["ffn_dim"] * c["hidden_size"]       # ff out
+      + c["time_embed_dim"] * 6 * c["hidden_size"] * MODALITY_NUM
+      + 6 * c["hidden_size"] * MODALITY_NUM   # adaln bias
+  )
+  return per_block, per_block * c["num_layers"]
+
+
+def main():
+  ok = test_block()
+  ok &= test_transformer()
+  ok &= test_checkpoint_names()
+  per_block, total = parameter_count()
+  print(f"  one block {per_block / 1e9:.2f}B, x{CONFIG['num_layers']} = "
+        f"{total / 1e9:.1f}B  ({total * 2 / 2**30:.0f} GiB in bfloat16)")
+  print("all match" if ok else "FAILED")
+  return 0 if ok else 1
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())
