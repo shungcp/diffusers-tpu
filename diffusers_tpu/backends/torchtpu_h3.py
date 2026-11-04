@@ -93,6 +93,9 @@ def parse_args():
   p.add_argument("--height", type=int, default=480)
   p.add_argument("--width", type=int, default=832)
   p.add_argument("--steps", type=int, default=8)
+  p.add_argument("--pika-adapter", default=None,
+                 help="Pika-H3-Flex adapter dir (fl2va/ or ref2va/): merge the "
+                      "LoRA and sample its six-step re-noising ladder")
   p.add_argument("--seed", type=int, default=42)
   p.add_argument("--out", default="out")
   p.add_argument("--tag", default="tt_h3")
@@ -331,6 +334,14 @@ def main():
 
   rank, world, all_reduce = init_parallel()
   transformer = getattr(pipe, pipe._dit_name)
+  if args.pika_adapter:
+    # Merged before any slicing: the adapter's matrices are full-width.
+    from diffusers_tpu.models.minimax_h3.pika import merge_pika_lora, pika_scheduler
+    pika = merge_pika_lora(transformer, args.pika_adapter)
+    pipe.update_components(
+        scheduler=pika_scheduler(pipe.scheduler, pika, "video_shift", args.seed),
+        audio_scheduler=pika_scheduler(pipe.audio_scheduler, pika, "audio_shift",
+                                       args.seed))
   if world > 1:
     # `--shard-adaln`: also shard the AdaLN projection (~43% of a block).
     # The gather restores the tensor exactly. Off by default.
@@ -1937,12 +1948,16 @@ def _write(result, args):
   if frames is None:
     print("no frames on the result; nothing written", flush=True)
     return
+  if os.environ.get("RANK", "0") != "0":
+    return    # every rank holds the frames; eight writers would race on one file
   path = os.path.join(args.out, f"h3_{args.tag}_frames.npy")
   arr = np.asarray(frames[0])
   if arr.dtype != np.uint8:
     # output_type="np" yields floats in [0, 1]; same formula as `numpy_to_pil`.
     arr = (arr * 255).round().astype("uint8")
-  np.save(path, arr)
+  tmp = path[:-len(".npy")] + ".tmp.npy"
+  np.save(tmp, arr)
+  os.replace(tmp, path)
   print(f"wrote {path}", flush=True)
 
 

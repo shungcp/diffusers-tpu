@@ -247,12 +247,18 @@ The resident server takes the adapters too, one per workflow; each request line 
 bash scripts/run_h3_jax_server.sh requests.jsonl --pika-fl2va $PIKA/fl2va --pika-ref2va $PIKA/ref2va
 ```
 
-The torchax backend takes the same flag; turn its default lossy options off for the six-step ladder (48.4 s for text-to-video, 67.0 s for reference-to-video at 768p).
-torchax 后端用同一个参数;六步采样时要关掉它默认的有损选项(768p 下文生视频 48.4 秒,参考图生视频 67.0 秒)。
+The torchax and torch_tpu backends take the same flag; for torchax, turn its default lossy options off for the six-step ladder.
+torchax 和 torch_tpu 后端用同一个参数;torchax 六步采样时要关掉它默认的有损选项。
 
 ```bash
 bash scripts/run_h3_torchax.sh --pika-adapter $PIKA/fl2va --cache-threshold 0 --sparse-window 0 --prompt "..."
+bash scripts/run_h3_torchtpu.sh t2va --pika-adapter $PIKA/fl2va --prompt "..."
 ```
+
+| Pika-H3-Flex, 768x1344, 345 frames | JAX | torchax | torch_tpu |
+|---|---|---|---|
+| text-to-video / 文生视频 | **40.3 s** | 47.3 s | 71.1 s |
+| reference-to-video / 参考图生视频 | **51.7 s** | 67.0 s | 79.4 s |
 
 The adapter is merged into the weights while loading, so the denoising step costs the same as the base model.
 适配器在加载时就合并进权重,所以每一步去噪的开销和底座模型一样。

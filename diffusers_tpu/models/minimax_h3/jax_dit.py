@@ -128,6 +128,12 @@ def _cmm(x, weights):
   return list(outs)
 
 
+def _tp_size():
+  """Size of the `tp` axis of the mesh in context (1 without one)."""
+  import jax
+  return dict(jax.sharding.get_abstract_mesh().shape).get("tp", 1)
+
+
 def _constrain(x, *spec):
   """`with_sharding_constraint`, or the identity when the flag is off."""
   if not _STREAM:
@@ -319,7 +325,7 @@ def _build_modules():
 
     def __call__(self, x, rope, sdpa=None, true_len=None):
       shape = x.shape[:-1] + (self.heads, self.head_dim)
-      if CMM and rope is not None and x.shape[1] % 8 == 0:
+      if CMM and rope is not None and x.shape[1] % _tp_size() == 0:
         qx, kx, vx = _cmm(x, [self.to_q.weight[...], self.to_k.weight[...],
                               self.to_v.weight[...]])
       else:
@@ -368,7 +374,7 @@ def _build_modules():
       self.out = Linear(ffn_dim, hidden_size, dtype=dtype, rngs=rngs)
 
     def __call__(self, x):
-      if CMM and x.shape[1] % 8 == 0 and x.shape[1] > 50000:   # skip the token refiner
+      if CMM and x.shape[1] % _tp_size() == 0 and x.shape[1] > 50000:   # skip the token refiner
         (y,) = _cmm(x, [self.proj.weight[...]])
       else:
         y = self.proj(x)
@@ -1307,6 +1313,12 @@ def quantize_transformer_fp8(model, mesh=None):
     for parent_attr, leaf_attr in targets:
       lin = getattr(getattr(block, parent_attr), leaf_attr)
       w = lin.weight[...]
+      if parent_attr == "adaln_proj" and (
+          (mesh is not None and mesh.devices.size > 1) or w.shape[0] == 1):
+        # Leave the modulation in bfloat16 when HBM is not the constraint
+        # (several chips) or when it is a placeholder (`--adaln-host`): its
+        # fp8 error accumulates over 50 blocks (v7x-8 ref2va DINO 0.8057).
+        continue
       mem_kind = getattr(w.sharding, "memory_kind", None) if hasattr(w, "sharding") else None
       w_name = f"transformer_blocks.{i}.{parent_attr}.{leaf_attr}.weight"
       s_name = f"transformer_blocks.{i}.{parent_attr}.{leaf_attr}.weight_scale"

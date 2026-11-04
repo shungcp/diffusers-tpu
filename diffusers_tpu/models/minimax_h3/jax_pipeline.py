@@ -831,6 +831,12 @@ def main():
           return sdpa(q, k, v)
         k = k - jnp.mean(k, axis=2, keepdims=True)
         with jax.default_matmul_precision("default"):
+          if args.attn_keep_heads:
+            # As in `sdpa`: shard heads and let XLA choose the output layout.
+            from jax.experimental.shard_map import shard_map
+            qs, kvs, _ = mesh_attention._partition_specs(mesh, q.shape, True)
+            return shard_map(_local_sp, mesh=mesh, in_specs=(qs, kvs, kvs),
+                             out_specs=qs, check_rep=False)(q, k, v)
           return mesh_attention._on_mesh(_local_sp, mesh, q, k, v, True)
     else:
       print("  [sparse] equivalent to dense (window covers the whole sequence), not applied", flush=True)
