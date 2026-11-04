@@ -117,6 +117,7 @@ Measured 2026-11-02 to 2026-11-03; "4 chips" means four chips of the same v6e-8 
 | Qwen-Image-2.1, 20 steps, JAX / 20 步,JAX | 8.1 s ² | 1.34 s ³ | 0.74 s |
 | Qwen-Image-2.1, 20 steps, torchax / 20 步,torchax | does not fit / 放不下 | 1.66 s | 1.28 s |
 | Qwen-Image-2.1, 20 steps, torch_tpu / 20 步,torch_tpu | 8.8 s | does not fit / 放不下 | 1.18 s |
+| MiniMax-H3 reference-to-video, lossy / 参考图生视频,有损 | — | 92.7 s | 52.3 s |
 | Pika-H3-Flex text-to-video / 文生视频 | 58.8 s ⁴ | 70.8 s | 40.3 s |
 
 ¹ 480x832, 121 frames, `--chips 1 --offload`. ¹ 480x832,121 帧,`--chips 1 --offload`。
@@ -127,8 +128,8 @@ Measured 2026-11-02 to 2026-11-03; "4 chips" means four chips of the same v6e-8 
 
 ⁴ On a **TPU v5e** chip (16 GB), 480x832, 141 frames, with `--int8-weights --adaln-host`. ⁴ 在 **TPU v5e** chip(16 GB)上,480x832,141 帧,使用 `--int8-weights --adaln-host`。
 
-MiniMax-H3 on 4 chips needs `--offload` (69.8 s lossy, 208.4 s lossless), or `--adaln-host --text-offload` (63.7 s lossy).
-MiniMax-H3 在 4 chip 上需要 `--offload`(有损 69.8 秒,无损 208.4 秒),或者 `--adaln-host --text-offload`(有损 63.7 秒)。
+MiniMax-H3 on 4 chips needs `--offload` (text-to-video 69.8 s lossy, 208.4 s lossless; reference-to-video 98.7 s lossy, 267.3 s lossless), or `--adaln-host --text-offload` (63.7 s and 92.7 s lossy).
+MiniMax-H3 在 4 chip 上需要 `--offload`(文生视频有损 69.8 秒、无损 208.4 秒;参考图生视频有损 98.7 秒、无损 267.3 秒),或者 `--adaln-host --text-offload`(有损 63.7 秒和 92.7 秒)。
 
 The 4-chip and 8-chip MiniMax-H3 and Pika-H3-Flex numbers use 768x1344, 345 frames.
 4 chip 和 8 chip 的 MiniMax-H3、Pika-H3-Flex 数字都是 768x1344、345 帧。

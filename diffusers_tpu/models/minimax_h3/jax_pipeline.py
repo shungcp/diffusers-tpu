@@ -417,8 +417,13 @@ def main():
           f"{time.perf_counter() - _t:.2f}s", flush=True)
     del _ri, _pr
     vision, _ = jvision.build(text_dir, dtype=dtype, abstract=True)
+    # Host-resident vision weights on a multi-chip mesh crash the TPU:
+    # their replicated copy is fetched in async slices of width 1152 / chips
+    # (288 on four chips), and lane-dimension slices must start on 128-lane
+    # chunk boundaries ("Core halted unexpectedly"). The tower is 1.2 GB,
+    # so it stays on the chips there.
     jvision.load(vision, text_dir, mesh=mesh, spec_fn=lambda k, n: _P(),
-                 memory_kind=text_host)
+                 memory_kind=text_host if len(devices) == 1 else None)
     # Shard vision attention heads across chips (text stage 4.9 -> 1.4 s).
     if os.environ.get("DT_VISION_HEAD_SHARD", "1") == "1" and len(devices) > 1:
       _qv.HEAD_SHARD_AXIS = "tp"
