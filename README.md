@@ -150,8 +150,8 @@ Download the model weights into the Hugging Face cache (set `HF_HOME` to choose 
 把模型权重下载到 Hugging Face 缓存(用 `HF_HOME` 指定位置)。
 
 ```bash
-huggingface-cli download MiniMaxAI/MiniMax-H3
-huggingface-cli download Qwen/Qwen-Image-2.1
+hf download MiniMaxAI/MiniMax-H3
+hf download Qwen/Qwen-Image-2.1
 ```
 
 The torch_tpu backend needs its own environment with Python 3.14: `requirements/torchtpu.txt`.
@@ -225,18 +225,17 @@ bash scripts/run_qwen.sh torchtpu --prompt "..."
 
 ## Run Pika-H3-Flex / 运行 Pika-H3-Flex
 
-Download the two adapters; the base model is the MiniMax-H3 you already have.
-下载两个适配器;底座就是已经下载好的 MiniMax-H3。
+Download the two adapters; the base model is the MiniMax-H3 you already have. The command prints the folder it downloaded to.
+下载两个适配器;底座就是已经下载好的 MiniMax-H3。这条命令会输出下载到的文件夹。
 
 ```bash
-huggingface-cli download Pika-Labs/Pika-H3-Flex --include "fl2va/*" "ref2va/*"
+PIKA=$(hf download Pika-Labs/Pika-H3-Flex --include "fl2va/*" --include "ref2va/*" --quiet)
 ```
 
 Point `--pika-adapter` at the `fl2va` folder for text-to-video, or the `ref2va` folder for reference-to-video.
 文生视频时把 `--pika-adapter` 指向 `fl2va` 文件夹,参考图生视频时指向 `ref2va` 文件夹。
 
 ```bash
-PIKA=$(ls -d $HF_HOME/hub/models--Pika-Labs--Pika-H3-Flex/snapshots/*)
 bash scripts/run_h3_jax.sh t2va --pika-adapter $PIKA/fl2va --prompt "..."
 bash scripts/run_h3_jax.sh ref2va --pika-adapter $PIKA/ref2va --reference character.png --prompt "..."
 ```
