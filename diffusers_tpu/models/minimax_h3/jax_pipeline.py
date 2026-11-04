@@ -232,6 +232,22 @@ def sigma_schedule(steps, shift):
   return sigmas[keep]
 
 
+def _release_host_memory():
+  """Hand freed host memory back to the OS.
+
+  Freed pinned-host arrays stay in the allocator's free lists: on a v5e host
+  (tcmalloc preloaded) 8 GB freed left RSS at 12 GB until released. A first
+  start on 47 GB then still held the 25 GB text tower while building the DiT,
+  and the kernel killed it.
+  """
+  import ctypes
+  libc = ctypes.CDLL(None)
+  for name in ("MallocExtension_ReleaseFreeMemory", "malloc_trim"):
+    fn = getattr(libc, name, None)
+    if fn is not None:
+      fn(*((0,) if name == "malloc_trim" else ()))
+
+
 class _LazyPut:
   """A list whose items are moved to `sharding` when indexed."""
 
@@ -562,6 +578,7 @@ def main():
     # backends that time the text tower inside it.
     print(f"  [t2va] text tower first {time.perf_counter() - began_t2va_text:.1f}s"
           f" (incl. compile; not part of generate)", flush=True)
+  _release_host_memory()
   live = sum(x.nbytes for x in jax.live_arrays()) / 2**30
   print(f"  freed the text tower, {live:.1f} GiB still live", flush=True)
 
@@ -1214,6 +1231,7 @@ def main():
     else:
       del state, transformer, call, call_sparse, graphdef
       jax.clear_caches()
+      _release_host_memory()
       live = sum(x.nbytes for x in jax.live_arrays()) / 2**30
       print(f"  freed the transformer, {live:.1f} GiB still live", flush=True)
     video = jnp.asarray(video)

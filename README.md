@@ -28,8 +28,8 @@ Newest first. Each entry links a date to what changed.
 - **2026-11-04** — TPU v7x results on 1, 2, 4 and 8 devices (a v7x chip has two TensorCores, each a JAX device with 95 GB of HBM, so no `--offload` is needed even at 768p on one device), plus a sequence-tiled Pallas SwiGLU FFN kernel (`--pallas-ffn`): Pika-H3-Flex generates a 14-second 768p clip in 36.0 s on a v7x-8 (8 devices, 4 chips; 13.5 s at 480p), 63.3 s on 4 devices, 108.4 s on 2 devices, and 197.6 s on a single device.
   **2026-11-04** — 新增 TPU v7x 在 1、2、4、8 个 device 上的性能数据(一个 v7x chip 有两个 TensorCore,每个是一个 JAX device,各有 95 GB HBM,所以单个 device 跑 768p 也无需 `--offload`)及序列分块 Pallas SwiGLU FFN kernel(`--pallas-ffn`):Pika-H3-Flex 生成 14 秒 768p 视频在 v7x-8(8 个 device,4 个 chip)上为 36.0 秒(480p 为 13.5 秒),4 个 device 为 63.3 秒,2 个 device 为 108.4 秒,单个 device 为 197.6 秒。
 
-- **2026-11-04** — The JAX backend now decodes the soundtrack as well (its videos used to be silent); `scripts/frames_to_mp4.py` muxes it in. It adds about 0.3 s on a v6e-8 and nothing on one chip.
-  **2026-11-04** — JAX 后端现在也解码音轨(之前生成的视频没有声音),`scripts/frames_to_mp4.py` 会把音轨合进 mp4。在 v6e-8 上多约 0.3 秒,单 chip 上不增加时间。
+- **2026-11-04** — The JAX backend now decodes the soundtrack as well (its videos used to be silent); `scripts/frames_to_mp4.py` muxes it in. It adds about 0.1 s on a v6e-8 and nothing on one chip.
+  **2026-11-04** — JAX 后端现在也解码音轨(之前生成的视频没有声音),`scripts/frames_to_mp4.py` 会把音轨合进 mp4。在 v6e-8 上多约 0.1 秒,单 chip 上不增加时间。
 
 - **2026-11-03** — Pika-H3-Flex six-step adapters: a 14-second 768p clip in 40.3 s on a v6e-8. MiniMax-H3 now also runs end to end on a single TPU v5e chip.
   **2026-11-03** — 支持 Pika-H3-Flex 六步适配器:在 v6e-8 上 40.3 秒生成一段 14 秒的 768p 视频。MiniMax-H3 现在也能在单个 TPU v5e chip 上端到端运行。
@@ -56,8 +56,8 @@ Software: jax 0.12.0.1, libtpu 0.0.51, torch_tpu 0.2.0, diffusers `cc8644b` (see
 | reference-to-video, lossless / 参考图生视频,无损 | **139.2 s** | 186.7 s | 189 s |
 | reference-to-video, lossy / 参考图生视频,有损 | **51.2 s** | 77.3 s | 86 s |
 
-JAX times include decoding the audio; the two lossless JAX numbers were measured before it was added (about 0.3 s more).
-JAX 的时间包含音频解码;两个无损 JAX 数字是加入音频解码之前测的(会多约 0.3 秒)。
+JAX times include decoding the audio; the two lossless JAX numbers were measured before it was added (about 0.1 s more).
+JAX 的时间包含音频解码;两个无损 JAX 数字是加入音频解码之前测的(会多约 0.1 秒)。
 
 "Lossy" skips a DiT call while the timestep embedding barely changes, and lets each video frame attend only to nearby frames.
 "有损"是指:时间步嵌入几乎不变时跳过一次 DiT 计算,并且让每一帧只关注相邻的帧。
@@ -98,9 +98,9 @@ A resident server (`--runs`) keeps the model and decoder on the chips; these are
 
 | Pika-H3-Flex, v6e-8 | per request / 每个请求 |
 |---|---|
-| text-to-video / 文生视频 | **11.1 s** |
-| reference-to-video, same reference image / 参考图生视频,参考图不变 | **13.8 s** |
-| reference-to-video, a new reference image every request / 参考图生视频,每次换新参考图 | **15.2 s** |
+| text-to-video / 文生视频 | **10.8 s** |
+| reference-to-video, same reference image / 参考图生视频,参考图不变 | **13.5 s** |
+| reference-to-video, a new reference image every request / 参考图生视频,每次换新参考图 | **14.8 s** |
 
 Reference-to-video uses `--sparse-window 16 --sparse-dense-steps 2`; a new image adds the text/vision encode (0.8 s) and the reference encode (0.5 s); preparing the image on the host takes another 0.2 s.
 参考图生视频使用 `--sparse-window 16 --sparse-dense-steps 2`;换新图时要加上文本/视觉编码(0.8 秒)和参考图编码(0.5 秒);在主机上准备图片另需 0.2 秒。
@@ -111,8 +111,8 @@ Without the sparse attention, reference-to-video takes 15.0 s with the same imag
 The same sparse attention brings text-to-video to 9.9 s.
 文生视频加上同样的稀疏注意力是 9.9 秒。
 
-Through the resident server, with a new prompt or reference image on every request, text-to-video takes 11.7 s and reference-to-video 16.0–16.6 s (`sparse_dense_steps` 3).
-通过常驻服务、每个请求换新的提示词或参考图时,文生视频为 11.7 秒,参考图生视频为 16.0–16.6 秒(`sparse_dense_steps` 设为 3)。
+Through the resident server, with a new prompt or reference image on every request, text-to-video takes 11.5 s and reference-to-video 15.8–16.5 s (`sparse_dense_steps` 3).
+通过常驻服务、每个请求换新的提示词或参考图时,文生视频为 11.5 秒,参考图生视频为 15.8–16.5 秒(`sparse_dense_steps` 设为 3)。
 
 ### Fewer chips / 更少的 chip
 
