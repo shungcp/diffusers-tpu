@@ -13,7 +13,7 @@ import os
 class AudioDecoder:
   """Rows `(2 * T, 32)` (channel-major, as packed) -> waveform `(2, samples)`."""
 
-  def __init__(self, snapshot, precision="high", on_cpu=False):
+  def __init__(self, snapshot, precision="high", on_cpu=False, devices=None):
     """`on_cpu`: decode with PyTorch on the host, in a background thread.
     For one 16 GB chip, which cannot hold the video decoder and this
     program's 1.8 GB of scratch at once; the host's ~2 s for a 6 s clip
@@ -49,7 +49,7 @@ class AudioDecoder:
     env = torchax.default_env()
     # The two stereo channels are independent batch items: one per chip
     # when there are two (0.53 -> 0.37 s on v6e).
-    devs = jax.devices()[:2]
+    devs = (devices if devices is not None else jax.devices())[:2]
     self._mesh = mesh = jax.sharding.Mesh(np.array(devs), ("b",))
     self._z_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(
         "b" if len(devs) == 2 else None))

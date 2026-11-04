@@ -426,13 +426,16 @@ class Server:
     self.audio_dec = None
     if not self.a.no_audio:
       from diffusers_tpu.models.minimax_h3.audio_decode import AudioDecoder
-      self.audio_dec = AudioDecoder(self.snapshot, on_cpu=mesh.devices.size == 1)
+      _hbm = (mesh.devices.flat[0].memory_stats() or {}).get("bytes_limit", 0) / 2**30
+      _audio_cpu = mesh.devices.size == 1 and (0 < _hbm < 50)
+      self.audio_dec = AudioDecoder(
+          self.snapshot, on_cpu=_audio_cpu, devices=list(mesh.devices.flat))
       # Compile once for the default length; otherwise the first request
       # pays about 64 s for it.
       from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
           align_num_frames, audio_latent_num_frames)
       n = audio_latent_num_frames(align_num_frames(int(self.a.num_frames), 17, 5))
-      if mesh.devices.size > 1:
+      if not _audio_cpu:
         self.audio_dec.decode(np.zeros((2 * n, self.audio_dec.channels), np.float32))
 
   # ---------------------------------------------------------------------
@@ -861,10 +864,11 @@ class Server:
     z = latents.astype(self.dtype)
     if pad_tokens:
       z = jnp.concatenate([z, jnp.repeat(z[:, :, -1:], pad_tokens, axis=2)], axis=2)
+    _base_cap = 8 if latents.shape[3] * latents.shape[4] <= 30 * 52 else 4
     K = decode_chunk_batch(frames_lat, a.decode_chunk_batch,
                            1 if self.mesh.devices.size == 1 else
                            a.decode_chunk_cap or
-                           (8 if latents.shape[3] * latents.shape[4] <= 30 * 52 else 4))
+                           max(1, (_base_cap * self.mesh.devices.size) // 8))
     decoded, pieces, carry = {}, [], None
     for i in range(num_chunks):
       if i not in decoded:

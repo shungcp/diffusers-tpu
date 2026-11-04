@@ -372,8 +372,32 @@ def _build_modules():
     def __init__(self, hidden_size, ffn_dim, *, dtype=jnp.bfloat16, rngs=None):
       self.proj = Linear(hidden_size, 2 * ffn_dim, dtype=dtype, rngs=rngs)
       self.out = Linear(ffn_dim, hidden_size, dtype=dtype, rngs=rngs)
+      self.swiglu_tp = 1
 
     def __call__(self, x):
+      if os.environ.get("DT_PALLAS_FFN") == "1" and x.shape[1] >= 1024:
+        from ...kernels import pallas_ffn
+        ws_proj = (
+            self.proj.weight_scale[...]
+            if self.proj.weight_scale is not None
+            and self.proj.weight_scale[...] is not None
+            else None
+        )
+        ws_out = (
+            self.out.weight_scale[...]
+            if self.out.weight_scale is not None
+            and self.out.weight_scale[...] is not None
+            else None
+        )
+        bm = int(os.environ.get("DT_PALLAS_FFN_BM", "512"))
+        return pallas_ffn.pallas_swiglu_ffn_sharded(
+            x,
+            self.proj.weight[...],
+            self.out.weight[...],
+            ws_proj,
+            ws_out,
+            block_m=bm,
+        )
       if FF_CHUNK and x.shape[1] > FF_CHUNK:
         # DT_FF_CHUNK=<rows>: the feed-forward a slab of rows at a time. Its
         # (seq, 2 x 14336) intermediate is 6 GB at 768p/345 frames, which
@@ -392,6 +416,11 @@ def _build_modules():
         (y,) = _cmm(x, [self.proj.weight[...]])
       else:
         y = self.proj(x)
+      tp = getattr(self, "swiglu_tp", 1)
+      if tp > 1:
+        yr = y.reshape(*y.shape[:-1], tp, 2, -1)
+        value, gate = yr[..., 0, :], yr[..., 1, :]
+        return self.out((value * jax.nn.silu(gate)).reshape(*x.shape[:-1], -1))
       value, gate = jnp.split(y, 2, axis=-1)
       return self.out(value * jax.nn.silu(gate))
 
@@ -657,10 +686,13 @@ def _build_modules():
       if os.environ.get("DT_DUMP_BLOCKS"):
         jax.debug.callback(functools.partial(_blk_save, "x0"), x)
         jax.debug.callback(functools.partial(_blk_save, "temb"), temb)
-      _barrier = segments is not None or os.environ.get("DT_BLOCK_BARRIER") == "1"
+      _barrier = (segments is not None or adaln_mods is not None
+                  or _tp_size() <= 2
+                  or os.environ.get("DT_BLOCK_BARRIER") == "1")
       for _i, block in enumerate(self.transformer_blocks):
         if _barrier and _i > 0:
-          x, temb = jax.lax.optimization_barrier((x, temb))
+          x, temb, adaln_indices = jax.lax.optimization_barrier(
+              (x, temb, adaln_indices))
         x = block(x, temb, adaln_indices, rope, sdpa, segments,
                   seq if seq_len is None else seq_len,
                   None if adaln_mods is None else adaln_mods[_i])
@@ -1452,6 +1484,60 @@ def quantize_transformer_fp8(model, mesh=None):
       count += 1
   print(f"  [fp8] Quantized {count} Linear layers to float8_e4m3fn across "
         f"{len(model.transformer_blocks)} blocks", flush=True)
+  return model
+
+
+def interleave_swiglu_weights(model, mesh=None):
+  """Permute `ff.proj` weights from `(2, tp, ffn // tp, in)` to `(tp, 2, ffn // tp, in)`.
+
+  With `P("tp", None)` sharding on `(2 * ffn_dim, hidden)`, the unpermuted layout
+  places all `value` rows on the first half of the mesh and all `gate` rows on
+  the second half. Interleaving `(tp, 2, ffn_dim // tp, hidden)` gives every chip
+  matching `(value, gate)` pairs so `value * silu(gate)` and the sequence-tiled
+  Pallas SwiGLU FFN megakernel (`pallas_swiglu_ffn_sharded`) run locally per chip.
+  """
+  import jax
+  import jax.numpy as jnp
+  from flax import nnx
+
+  tp = mesh.devices.size if mesh is not None else 1
+  if tp <= 1:
+    for blk in (*model.token_refiner.refiner_blocks, *model.transformer_blocks):
+      blk.ff.swiglu_tp = 1
+    return model
+
+  @jax.jit
+  def _perm_w(w):
+    return jnp.swapaxes(w.reshape(2, tp, -1, w.shape[-1]), 0, 1).reshape(w.shape)
+
+  @jax.jit
+  def _perm_s(s):
+    return jnp.swapaxes(s.reshape(2, tp, -1), 0, 1).reshape(s.shape)
+
+  for blk in (*model.token_refiner.refiner_blocks, *model.transformer_blocks):
+    lin = blk.ff.proj
+    w = lin.weight[...]
+    if w.shape[0] % (2 * tp) != 0 or getattr(blk.ff, "swiglu_tp", 1) == tp:
+      continue
+    sh = w.sharding
+    mem = getattr(sh, "memory_kind", None)
+    if mem == "pinned_host":
+      dev_sh = jax.sharding.NamedSharding(mesh, sh.spec, memory_kind="device")
+      w_p = jax.device_put(_perm_w(jax.device_put(w, dev_sh)), sh)
+    else:
+      w_p = jax.device_put(_perm_w(w), sh)
+    lin.weight = nnx.Param(w_p)
+    if lin.weight_scale is not None and lin.weight_scale[...] is not None:
+      s = lin.weight_scale[...]
+      s_sh = s.sharding
+      if getattr(s_sh, "memory_kind", None) == "pinned_host":
+        s_dev = jax.sharding.NamedSharding(mesh, s_sh.spec, memory_kind="device")
+        s_p = jax.device_put(_perm_s(jax.device_put(s, s_dev)), s_sh)
+      else:
+        s_p = jax.device_put(_perm_s(s), s_sh)
+      lin.weight_scale = nnx.data(nnx.Param(s_p))
+    blk.ff.swiglu_tp = tp
+  print(f"  [swiglu] interleaved ff.proj weights across tp={tp}", flush=True)
   return model
 
 

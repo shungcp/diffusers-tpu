@@ -187,6 +187,8 @@ def parse_args():
                        "DINO 0.9709 -> 0.9377")
   ap.add_argument("--qk-fp8", action="store_true",
                   help="Cast Q and K to float8_e4m3fn inside Pallas splash attention.")
+  ap.add_argument("--pallas-ffn", action="store_true",
+                  help="Use sequence-tiled Pallas SwiGLU FFN megakernel (DT_PALLAS_FFN=1).")
   ap.add_argument("--dense-attention", action="store_true",
                   help="Skip the Pallas splash kernel. Slower and much "
                        "hungrier, but it runs where the kernel does not.")
@@ -314,6 +316,8 @@ def main():
       "DT_PAD_SEQUENCE_TO", str(args.pad_sequence_to))
   os.environ["DT_FULL_LANE_ROPE"] = os.environ.get(
       "DT_FULL_LANE_ROPE", "1" if args.full_lane_rope else "0")
+  if args.pallas_ffn:
+    os.environ["DT_PALLAS_FFN"] = "1"
   # Branch on per-chip HBM: v6e has 32 GiB, v7x ~95 GiB per core (defaults
   # tuned on v7x regress on v6e).
   _hbm = (jax.devices()[0].memory_stats() or {}).get("bytes_limit", 0) / 2**30
@@ -629,9 +633,10 @@ def main():
     _ENC_ONE[0] = _encode_one
     # Whole-encode jit (DT_ENC_JIT, on by default): 2.8 -> 0.5 s for a
     # 3648x2048 reference, tiles in groups (DT_ENC_GROUP) so it compiles.
-    # One chip (v5e: 16 GB) cannot compile the whole tiled encode even in
+    # One small chip (v5e: 16 GB) cannot compile the whole tiled encode even in
     # groups (34.7 GB of temporaries); the per-tile path fits.
-    _jit_enc = os.environ.get("DT_ENC_JIT", "1" if len(devices) > 1 else "0") == "1"
+    _jit_enc = os.environ.get(
+        "DT_ENC_JIT", "0" if (len(devices) == 1 and _small_hbm) else "1") == "1"
     if _jit_enc:
       # Grouped tiles are what lets the whole-encode program compile; the
       # eager path (and the server) keeps the single vmap, which fits there.
@@ -792,7 +797,7 @@ def main():
       dit.cache_finish(extra={"adaln": _mods_host} if _mods_host is not None else None)
   adaln_mods = None
   if args.adaln_host:
-    if len(devices) == 1:
+    if len(devices) == 1 and _small_hbm:
       # One small chip: keep every step's modulation on the host and move one
       # step's 18 MB in per call instead of holding all of it in HBM.
       adaln_mods = _LazyPut(list(_mods_host), jax.sharding.NamedSharding(
@@ -803,6 +808,9 @@ def main():
   del lora
   if args.fp8:
     dit.quantize_transformer_fp8(transformer, mesh=mesh)
+  if (args.pallas_ffn or os.environ.get("DT_PALLAS_FFN") == "1"
+      or os.environ.get("DT_SWIGLU_INTERLEAVE") == "1"):
+    dit.interleave_swiglu_weights(transformer, mesh=mesh)
   if host is not None:
     _, _probe = nnx.split(transformer)
     _leaves = jax.tree.leaves(_probe)
@@ -1038,7 +1046,7 @@ def main():
   _edges = np.flatnonzero(_idx[1:] != _idx[:-1]) + 1
   _bounds = [0, *_edges.tolist(), int(_idx.shape[0])]
   segments = tuple((a, b, int(_idx[a])) for a, b in zip(_bounds, _bounds[1:]))
-  if not (args.segments or len(devices) == 1):
+  if not (args.segments or (len(devices) == 1 and _small_hbm)):
     segments = None
   else:
     print(f"  [segments] {segments}", flush=True)
@@ -1329,11 +1337,13 @@ def main():
       if args.warmup:
         # Warm the decode program too (it is built after the denoise loop).
         warm = time.perf_counter()
-        # 1 chip decodes one chunk at a time to save HBM; multi-chip picks K
-        # automatically (decode_chunk_batch).
+        # Scale auto cap by mesh size so each chip processes <= ~35 tiles/call.
+        _cap = (max(1, (DECODE_CHUNK_CAP * mesh.devices.size) // 8)
+                if tile_shard else DECODE_CHUNK_CAP)
         _cb = decode_chunk_batch(latents.shape[2], int(os.environ.get(
             "DT_DECODE_CHUNK_BATCH",
-            args.decode_chunk_batch or (1 if mesh.devices.size == 1 else 0))))
+            args.decode_chunk_batch or (1 if mesh.devices.size == 1 else 0))),
+            cap=_cap)
         jax.block_until_ready(
             decode_tiled(dec_state,
                          jnp.concatenate([latents[:, :, :WARM_CHUNK]] * _cb,
@@ -1343,8 +1353,9 @@ def main():
       # Small (one jitted program); built and compiled here so its setup
       # is subtracted with the video decoder's.
       from diffusers_tpu.models.minimax_h3.audio_decode import AudioDecoder
-      audio_dec = AudioDecoder(snapshot, on_cpu=len(devices) == 1)
-      if len(devices) > 1:
+      _audio_cpu = len(devices) == 1 and _small_hbm
+      audio_dec = AudioDecoder(snapshot, on_cpu=_audio_cpu, devices=devices)
+      if not _audio_cpu:
         audio_dec.decode(np.zeros((audio_idx.shape[0], audio_dec.channels),
                                   np.float32))
     decoder_setup = time.perf_counter() - began_setup
@@ -1390,14 +1401,16 @@ def main():
     t_dec = t_blend = 0.0
     per_call = []
     pieces, carry = [], None
-    host_pieces = mesh.devices.size == 1
+    host_pieces = mesh.devices.size == 1 and _small_hbm
     # DT_DECODE_CHUNK_BATCH=K stacks K temporal chunks along the batch axis per
     # decode call. Chunks are independent (cross-fading happens afterwards).
-    # 1 chip decodes one chunk at a time to save HBM; multi-chip picks K
-    # automatically (decode_chunk_batch).
+    # Scale auto cap by mesh size so each chip processes <= ~35 tiles/call.
+    _cap = (max(1, (DECODE_CHUNK_CAP * mesh.devices.size) // 8)
+            if tile_shard else DECODE_CHUNK_CAP)
     chunk_batch = decode_chunk_batch(frames_lat, int(os.environ.get(
         "DT_DECODE_CHUNK_BATCH",
-        args.decode_chunk_batch or (1 if mesh.devices.size == 1 else 0))))
+        args.decode_chunk_batch or (1 if mesh.devices.size == 1 else 0))),
+        cap=_cap)
     print(f"  decode: {num_chunks} chunks, {chunk_batch} per call", flush=True)
     decoded = {}
 
@@ -1477,7 +1490,7 @@ def main():
         1, -1, 1, 1, 1)
     pixel_std = jnp.asarray((0.229, 0.224, 0.225), jnp.float32).reshape(
         1, -1, 1, 1, 1)
-    if len(devices) == 1:
+    if len(devices) == 1 and _small_hbm:
       # One small chip (v5e: 16 GB) cannot hold a float32 copy of the clip
       # beside the decoder; finish on the host, a few frames at a time.
       _f = np.asarray(frames)[0]
