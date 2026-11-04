@@ -25,8 +25,8 @@ Every model can run through three backends, so you can pick the one that fits yo
 Newest first. Each entry links a date to what changed.
 最新的在最上面。每条记录写明日期和变化。
 
-- **2026-11-04** — TPU v7x results across 1, 2, 4 and 8 chips (95 GB HBM per chip, no `--offload` needed even at 768p on 1 chip), plus a sequence-tiled Pallas SwiGLU FFN kernel (`--pallas-ffn`): Pika-H3-Flex generates a 14-second 768p clip in 36.0 s on a v7x-8 (13.5 s at 480p), 63.3 s on 4 chips, 108.4 s on 2 chips, and 197.6 s on a single v7x chip.
-  **2026-11-04** — 新增 TPU v7x 在 1、2、4、8 个 chip 上的性能数据(单 chip 95 GB HBM,即使单 chip 跑 768p 也无需 `--offload`)及序列分块 Pallas SwiGLU FFN kernel(`--pallas-ffn`):Pika-H3-Flex 生成 14 秒 768p 视频在 v7x-8 上为 36.0 秒(480p 为 13.5 秒),4 chip 为 63.3 秒,2 chip 为 108.4 秒,单 chip 为 197.6 秒。
+- **2026-11-04** — TPU v7x results on 1, 2, 4 and 8 devices (a v7x chip has two TensorCores, each a JAX device with 95 GB of HBM, so no `--offload` is needed even at 768p on one device), plus a sequence-tiled Pallas SwiGLU FFN kernel (`--pallas-ffn`): Pika-H3-Flex generates a 14-second 768p clip in 36.0 s on a v7x-8 (8 devices, 4 chips; 13.5 s at 480p), 63.3 s on 4 devices, 108.4 s on 2 devices, and 197.6 s on a single device.
+  **2026-11-04** — 新增 TPU v7x 在 1、2、4、8 个 device 上的性能数据(一个 v7x chip 有两个 TensorCore,每个是一个 JAX device,各有 95 GB HBM,所以单个 device 跑 768p 也无需 `--offload`)及序列分块 Pallas SwiGLU FFN kernel(`--pallas-ffn`):Pika-H3-Flex 生成 14 秒 768p 视频在 v7x-8(8 个 device,4 个 chip)上为 36.0 秒(480p 为 13.5 秒),4 个 device 为 63.3 秒,2 个 device 为 108.4 秒,单个 device 为 197.6 秒。
 
 - **2026-11-04** — The JAX backend now decodes the soundtrack as well (its videos used to be silent); `scripts/frames_to_mp4.py` muxes it in. It adds about 0.3 s on a v6e-8 and nothing on one chip.
   **2026-11-04** — JAX 后端现在也解码音轨(之前生成的视频没有声音),`scripts/frames_to_mp4.py` 会把音轨合进 mp4。在 v6e-8 上多约 0.3 秒,单 chip 上不增加时间。
@@ -173,26 +173,26 @@ Reference-to-video also needs `DT_TEXT_ATTN_CHUNK=1024`; 768x1344, 345 frames ne
 `DT_INT8_ACT=1` also quantizes activations and uses the int8 matrix units: denoising is 10-22% faster, and the output changes more.
 `DT_INT8_ACT=1` 会把激活也量化,使用 int8 矩阵单元:去噪快 10-22%,结果的变化也更大。
 
-### TPU v7x — 1, 2, 4 and 8 chips / TPU v7x(1、2、4、8 个 chip)
+### TPU v7x — 1, 2, 4 and 8 devices / TPU v7x(1、2、4、8 个 device)
 
-Measured 2026-11-04 on TPU v7x (95 GB HBM per chip), JAX backend with `--fp8 --qk-fp8 --adaln-host`. Because each v7x chip has 95 GB of HBM, the full 35B DiT and 768x1344, 345-frame sequence stay resident in HBM on 1, 2, 4 and 8 chips without `--offload`.
-测于 2026-11-04,TPU v7x(每 chip 95 GB HBM),JAX 后端配合 `--fp8 --qk-fp8 --adaln-host`。由于单个 v7x chip 拥有 95 GB HBM,完整的 35B DiT 与 768x1344、345 帧序列在 1、2、4、8 个 chip 上均可常驻 HBM,无需 `--offload`。
+Measured 2026-11-04 on TPU v7x, JAX backend with `--fp8 --qk-fp8 --adaln-host`. A v7x chip has two TensorCores, and JAX sees each as one device with 95 GB of HBM; "8 devices" is a v7x-8, which is 4 chips. With 95 GB per device, the full 35B DiT and 768x1344, 345-frame sequence stay resident in HBM on 1, 2, 4 and 8 devices without `--offload`.
+测于 2026-11-04,TPU v7x,JAX 后端配合 `--fp8 --qk-fp8 --adaln-host`。一个 v7x chip 有两个 TensorCore,JAX 把每个视为一个 device,各有 95 GB HBM;"8 个 device"即 v7x-8,也就是 4 个 chip。由于每个 device 有 95 GB,完整的 35B DiT 与 768x1344、345 帧序列在 1、2、4、8 个 device 上均可常驻 HBM,无需 `--offload`。
 
 #### Pika-H3-Flex (6 steps / 6 步)
 
-| | 1 chip | 2 chips / 2 chip | 4 chips / 4 chip | 8 chips / 8 chip |
+| | 1 device | 2 devices / 2 个 device | 4 devices / 4 个 device | 8 devices (v7x-8) / 8 个 device |
 |---|---|---|---|---|
 | text-to-video, 768x1344, 345 frames / 文生视频,768p 345 帧 | **197.6 s** (179.7 + 14.3) | **108.4 s** (91.3 + 12.9) | **63.3 s** (49.3 + 9.7) | **36.0 s** (25.1 + 6.6) |
 | reference-to-video, 768x1344, 345 frames / 参考图生视频,768p 345 帧 | — | **123.3 s** (104.9 + 13.0) | **71.5 s** (56.6 + 9.7) | **40.5 s** (28.8 + 6.6) |
 | text-to-video, 480x832, 362 frames (15 s) / 文生视频,480p 362 帧 | — | — | — | **13.5 s** (6.1 + 4.4) |
 | text-to-video, 480x832, 141 frames (6 s) / 文生视频,480p 141 帧 | **14.3 s** (9.2 + 3.3) | — | — | **7.3 s** (2.2 + 2.8) |
 
-Parentheses show `(denoise + video decode)` in seconds; on 8 chips, steady-state compute (`denoise + decode + text`) for 480x832, 362 frames is 10.7 s, faster than the 15-second clip itself. Measured before the JAX audio decode was added (adds about 0.2–0.3 s).
-括号内为 `(去噪 + 视频解码)` 秒数;在 8 个 chip 上,480x832、362 帧的纯计算时间(`去噪 + 解码 + 文本编码`)仅 10.7 秒,快于 15 秒视频本身的时长。这些数字是在加入 JAX 音频解码之前测的(加上音频解码约多 0.2–0.3 秒)。
+Parentheses show `(denoise + video decode)` in seconds; on 8 devices, steady-state compute (`denoise + decode + text`) for 480x832, 362 frames is 10.7 s, faster than the 15-second clip itself. Measured before the JAX audio decode was added (adds about 0.2–0.3 s).
+括号内为 `(去噪 + 视频解码)` 秒数;在 8 个 device 上,480x832、362 帧的纯计算时间(`去噪 + 解码 + 文本编码`)仅 10.7 秒,快于 15 秒视频本身的时长。这些数字是在加入 JAX 音频解码之前测的(加上音频解码约多 0.2–0.3 秒)。
 
 #### MiniMax-H3 — 768x1344, 345 frames (14.4 s), 20 steps
 
-| | 2 chips / 2 chip | 4 chips / 4 chip | 8 chips / 8 chip |
+| | 2 devices / 2 个 device | 4 devices / 4 个 device | 8 devices (v7x-8) / 8 个 device |
 |---|---|---|---|
 | text-to-video, lossy / 文生视频,有损 ¹ | **111.1 s** (93.9 + 12.9) | **68.5 s** (54.0 + 9.7) | **44.8 s** (33.6 + 6.6) ² |
 | text-to-video, lossless / 文生视频,无损 | **305.8 s** (289.0 + 12.8) | **170.3 s** (156.6 + 9.6) | **90.3 s** (79.4 + 6.6) ³ |
@@ -203,7 +203,7 @@ Parentheses show `(denoise + video decode)` in seconds; on 8 chips, steady-state
 
 ² With `--pallas-ffn` (sequence-tiled Pallas SwiGLU FFN megakernel, `DT_PALLAS_FFN=1`), which saves 2.7 s on 19-step denoising (36.3 s -> 33.6 s). ² 启用 `--pallas-ffn`(序列分块 Pallas SwiGLU FFN megakernel,`DT_PALLAS_FFN=1`),19 步去噪节省 2.7 秒(36.3 秒 -> 33.6 秒)。
 
-³ On 8 v7x chips, `torchax` lossless text-to-video takes 128.5 s. ³ 在 8 个 v7x chip 上,`torchax` 无损文生视频为 128.5 秒。
+³ On a v7x-8 (8 devices), `torchax` lossless text-to-video takes 128.5 s. ³ 在 v7x-8(8 个 device)上,`torchax` 无损文生视频为 128.5 秒。
 
 ---
 

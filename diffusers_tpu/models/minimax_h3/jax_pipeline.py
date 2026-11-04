@@ -318,7 +318,7 @@ def main():
       "DT_FULL_LANE_ROPE", "1" if args.full_lane_rope else "0")
   if args.pallas_ffn:
     os.environ["DT_PALLAS_FFN"] = "1"
-  # Branch on per-chip HBM: v6e has 32 GiB, v7x ~95 GiB per core (defaults
+  # Branch on per-device HBM: v6e has 32 GiB, v7x ~95 GiB per TensorCore (defaults
   # tuned on v7x regress on v6e).
   _hbm = (jax.devices()[0].memory_stats() or {}).get("bytes_limit", 0) / 2**30
   _small_hbm = _hbm < 48
@@ -363,7 +363,7 @@ def main():
   if args.offload_blocks:
     args.offload = True
   host = "pinned_host" if args.offload else None
-  # On 1 chip (even a 95 GiB v7x), compiling the 62 GiB text tower resident
+  # On 1 device (even a 95 GiB v7x TensorCore), compiling the 62 GiB text tower resident
   # in HBM needs 119 GiB of temporaries; streaming it from pinned_host takes
   # ~9 s and leaves HBM free for a resident 31 GiB FP8 DiT.
   text_host = ("pinned_host" if (args.offload or args.text_offload
