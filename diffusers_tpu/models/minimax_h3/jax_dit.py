@@ -374,6 +374,20 @@ def _build_modules():
       self.out = Linear(ffn_dim, hidden_size, dtype=dtype, rngs=rngs)
 
     def __call__(self, x):
+      if FF_CHUNK and x.shape[1] > FF_CHUNK:
+        # DT_FF_CHUNK=<rows>: the feed-forward a slab of rows at a time. Its
+        # (seq, 2 x 14336) intermediate is 6 GB at 768p/345 frames, which
+        # tips a 16 GB v5e chip over.
+        n = -(-x.shape[1] // FF_CHUNK)
+        pad = n * FF_CHUNK - x.shape[1]
+        xp = jnp.pad(x, ((0, 0), (0, pad), (0, 0))) if pad else x
+        xs = xp.reshape(x.shape[0], n, FF_CHUNK, x.shape[2]).swapaxes(0, 1)
+
+        def one(xc):
+          value, gate = jnp.split(self.proj(xc), 2, axis=-1)
+          return self.out(value * jax.nn.silu(gate))
+        ys = jax.lax.map(one, xs)
+        return ys.swapaxes(0, 1).reshape(x.shape[0], n * FF_CHUNK, -1)[:, :x.shape[1]]
       if CMM and x.shape[1] % _tp_size() == 0 and x.shape[1] > 50000:   # skip the token refiner
         (y,) = _cmm(x, [self.proj.weight[...]])
       else:
@@ -927,10 +941,100 @@ def _quantize_int8(t, rows=1024):
 
 
 INT8_ACT = os.environ.get("DT_INT8_ACT", "0") == "1"
+FF_CHUNK = int(os.environ.get("DT_FF_CHUNK", "0"))
+
+# Write-through weight cache: set CACHE_WRITE["dir"] before a load and the
+# loaders save each host array as it is made, before it goes to the chips.
+# Saving the loaded module afterwards instead copied every
+# pinned array back into host memory and kept the copy: +1 GB per GB saved,
+# which killed a 47 GB v5e host at 17 GB written.
+CACHE_WRITE = {}
+
+
+def cache_put(name, arr):
+  """Save one host array under the module's parameter path (thread-safe)."""
+  import os
+
+  import numpy as np
+
+  d = CACHE_WRITE.get("dir")
+  if not d:
+    return
+  os.makedirs(d, exist_ok=True)
+  arr = np.asarray(arr)
+  dt = str(arr.dtype)
+  np.save(os.path.join(d, name + ".npy"),
+          arr.view(np.uint16) if dt == "bfloat16" else arr)
+  CACHE_WRITE.setdefault("dtypes", {})[name] = dt
+
+
+def cache_finish(extra=None):
+  """Write the index for everything `cache_put` saved; turn writing off."""
+  import json
+  import os
+
+  d = CACHE_WRITE.pop("dir", None)
+  dtypes = CACHE_WRITE.pop("dtypes", {})
+  if not d:
+    return
+  for key, arr in (extra or {}).items():
+    CACHE_WRITE["dir"] = d
+    cache_put("_extra." + key, arr)
+    CACHE_WRITE.pop("dir")
+    dtypes["_extra." + key] = CACHE_WRITE.pop("dtypes")["_extra." + key]
+  with open(os.path.join(d, "index.json"), "w") as f:
+    json.dump({"params": sorted(k for k in dtypes if not k.startswith("_extra.")),
+               "extra": sorted(extra or {}), "dtypes": dtypes}, f)
+
 
 # `load_transformer(adaln_temb=)` leaves its `(steps, blocks, levels, out)`
 # modulation here rather than on the nnx module, which holds jax arrays only.
 ADALN_MODS = {}
+
+
+def load_param_cache(model, cache_dir, mesh, spec_fn, memory_kind=None):
+  """Fill an abstract module from a weight-cache directory; returns extras.
+
+  Params the module was not built with (int8 `weight_scale`) are created.
+  Shapes that do not match the module (placeholders) are replicated.
+  """
+  import json
+  import os
+
+  import jax
+  import ml_dtypes
+  import numpy as np
+  from flax import nnx
+  from jax.sharding import NamedSharding, PartitionSpec as P
+
+  with open(os.path.join(cache_dir, "index.json")) as f:
+    index = json.load(f)
+
+  def get(fname):
+    arr = np.load(os.path.join(cache_dir, fname + ".npy"), mmap_mode="r")
+    if index["dtypes"][fname] == "bfloat16":
+      arr = arr.view(ml_dtypes.bfloat16)
+    return arr
+
+  for name in index["params"]:
+    arr = get(name)
+    parts = name.split(".")
+    node = model
+    for part in parts[:-1]:
+      node = node[int(part)] if part.isdigit() else getattr(node, part)
+    spec = spec_fn(name, arr.ndim) if spec_fn else P()
+    if mesh is not None and any(
+        ax is not None and d % mesh.devices.size for d, ax in zip(arr.shape, spec)):
+      spec = P()
+    kind = memory_kind(name) if callable(memory_kind) else memory_kind
+    value = jax.device_put(np.ascontiguousarray(arr),
+                           NamedSharding(mesh, spec, memory_kind=kind))
+    current = getattr(node, parts[-1], None)
+    if isinstance(current, nnx.Param):
+      current.value = value
+    else:
+      setattr(node, parts[-1], nnx.data(nnx.Param(value)))
+  return {k: np.asarray(get("_extra." + k)) for k in index["extra"]}
 
 
 def host_temb(transformer_dir, levels_per_step, freq_dim=256):
@@ -1121,6 +1225,8 @@ def _load_transformer_parallel(model, shards, mesh, memory_kind, resolve,
         if int8 and key.startswith("transformer_blocks.") and key.endswith(
             _INT8_TARGETS):
           q, sc = _quantize_int8(t)
+          cache_put(name, q.numpy().reshape(want.shape))
+          cache_put(name[:-len("weight")] + "weight_scale", sc.numpy())
           value = jax.device_put(
               q.numpy().reshape(want.shape),
               jax.sharding.NamedSharding(mesh, _spec_for(name), memory_kind=kind))
@@ -1135,6 +1241,7 @@ def _load_transformer_parallel(model, shards, mesh, memory_kind, resolve,
         else:
           arr = t.numpy()
         arr = arr.astype(np.dtype(want.dtype), copy=False).reshape(want.shape)
+        cache_put(name, arr)
         value = jax.device_put(
             arr, jax.sharding.NamedSharding(mesh, _spec_for(name),
                                             memory_kind=kind))
@@ -1160,6 +1267,8 @@ def _load_transformer_parallel(model, shards, mesh, memory_kind, resolve,
       if isinstance(value, tuple) and value[0] in ("adaln_w", "adaln_b"):
         (adaln_w if value[0] == "adaln_w" else adaln_b)[value[1]] = value[2]
         # A placeholder keeps the module whole without 26 GB behind it.
+        cache_put(name, np.zeros((1,) * len(param.value.shape),
+                                 np.dtype(param.value.dtype)))
         ph = jax.device_put(np.zeros((1,) * len(param.value.shape),
                                      np.dtype(param.value.dtype)),
                             jax.sharding.NamedSharding(

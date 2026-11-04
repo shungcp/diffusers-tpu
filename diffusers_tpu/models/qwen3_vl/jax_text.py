@@ -58,6 +58,9 @@ def find_snapshot(model_id=MODEL_ID):
 
 # Text attention in float32 at highest precision (DT_TEXT_ATTN_F32, on by default).
 TEXT_ATTN_F32 = os.environ.get("DT_TEXT_ATTN_F32", "1") == "1"
+# Causal text attention a block of queries at a time (DT_TEXT_ATTN_CHUNK=<rows>),
+# for one small chip and a long ref2va prompt.
+TEXT_ATTN_CHUNK = int(os.environ.get("DT_TEXT_ATTN_CHUNK", "0"))
 
 def _build_modules():
   """Imports flax lazily so the file can be read without it installed."""
@@ -122,7 +125,29 @@ def _build_modules():
       k = apply_rope(k, cos, sin).astype(v.dtype)
       # jax's attention does grouped queries itself when the head counts
       # differ, so no explicit repeat.
-      if TEXT_ATTN_F32:
+      if TEXT_ATTN_CHUNK and mask is None and s > TEXT_ATTN_CHUNK:
+        # Causal attention a block of queries at a time (DT_TEXT_ATTN_CHUNK):
+        # one 16 GB v5e chip cannot hold the 64 x 7518^2 float32 scores of a
+        # ref2va prompt (27.5 GB of temporaries in the whole-tower program).
+        c = TEXT_ATTN_CHUNK
+        n = -(-s // c)
+        qp = jnp.pad(q, ((0, 0), (0, n * c - s), (0, 0), (0, 0)))
+        qc = qp.reshape(b, n, c, self.heads, self.head_dim).swapaxes(0, 1)
+        cols = jnp.arange(s)[None, :]
+        dt = jnp.float32 if TEXT_ATTN_F32 else v.dtype
+        kf, vf = k.astype(dt), v.astype(dt)
+
+        def one(args):
+          qi, start = args
+          rows = start + jnp.arange(c)[:, None]
+          m = (cols <= rows)[None, None]
+          with jax.default_matmul_precision("highest" if TEXT_ATTN_F32 else "default"):
+            return jax.nn.dot_product_attention(qi.astype(dt), kf, vf, mask=m,
+                                                scale=self.scale)
+        out = jax.lax.map(one, (qc, jnp.arange(n) * c))
+        out = out.swapaxes(0, 1).reshape(b, n * c, self.heads, self.head_dim)[:, :s]
+        out = out.astype(v.dtype)
+      elif TEXT_ATTN_F32:
         # float32 at highest precision: the bfloat16 path loses accuracy on
         # long prompts (7,518 tokens with a ref2va image) at the same speed.
         with jax.default_matmul_precision("highest"):

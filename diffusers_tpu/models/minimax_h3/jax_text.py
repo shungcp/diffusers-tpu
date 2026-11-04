@@ -190,6 +190,9 @@ def _load_parallel(model, shards, mesh, spec_fn, memory_kind, int8=False,
         if int8 and parts[0] == "layers" and name.endswith("_proj.weight"):
           from .jax_dit import _quantize_int8
           q, sc = _quantize_int8(t)
+          from .jax_dit import cache_put
+          cache_put(name, q.numpy())
+          cache_put(name[:-len("weight")] + "weight_scale", sc.numpy())
           sh = NamedSharding(mesh, spec_fn(parts, 2), memory_kind=memory_kind)
           sc_sh = NamedSharding(mesh, jax.sharding.PartitionSpec(),
                                 memory_kind=memory_kind)
@@ -201,6 +204,9 @@ def _load_parallel(model, shards, mesh, spec_fn, memory_kind, int8=False,
         arr = arr.astype(np.dtype(want.dtype), copy=False)
         if arr.shape != want.shape:
           raise ValueError(f"{key}: checkpoint {arr.shape} vs model {want.shape}")
+        from .jax_dit import cache_put
+        # The module holds the embedding as a bare Param named `embed_tokens`.
+        cache_put("embed_tokens" if name == "embed_tokens.weight" else name, arr)
         out.append((name, jax.device_put(arr, NamedSharding(
             mesh, spec_fn(name.split("."), arr.ndim), memory_kind=memory_kind))))
     return out

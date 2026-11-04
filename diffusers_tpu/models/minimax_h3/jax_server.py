@@ -66,6 +66,11 @@ def parse_args():
   ap.add_argument("--sparse-window", type=int, default=16,
                   help="sparse attention window for requests with lossy=true (t2va and ref2va)")
   ap.add_argument("--sparse-dense-steps", type=int, default=6)
+  ap.add_argument("--text-resident", action="store_true",
+                  help="Keep the text and vision towers on the chips after the "
+                       "first request instead of moving them from host each "
+                       "time. Fits at 480p beside the DiT and decoder; at 768p "
+                       "the decoder no longer fits.")
   ap.add_argument("--pika-fl2va", default="",
                   help="Pika-H3-Flex fl2va adapter dir: text-to-video requests use "
                        "its six-step ladder and re-noising sampler")
@@ -437,14 +442,27 @@ class Server:
       jax.block_until_ready(self.state)
       self._park_s = time.perf_counter() - t_park
     t_h2d = time.perf_counter()
-    enc_g, enc_host = nnx.split(self.encoder)
-    enc = nnx.merge(enc_g, self._to_device(enc_host))
-    jax.block_until_ready(nnx.state(enc))
+    resident = self.a.text_resident
+    if resident and getattr(self, "_enc_dev", None) is not None:
+      enc = self._enc_dev
+    else:
+      enc_g, enc_host = nnx.split(self.encoder)
+      enc = nnx.merge(enc_g, self._to_device(enc_host))
+      jax.block_until_ready(nnx.state(enc))
+      if resident:
+        # --text-resident: the towers stay on the chips after the first
+        # request (480p leaves room for them beside the DiT and decoder).
+        self._enc_dev = enc
     t_h2d = time.perf_counter() - t_h2d
     with jax.set_mesh(self.mesh):
       if reference_image is not None:
-        vis_g, vis_host = nnx.split(self.vision)
-        vis = nnx.merge(vis_g, self._to_device(vis_host))
+        if resident and getattr(self, "_vis_dev", None) is not None:
+          vis = self._vis_dev
+        else:
+          vis_g, vis_host = nnx.split(self.vision)
+          vis = nnx.merge(vis_g, self._to_device(vis_host))
+          if resident:
+            self._vis_dev = vis
         t_prep = time.perf_counter()
         pres = r2v.presentation(self.snapshot, prompt, reference_image)
         pos3 = r2v.text_positions(self.snapshot, pres["ids"], pres["grid_thw"],
@@ -466,7 +484,8 @@ class Server:
         emb = r2v.encode_text_with_vision(enc, vis, pres_in, pos_in, self.cfg_text,
                                           self.dtype, TEXT_ENCODER_LAYER, jit=True)
         emb = jax.block_until_ready(emb)[:, :n_real]
-        r2v.release_text_jit()   # the towers go back to host after this
+        if not resident:
+          r2v.release_text_jit()   # the towers go back to host after this
         del vis
         print(f"  [server] ref2va text: text tower to chip {t_h2d:.1f}s, host prep {t_prep:.1f}s, "
               f"vision+text tower {time.perf_counter() - t_fwd:.1f}s", flush=True)

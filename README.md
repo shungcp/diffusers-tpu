@@ -118,7 +118,7 @@ Measured 2026-11-02 to 2026-11-03; "4 chips" means four chips of the same v6e-8 
 | Qwen-Image-2.1, 20 steps, torchax / 20 步,torchax | does not fit / 放不下 | 1.66 s | 1.28 s |
 | Qwen-Image-2.1, 20 steps, torch_tpu / 20 步,torch_tpu | 8.8 s | does not fit / 放不下 | 1.18 s |
 | MiniMax-H3 reference-to-video, lossy / 参考图生视频,有损 | — | 92.7 s | 52.3 s |
-| Pika-H3-Flex text-to-video / 文生视频 | 58.8 s ⁴ | 70.8 s | 40.3 s |
+| Pika-H3-Flex text-to-video / 文生视频 | 55 s ⁴ | 70.8 s | 40.3 s |
 
 ¹ 480x832, 121 frames, `--chips 1 --offload`. ¹ 480x832,121 帧,`--chips 1 --offload`。
 
@@ -133,6 +133,33 @@ MiniMax-H3 在 4 chip 上需要 `--offload`(文生视频有损 69.8 秒、无损
 
 The 4-chip and 8-chip MiniMax-H3 and Pika-H3-Flex numbers use 768x1344, 345 frames.
 4 chip 和 8 chip 的 MiniMax-H3、Pika-H3-Flex 数字都是 768x1344、345 帧。
+
+### One TPU v5e chip / 单个 TPU v5e chip
+
+Measured 2026-11-04 on a v5litepod-1 (16 GB HBM, 47 GB host memory), Pika-H3-Flex, six steps.
+测于 2026-11-04,v5litepod-1(16 GB HBM,47 GB 主机内存),Pika-H3-Flex 六步。
+
+| per request / 每个请求 | 480x832, 141 frames / 141 帧 | 480x832, 362 frames / 362 帧 | 768x1344, 345 frames / 345 帧 |
+|---|---|---|---|
+| text-to-video / 文生视频 | 55 s | 272 s (251 s ¹) | 748 s |
+| reference-to-video / 参考图生视频 | 142 s | 314 s (288 s ¹) | — |
+
+¹ With `DT_INT8_ACT=1`. ¹ 使用 `DT_INT8_ACT=1`。
+
+Run with `--chips 1 --offload --int8-weights --adaln-host`: the DiT is held in host memory as int8 (19.6 GB) and streamed in.
+运行时加上 `--chips 1 --offload --int8-weights --adaln-host`:DiT 以 int8(19.6 GB)放在主机内存,流式送入 chip。
+
+`--int8-weights` halves the weights and changes the output a little; `--adaln-host` precomputes the timestep modulation, so 26 GB of weights never reach the chip, and does not change the output.
+`--int8-weights` 把权重减半,结果略有变化;`--adaln-host` 预先算好时间步调制,于是有 26 GB 权重根本不用上 chip,不改变结果。
+
+Set `DT_WEIGHT_CACHE=<dir>` to keep the converted weights on disk: loading drops from 375 s to 178 s on the next start.
+设置 `DT_WEIGHT_CACHE=<目录>` 把转换好的权重存在磁盘上:下次启动时加载从 375 秒降到 178 秒。
+
+Reference-to-video also needs `DT_TEXT_ATTN_CHUNK=1024`; 768x1344, 345 frames needs `DT_FF_CHUNK=4096 --block-q 1024 --block-kv 2048`.
+参考图生视频还需要 `DT_TEXT_ATTN_CHUNK=1024`;768x1344、345 帧需要 `DT_FF_CHUNK=4096 --block-q 1024 --block-kv 2048`。
+
+`DT_INT8_ACT=1` also quantizes activations and uses the int8 matrix units: denoising is 10-22% faster, and the output changes more.
+`DT_INT8_ACT=1` 会把激活也量化,使用 int8 矩阵单元:去噪快 10-22%,结果的变化也更大。
 
 ---
 
@@ -279,20 +306,8 @@ The first run compiles for a few minutes; compiled programs are cached under `~/
 A single v6e chip can run MiniMax-H3 at 480p with `--chips 1 --offload`, streaming weights from host memory.
 单个 v6e chip 可以用 `--chips 1 --offload` 运行 480p 的 MiniMax-H3,权重从主机内存流式加载。
 
-A single v5e chip (47 GB of host memory) also works: add `--int8-weights --adaln-host`.
-单个 v5e chip(主机内存 47 GB)也能运行:再加上 `--int8-weights --adaln-host`。
-
-`--int8-weights` halves the weights; `--adaln-host` precomputes the timestep modulation, so 26 GB of weights never reach the chip.
-`--int8-weights` 把权重减半;`--adaln-host` 预先算好时间步调制,于是有 26 GB 权重根本不用上 chip。
-
-`--int8-weights` changes the output a little; `--adaln-host` does not change the quality.
-`--int8-weights` 会让结果略有变化;`--adaln-host` 不影响画质。
-
-A 15-second 480p clip (362 frames) takes 272 s on one v5e chip with Pika-H3-Flex.
-用 Pika-H3-Flex 在单个 v5e chip 上生成一段 15 秒的 480p 视频(362 帧)需要 272 秒。
-
-On v5e, `DT_INT8_ACT=1` also quantizes activations and runs the int8 matrix units: denoising is 10-22% faster (251 s for that clip), and the output changes more.
-在 v5e 上,`DT_INT8_ACT=1` 会把激活也量化,使用 int8 矩阵单元:去噪快 10-22%(上面那段视频为 251 秒),结果的变化也更大。
+A single TPU v5e chip also runs MiniMax-H3 end to end; see "One TPU v5e chip" under Results.
+单个 TPU v5e chip 也能端到端运行 MiniMax-H3;见"性能"一节里的"单个 TPU v5e chip"。
 
 Every entry point lists all of its options with `--help`.
 每个入口都可以用 `--help` 查看全部选项。

@@ -228,6 +228,20 @@ def sigma_schedule(steps, shift):
   return sigmas[keep]
 
 
+class _LazyPut:
+  """A list whose items are moved to `sharding` when indexed."""
+
+  def __init__(self, items, sharding):
+    self.items, self.sharding = items, sharding
+
+  def __getitem__(self, i):
+    import jax
+    return jax.device_put(self.items[i], self.sharding)
+
+  def __len__(self):
+    return len(self.items)
+
+
 def _step_sigmas(args, pika=None):
   """Video and audio sigma grids, terminal 0 included.
 
@@ -381,9 +395,26 @@ def main():
   # Abstract, not concrete: a concrete build would allocate 24 GiB of zeros
   # on chip 0 before any weight is read.
   encoder, cfg_text = jtext.build(text_dir, dtype=dtype, abstract=True)
-  jtext.load(encoder, text_dir, mesh=mesh, spec_fn=jtext.param_spec,
-             memory_kind=text_host, int8=args.int8_weights,
-             keep_layers=TEXT_ENCODER_LAYER if args.int8_weights else None)
+  # DT_WEIGHT_CACHE=<dir>: write the loaded (quantized, merged) weights as
+  # .npy while loading, and read them back on later starts instead of the
+  # checkpoint (v5e-1: 375 -> 178 s to load).
+  _wc = os.environ.get("DT_WEIGHT_CACHE")
+  _tc = os.path.join(_wc, "text" + ("_int8" if args.int8_weights else "")) if _wc else None
+  if _tc and os.path.exists(os.path.join(_tc, "index.json")):
+    if args.int8_weights:
+      encoder.layers = nnx.List(list(encoder.layers)[:TEXT_ENCODER_LAYER])
+    dit.load_param_cache(encoder, _tc, mesh,
+                         lambda n, nd: jtext.param_spec(n.split("."), nd),
+                         memory_kind=text_host)
+    print(f"  [weight-cache] text tower from {_tc}", flush=True)
+  else:
+    if _tc:
+      dit.CACHE_WRITE["dir"] = _tc
+    jtext.load(encoder, text_dir, mesh=mesh, spec_fn=jtext.param_spec,
+               memory_kind=text_host, int8=args.int8_weights,
+               keep_layers=TEXT_ENCODER_LAYER if args.int8_weights else None)
+    if _tc:
+      dit.cache_finish()
   print(f"text encoder loaded  {time.perf_counter() - began:.0f}s", flush=True)
 
   if args.reference:
@@ -596,7 +627,9 @@ def main():
     _ENC_ONE[0] = _encode_one
     # Whole-encode jit (DT_ENC_JIT, on by default): 2.8 -> 0.5 s for a
     # 3648x2048 reference, tiles in groups (DT_ENC_GROUP) so it compiles.
-    _jit_enc = os.environ.get("DT_ENC_JIT", "1") == "1"
+    # One chip (v5e: 16 GB) cannot compile the whole tiled encode even in
+    # groups (34.7 GB of temporaries); the per-tile path fits.
+    _jit_enc = os.environ.get("DT_ENC_JIT", "1" if len(devices) > 1 else "0") == "1"
     if _jit_enc:
       # Grouped tiles are what lets the whole-encode program compile; the
       # eager path (and the server) keeps the single vmap, which fits there.
@@ -728,14 +761,41 @@ def main():
                + ([max(1.0 - float(_sv[i]), 0.999)] if args.reference else [])
                for i in range(len(_sv) - 1)]
     adaln_temb = dit.host_temb(os.path.join(snapshot, trunk), _levels)
-  dit.load_transformer(transformer, os.path.join(snapshot, trunk),
-                       mesh=mesh, memory_kind=dit_host,
-                       round_bf16=args.bf16_weights, lora=lora,
-                       int8=args.int8_weights, adaln_temb=adaln_temb)
+  _dc = None
+  if _wc:
+    _dc = os.path.join(_wc, "dit_" + "_".join(filter(None, [
+        trunk, os.path.basename(os.path.normpath(args.pika_adapter or "")) or "base",
+        "int8" if args.int8_weights else "",
+        f"adaln{len(adaln_temb)}" if adaln_temb is not None else "",
+        "bf16w" if args.bf16_weights else ""])))
+  _mods_host = None
+  if _dc and os.path.exists(os.path.join(_dc, "index.json")):
+    _extra = dit.load_param_cache(transformer, _dc, mesh,
+                                  lambda n, nd: dit._spec_for(n),
+                                  memory_kind=dit_host)
+    _mods_host = _extra.get("adaln")
+    print(f"  [weight-cache] DiT from {_dc}", flush=True)
+  else:
+    if _dc:
+      dit.CACHE_WRITE["dir"] = _dc
+    dit.load_transformer(transformer, os.path.join(snapshot, trunk),
+                         mesh=mesh, memory_kind=dit_host,
+                         round_bf16=args.bf16_weights, lora=lora,
+                         int8=args.int8_weights, adaln_temb=adaln_temb)
+    if args.adaln_host:
+      _mods_host = dit.ADALN_MODS.pop("last")
+    if _dc:
+      dit.cache_finish(extra={"adaln": _mods_host} if _mods_host is not None else None)
   adaln_mods = None
   if args.adaln_host:
-    adaln_mods = [jax.device_put(m, jax.sharding.NamedSharding(
-        mesh, jax.sharding.PartitionSpec())) for m in dit.ADALN_MODS.pop("last")]
+    if len(devices) == 1:
+      # One small chip: keep every step's modulation on the host and move one
+      # step's 18 MB in per call instead of holding all of it in HBM.
+      adaln_mods = _LazyPut(list(_mods_host), jax.sharding.NamedSharding(
+          mesh, jax.sharding.PartitionSpec()))
+    else:
+      adaln_mods = [jax.device_put(m, jax.sharding.NamedSharding(
+          mesh, jax.sharding.PartitionSpec())) for m in _mods_host]
   del lora
   if args.fp8:
     dit.quantize_transformer_fp8(transformer, mesh=mesh)
