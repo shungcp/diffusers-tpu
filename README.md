@@ -25,6 +25,9 @@ Every model can run through three backends, so you can pick the one that fits yo
 Newest first. Each entry links a date to what changed.
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-04** — The JAX backend now decodes the soundtrack as well (its videos used to be silent); `scripts/frames_to_mp4.py` muxes it in. It adds about 0.3 s on a v6e-8 and nothing on one chip.
+  **2026-11-04** — JAX 后端现在也解码音轨(之前生成的视频没有声音),`scripts/frames_to_mp4.py` 会把音轨合进 mp4。在 v6e-8 上多约 0.3 秒,单 chip 上不增加时间。
+
 - **2026-11-03** — Pika-H3-Flex six-step adapters: a 14-second 768p clip in 40.3 s on a v6e-8. MiniMax-H3 now also runs end to end on a single TPU v5e chip.
   **2026-11-03** — 支持 Pika-H3-Flex 六步适配器:在 v6e-8 上 40.3 秒生成一段 14 秒的 768p 视频。MiniMax-H3 现在也能在单个 TPU v5e chip 上端到端运行。
 
@@ -35,8 +38,8 @@ Newest first. Each entry links a date to what changed.
 
 ## Results / 性能
 
-Measured 2026-11-02 to 2026-11-03 on a TPU v6e-8 (8 chips); warm requests, with the model already loaded and compiled.
-测于 2026-11-02 至 2026-11-03,TPU v6e-8(8 个 chip);均为热请求时间,模型已加载并编译完成。
+Measured 2026-11-02 to 2026-11-04 on a TPU v6e-8 (8 chips); warm requests, with the model already loaded and compiled.
+测于 2026-11-02 至 2026-11-04,TPU v6e-8(8 个 chip);均为热请求时间,模型已加载并编译完成。
 
 Software: jax 0.12.0.1, libtpu 0.0.51, torch_tpu 0.2.0, diffusers `cc8644b` (see `requirements/`).
 软件版本:jax 0.12.0.1、libtpu 0.0.51、torch_tpu 0.2.0、diffusers `cc8644b`(见 `requirements/`)。
@@ -46,9 +49,12 @@ Software: jax 0.12.0.1, libtpu 0.0.51, torch_tpu 0.2.0, diffusers `cc8644b` (see
 | | JAX | torchax | torch_tpu |
 |---|---|---|---|
 | text-to-video, lossless / 文生视频,无损 | **110.0 s** | 117.8 s | 139.0 s |
-| text-to-video, lossy / 文生视频,有损 | **36.9 s** | 42.9 s | 52.5 s |
+| text-to-video, lossy / 文生视频,有损 | **37.2 s** | 42.9 s | 52.5 s |
 | reference-to-video, lossless / 参考图生视频,无损 | **139.2 s** | 186.7 s | 189 s |
-| reference-to-video, lossy / 参考图生视频,有损 | **52.3 s** | 77.3 s | 86 s |
+| reference-to-video, lossy / 参考图生视频,有损 | **51.2 s** | 77.3 s | 86 s |
+
+JAX times include decoding the audio; the two lossless JAX numbers were measured before it was added (about 0.3 s more).
+JAX 的时间包含音频解码;两个无损 JAX 数字是加入音频解码之前测的(会多约 0.3 秒)。
 
 "Lossy" skips a DiT call while the timestep embedding barely changes, and lets each video frame attend only to nearby frames.
 "有损"是指:时间步嵌入几乎不变时跳过一次 DiT 计算,并且让每一帧只关注相邻的帧。
@@ -56,8 +62,8 @@ Software: jax 0.12.0.1, libtpu 0.0.51, torch_tpu 0.2.0, diffusers `cc8644b` (see
 The visual quality stays close to lossless; check it on your own prompts before relying on it.
 画质与无损版本接近;正式使用前,请先用自己的提示词检查效果。
 
-The resident server keeps the model on the chips between requests: 36.0 s (text) and 50.9 s (reference) per lossy request.
-常驻服务在请求之间把模型保留在 chip 上:每个有损请求 36.0 秒(文生)和 50.9 秒(参考图生)。
+The resident server keeps the model on the chips between requests: 36.6 s (text) and 51.4 s (reference) per lossy request.
+常驻服务在请求之间把模型保留在 chip 上:每个有损请求 36.6 秒(文生)和 51.4 秒(参考图生)。
 
 ### Qwen-Image-2.1 — 1024x1024
 
@@ -71,13 +77,13 @@ Qwen-Image 的三种后端都使用全部 8 个 chip。
 
 ### Pika-H3-Flex — six steps, JAX backend
 
-Measured 2026-11-03 on a TPU v6e-8, same size as the MiniMax-H3 table (768x1344, 345 frames).
-测于 2026-11-03,TPU v6e-8,尺寸与上面 MiniMax-H3 的表相同(768x1344,345 帧)。
+Measured 2026-11-04 on a TPU v6e-8, same size as the MiniMax-H3 table (768x1344, 345 frames), audio included.
+测于 2026-11-04,TPU v6e-8,尺寸与上面 MiniMax-H3 的表相同(768x1344,345 帧),含音频解码。
 
 | | Pika-H3-Flex, 6 steps / 6 步 | MiniMax-H3, lossless / 无损 |
 |---|---|---|
-| text-to-video / 文生视频 | **40.3 s** | 110.0 s |
-| reference-to-video / 参考图生视频 | **51.7 s** | 139.2 s |
+| text-to-video / 文生视频 | **40.6 s** | 110.0 s |
+| reference-to-video / 参考图生视频 | **51.1 s** | 139.2 s |
 
 Our six-step sampler matches Pika's own code within numerical noise, checked with the same initial noise.
 我们的六步采样与 Pika 官方代码一致,差异在数值噪声范围内(用相同的初始噪声核对过)。
@@ -89,21 +95,21 @@ A resident server (`--runs`) keeps the model and decoder on the chips; these are
 
 | Pika-H3-Flex, v6e-8 | per request / 每个请求 |
 |---|---|
-| text-to-video / 文生视频 | **10.6 s** |
-| reference-to-video, same reference image / 参考图生视频,参考图不变 | **13.4 s** |
-| reference-to-video, a new reference image every request / 参考图生视频,每次换新参考图 | **14.7 s** |
+| text-to-video / 文生视频 | **11.1 s** |
+| reference-to-video, same reference image / 参考图生视频,参考图不变 | **13.8 s** |
+| reference-to-video, a new reference image every request / 参考图生视频,每次换新参考图 | **15.2 s** |
 
-Reference-to-video uses `--sparse-window 16 --sparse-dense-steps 2`; a new image adds the text/vision encode (0.9 s) and the reference encode (0.5 s); preparing the image on the host takes another 0.2 s.
-参考图生视频使用 `--sparse-window 16 --sparse-dense-steps 2`;换新图时要加上文本/视觉编码(0.9 秒)和参考图编码(0.5 秒);在主机上准备图片另需 0.2 秒。
+Reference-to-video uses `--sparse-window 16 --sparse-dense-steps 2`; a new image adds the text/vision encode (0.8 s) and the reference encode (0.5 s); preparing the image on the host takes another 0.2 s.
+参考图生视频使用 `--sparse-window 16 --sparse-dense-steps 2`;换新图时要加上文本/视觉编码(0.8 秒)和参考图编码(0.5 秒);在主机上准备图片另需 0.2 秒。
 
-Without the sparse attention, reference-to-video takes 14.7 s with the same image and 16.1 s with a new one.
-不用稀疏注意力时,参考图生视频在参考图不变时为 14.7 秒,每次换新图时为 16.1 秒。
+Without the sparse attention, reference-to-video takes 15.0 s with the same image and 16.4 s with a new one.
+不用稀疏注意力时,参考图生视频在参考图不变时为 15.0 秒,每次换新图时为 16.4 秒。
 
-The same sparse attention brings text-to-video to 9.4 s.
-文生视频加上同样的稀疏注意力是 9.4 秒。
+The same sparse attention brings text-to-video to 9.9 s.
+文生视频加上同样的稀疏注意力是 9.9 秒。
 
-Through the resident server, with a new prompt or reference image on every request, text-to-video takes 11.9 s and reference-to-video 16.1 s (`sparse_dense_steps` 3).
-通过常驻服务、每个请求换新的提示词或参考图时,文生视频为 11.9 秒,参考图生视频为 16.1 秒(`sparse_dense_steps` 设为 3)。
+Through the resident server, with a new prompt or reference image on every request, text-to-video takes 11.7 s and reference-to-video 16.0–16.6 s (`sparse_dense_steps` 3).
+通过常驻服务、每个请求换新的提示词或参考图时,文生视频为 11.7 秒,参考图生视频为 16.0–16.6 秒(`sparse_dense_steps` 设为 3)。
 
 ### Fewer chips / 更少的 chip
 
@@ -112,13 +118,13 @@ Measured 2026-11-02 to 2026-11-03; "4 chips" means four chips of the same v6e-8 
 
 | | 1 chip | 4 chips / 4 chip | 8 chips / 8 chip |
 |---|---|---|---|
-| MiniMax-H3 text-to-video, lossy / 文生视频,有损 | 30.7 s ¹ | 63.7 s | 36.9 s |
+| MiniMax-H3 text-to-video, lossy / 文生视频,有损 | 30.7 s ¹ | 63.7 s | 37.2 s |
 | MiniMax-H3 text-to-video, lossless / 文生视频,无损 | 65.0 s ¹ | 208.4 s | 110.0 s |
 | Qwen-Image-2.1, 20 steps, JAX / 20 步,JAX | 8.1 s ² | 1.34 s ³ | 0.74 s |
 | Qwen-Image-2.1, 20 steps, torchax / 20 步,torchax | does not fit / 放不下 | 1.66 s | 1.28 s |
 | Qwen-Image-2.1, 20 steps, torch_tpu / 20 步,torch_tpu | 8.8 s | does not fit / 放不下 | 1.18 s |
-| MiniMax-H3 reference-to-video, lossy / 参考图生视频,有损 | — | 92.7 s | 52.3 s |
-| Pika-H3-Flex text-to-video / 文生视频 | 55 s ⁴ | 70.8 s | 40.3 s |
+| MiniMax-H3 reference-to-video, lossy / 参考图生视频,有损 | — | 92.7 s | 51.2 s |
+| Pika-H3-Flex text-to-video / 文生视频 | 55 s ⁴ | 70.8 s | 40.6 s |
 
 ¹ 480x832, 121 frames, `--chips 1 --offload`. ¹ 480x832,121 帧,`--chips 1 --offload`。
 
@@ -152,8 +158,11 @@ Run with `--chips 1 --offload --int8-weights --adaln-host`: the DiT is held in h
 `--int8-weights` halves the weights and changes the output a little; `--adaln-host` precomputes the timestep modulation, so 26 GB of weights never reach the chip, and does not change the output.
 `--int8-weights` 把权重减半,结果略有变化;`--adaln-host` 预先算好时间步调制,于是有 26 GB 权重根本不用上 chip,不改变结果。
 
-Set `DT_WEIGHT_CACHE=<dir>` to keep the converted weights on disk: loading drops from 375 s to 178 s on the next start.
-设置 `DT_WEIGHT_CACHE=<目录>` 把转换好的权重存在磁盘上:下次启动时加载从 375 秒降到 178 秒。
+Set `DT_WEIGHT_CACHE=<dir>` to keep the converted weights on disk: loading drops from 375 s to 178 s on the next start, and the transformer and text-encoder checkpoint shards are no longer read.
+设置 `DT_WEIGHT_CACHE=<目录>` 把转换好的权重存在磁盘上:下次启动时加载从 375 秒降到 178 秒,而且不再读取 transformer 和文本编码器的原始权重分片。
+
+On one chip the audio is decoded on the host, in the background while the chip decodes the video, so it adds no time.
+单 chip 时音频在主机上解码,与 chip 解码视频同时进行,不增加时间。
 
 Reference-to-video also needs `DT_TEXT_ATTN_CHUNK=1024`; 768x1344, 345 frames needs `DT_FF_CHUNK=4096 --block-q 1024 --block-kv 2048`.
 参考图生视频还需要 `DT_TEXT_ATTN_CHUNK=1024`;768x1344、345 帧需要 `DT_FF_CHUNK=4096 --block-q 1024 --block-kv 2048`。
@@ -227,8 +236,8 @@ bash scripts/run_h3_torchax.sh
 bash scripts/run_h3_torchtpu.sh t2va
 ```
 
-Frames are saved to `out/<tag>_frames.npy`; this turns them into mp4 files.
-帧保存在 `out/<tag>_frames.npy`;下面的命令把它们转成 mp4。
+Frames are saved to `out/<tag>_frames.npy` and the soundtrack to `out/<tag>_audio.npy` (32 kHz stereo; `--no-audio` skips it); this turns them into mp4 files with sound.
+帧保存在 `out/<tag>_frames.npy`,音轨保存在 `out/<tag>_audio.npy`(32 kHz 立体声;`--no-audio` 可跳过);下面的命令把它们转成带声音的 mp4。
 
 ```bash
 python scripts/frames_to_mp4.py out out/*_frames.npy
@@ -284,8 +293,8 @@ bash scripts/run_h3_torchtpu.sh t2va --pika-adapter $PIKA/fl2va --prompt "..."
 
 | Pika-H3-Flex, 768x1344, 345 frames | JAX | torchax | torch_tpu |
 |---|---|---|---|
-| text-to-video / 文生视频 | **40.3 s** | 47.3 s | 71.1 s |
-| reference-to-video / 参考图生视频 | **51.7 s** | 67.0 s | 79.4 s |
+| text-to-video / 文生视频 | **40.6 s** | 47.3 s | 71.1 s |
+| reference-to-video / 参考图生视频 | **51.1 s** | 67.0 s | 79.4 s |
 
 The adapter is merged into the weights while loading, so the denoising step costs the same as the base model.
 适配器在加载时就合并进权重,所以每一步去噪的开销和底座模型一样。

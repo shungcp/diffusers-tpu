@@ -169,6 +169,8 @@ def parse_args():
   ap.add_argument("--dtype", default="bfloat16", choices=("bfloat16", "float32"))
   ap.add_argument("--out", default="out")
   ap.add_argument("--tag", default="jax_t2va")
+  ap.add_argument("--no-audio", action="store_true",
+                  help="Skip the audio VAE decode (video-only output).")
   ap.add_argument("--vae-clip", type=int, default=8,
                   help="Latent frames decoded per program. The decoder "
                        "is a transformer over one token per latent voxel, "
@@ -754,19 +756,18 @@ def main():
     if pika["trunk"] != trunk:
       raise ValueError(f"adapter {pika['task']} wants {pika['trunk']}, "
                        f"this request reads {trunk}")
-  adaln_temb = None
+  adaln_temb = _levels = None
   if args.adaln_host:
     _sv, _sa = _step_sigmas(args, pika if args.pika_adapter else None)
     _levels = [[1.0 - _sv[i], 1.0 - _sa[i]]
                + ([max(1.0 - float(_sv[i]), 0.999)] if args.reference else [])
                for i in range(len(_sv) - 1)]
-    adaln_temb = dit.host_temb(os.path.join(snapshot, trunk), _levels)
   _dc = None
   if _wc:
     _dc = os.path.join(_wc, "dit_" + "_".join(filter(None, [
         trunk, os.path.basename(os.path.normpath(args.pika_adapter or "")) or "base",
         "int8" if args.int8_weights else "",
-        f"adaln{len(adaln_temb)}" if adaln_temb is not None else "",
+        f"adaln{len(_levels)}" if _levels is not None else "",
         "bf16w" if args.bf16_weights else ""])))
   _mods_host = None
   if _dc and os.path.exists(os.path.join(_dc, "index.json")):
@@ -778,6 +779,9 @@ def main():
   else:
     if _dc:
       dit.CACHE_WRITE["dir"] = _dc
+    # Only when building: a cached start then needs no transformer shard.
+    if _levels is not None:
+      adaln_temb = dit.host_temb(os.path.join(snapshot, trunk), _levels)
     dit.load_transformer(transformer, os.path.join(snapshot, trunk),
                          mesh=mesh, memory_kind=dit_host,
                          round_bf16=args.bf16_weights, lora=lora,
@@ -1335,8 +1339,20 @@ def main():
                          jnp.concatenate([latents[:, :, :WARM_CHUNK]] * _cb,
                                          axis=0).astype(dec_dtype)))
         print(f"  decode warmup {time.perf_counter() - warm:.1f}s", flush=True)
+    if run == 0 and not args.no_audio:
+      # Small (one jitted program); built and compiled here so its setup
+      # is subtracted with the video decoder's.
+      from diffusers_tpu.models.minimax_h3.audio_decode import AudioDecoder
+      audio_dec = AudioDecoder(snapshot, on_cpu=len(devices) == 1)
+      if len(devices) > 1:
+        audio_dec.decode(np.zeros((audio_idx.shape[0], audio_dec.channels),
+                                  np.float32))
     decoder_setup = time.perf_counter() - began_setup
     began_decode = time.perf_counter()
+    # Dispatched first so it queues with the video decode instead of after
+    # it; `audio` is final once the last step has run.
+    pending_audio = (None if args.no_audio else
+                     audio_dec.start(np.asarray(jax.device_get(audio))[0]))
     # Follows `AutoencoderKLMiniMaxH3._decode`: the VAE encodes 17 pixel
     # frames per chunk and drops `token_drop = 3` trailing latents, so
     # consecutive decoded chunks overlap and are cross-faded, and each carries
@@ -1435,6 +1451,11 @@ def main():
       frames = jax.block_until_ready(frames)
     del pieces, z
     decode_wall = time.perf_counter() - began_decode
+    wave = None
+    if not args.no_audio:
+      began_audio = time.perf_counter()
+      wave = audio_dec.finish(pending_audio)
+      audio_wall = time.perf_counter() - began_audio
     if dt_timing:
       print(f"  [decode timing] decode_tiled {t_dec:.2f}s  "
             f"slice+blend {t_blend:.2f}s  (serialized; sum >= normal wall time)",
@@ -1482,6 +1503,10 @@ def main():
     wall = time.perf_counter() - began_request
     request = wall - decoder_setup
     np.save(path, frames)
+    if wave is not None:
+      # Stereo float32 `(2, samples)` at `audio_dec.sampling_rate`;
+      # scripts/frames_to_mp4.py muxes it when it sits next to the frames.
+      np.save(os.path.join(args.out, f"{args.tag}_audio.npy"), wave)
     print(f"generate: {request:.1f}s" + (f"  [run {run}]" if args.runs > 1 else ""),
           flush=True)
     if args.reference:
@@ -1491,6 +1516,8 @@ def main():
             f" = generate {request:.1f} + text/vision {r2v_text_warm:.1f}"
             f" + reference encode {r2v_enc_warm:.1f}", flush=True)
     print(f"  denoise {denoise_wall:.1f}s, decode {decode_wall:.1f}s, "
+          + (f"audio {audio_wall:.2f}s ({20 * np.log10(np.sqrt(np.mean(wave ** 2)) + 1e-12):.0f} dBFS), "
+             if wave is not None else "") +
           f"load+compile before the request {began_request - began:.1f}s",
           flush=True)
     print(f"  (wall {wall:.1f}s, of which one-off decoder setup {decoder_setup:.1f}s "

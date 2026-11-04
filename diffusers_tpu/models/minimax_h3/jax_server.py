@@ -57,8 +57,11 @@ def parse_args():
   ap.add_argument("--decode-chunk-batch", type=int, default=0)  # 0 = auto
   # With a resident DiT and a tensor-parallel decoder, per-chunk scratch memory
   # is much larger than in the pipeline: K=10 needs 42.58 GiB and OOMs.
-  # Auto only balances chunks under this cap.
-  ap.add_argument("--decode-chunk-cap", type=int, default=4)
+  # Auto only balances chunks under this cap. 0 = 8 at 480p and below
+  # (2.7 -> 2.4 s), 4 above (8 at 768p needs 27.6 GiB and OOMs).
+  ap.add_argument("--decode-chunk-cap", type=int, default=0)
+  ap.add_argument("--no-audio", action="store_true",
+                  help="Skip the audio VAE decode (video-only output).")
   ap.add_argument("--vae-tile-overlap-px", type=int, default=32)
   ap.add_argument("--cache-threshold", type=float, default=None,
                   help="step-skip threshold for requests with lossy=true; defaults "
@@ -420,6 +423,17 @@ class Server:
     self._decode = decode
     self.lat_mean = jnp.asarray(self.vae_cfg["latents_mean"], jnp.float32).reshape(1, -1, 1, 1, 1)
     self.lat_std = jnp.asarray(self.vae_cfg["latents_std"], jnp.float32).reshape(1, -1, 1, 1, 1)
+    self.audio_dec = None
+    if not self.a.no_audio:
+      from diffusers_tpu.models.minimax_h3.audio_decode import AudioDecoder
+      self.audio_dec = AudioDecoder(self.snapshot, on_cpu=mesh.devices.size == 1)
+      # Compile once for the default length; otherwise the first request
+      # pays about 64 s for it.
+      from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
+          align_num_frames, audio_latent_num_frames)
+      n = audio_latent_num_frames(align_num_frames(int(self.a.num_frames), 17, 5))
+      if mesh.devices.size > 1:
+        self.audio_dec.decode(np.zeros((2 * n, self.audio_dec.channels), np.float32))
 
   # ---------------------------------------------------------------------
   def _encode_text(self, prompt, reference_image):
@@ -795,6 +809,9 @@ class Server:
 
       # Decode
       t = time.perf_counter()
+      # Audio first, so it queues with the video decode (saves about 0.3 s).
+      pending_audio = (None if self.audio_dec is None else
+                       self.audio_dec.start(np.asarray(jax.device_get(audio))[0]))
       vid = video[:, n_ref:]
       lat = vid.reshape(1, latent_frames, latent_h // 2, latent_w // 2,
                         dit.CONFIG_FULL["in_channels"], 2, 2)
@@ -803,6 +820,11 @@ class Server:
       lat = lat.astype(jnp.float32) * self.lat_std + self.lat_mean
       frames = self._decode_latents(lat)
     T["decode"] = time.perf_counter() - t
+    T["wave"] = None
+    if self.audio_dec is not None:
+      t = time.perf_counter()
+      T["wave"] = self.audio_dec.finish(pending_audio)
+      T["audio"] = time.perf_counter() - t
     T["total"] = time.perf_counter() - t_all
     T["text_tokens"] = T_info
     return frames, T
@@ -840,7 +862,9 @@ class Server:
     if pad_tokens:
       z = jnp.concatenate([z, jnp.repeat(z[:, :, -1:], pad_tokens, axis=2)], axis=2)
     K = decode_chunk_batch(frames_lat, a.decode_chunk_batch,
-                           1 if self.mesh.devices.size == 1 else a.decode_chunk_cap)
+                           1 if self.mesh.devices.size == 1 else
+                           a.decode_chunk_cap or
+                           (8 if latents.shape[3] * latents.shape[4] <= 30 * 52 else 4))
     decoded, pieces, carry = {}, [], None
     for i in range(num_chunks):
       if i not in decoded:
@@ -898,9 +922,13 @@ def main():
     frames, T = server.generate(req)
     tag = req.get("tag", f"req{n}")
     np.save(os.path.join(args.out, f"{tag}_frames.npy"), frames)
+    if T["wave"] is not None:
+      np.save(os.path.join(args.out, f"{tag}_audio.npy"), T["wave"])
     print(f"[req {n}] {tag}: total {T['total']:.1f}s = dit_swap {T['dit_swap']:.1f} + "
           f"text {T['text']:.1f} + prep {T['prep']:.1f} + denoise {T['denoise']:.1f} "
-          f"(skipped {T['skipped']}) + decode {T['decode']:.1f}  {tuple(frames.shape)}  "
+          f"(skipped {T['skipped']}) + decode {T['decode']:.1f}"
+          + (f" + audio {T['audio']:.2f}" if T["wave"] is not None else "") +
+          f"  {tuple(frames.shape)}  "
           f"text_tokens {T['text_tokens'][0]}->{T['text_tokens'][1]}",
           flush=True)
 
