@@ -765,7 +765,7 @@ def tiled_encode(encode_one, x, tile_px=256, overlap_px=64,
     from jax.sharding import NamedSharding, PartitionSpec as P
     n = len(tiles)
     ndev = mesh.devices.size
-    group = int(os.environ.get("DT_ENC_GROUP", "5")) * ndev
+    group = int(os.environ.get("DT_ENC_GROUP", "0")) * ndev
     if group and group < n:
       # Groups of DT_ENC_GROUP tiles a chip, one after another under
       # `lax.map`: as one program the 154-tile encode needs 34.7 GB of

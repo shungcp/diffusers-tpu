@@ -56,8 +56,8 @@ Software: jax 0.12.0.1, libtpu 0.0.51, torch_tpu 0.2.0, diffusers `cc8644b` (see
 The visual quality stays close to lossless; check it on your own prompts before relying on it.
 画质与无损版本接近;正式使用前,请先用自己的提示词检查效果。
 
-The resident server keeps the model on the chips between requests: 36.4 s (text) and 54.8 s (reference) per lossy request.
-常驻服务在请求之间把模型保留在 chip 上:每个有损请求 36.4 秒(文生)和 54.8 秒(参考图生)。
+The resident server keeps the model on the chips between requests: 36.0 s (text) and 50.9 s (reference) per lossy request.
+常驻服务在请求之间把模型保留在 chip 上:每个有损请求 36.0 秒(文生)和 50.9 秒(参考图生)。
 
 ### Qwen-Image-2.1 — 1024x1024
 
@@ -101,6 +101,9 @@ Without the sparse attention, reference-to-video takes 14.7 s with the same imag
 
 The same sparse attention brings text-to-video to 9.4 s.
 文生视频加上同样的稀疏注意力是 9.4 秒。
+
+Through the resident server, with a new prompt or reference image on every request, text-to-video takes 11.9 s and reference-to-video 16.1 s (`sparse_dense_steps` 3).
+通过常驻服务、每个请求换新的提示词或参考图时,文生视频为 11.9 秒,参考图生视频为 16.1 秒(`sparse_dense_steps` 设为 3)。
 
 ### Fewer chips / 更少的 chip
 
@@ -235,6 +238,13 @@ Point `--pika-adapter` at the `fl2va` folder for text-to-video, or the `ref2va` 
 PIKA=$(ls -d $HF_HOME/hub/models--Pika-Labs--Pika-H3-Flex/snapshots/*)
 bash scripts/run_h3_jax.sh t2va --pika-adapter $PIKA/fl2va --prompt "..."
 bash scripts/run_h3_jax.sh ref2va --pika-adapter $PIKA/ref2va --reference character.png --prompt "..."
+```
+
+The resident server takes the adapters too, one per workflow; each request line can set `sparse_dense_steps`.
+常驻服务也能加载适配器,每种工作流一个;每行请求可以设置 `sparse_dense_steps`。
+
+```bash
+bash scripts/run_h3_jax_server.sh requests.jsonl --pika-fl2va $PIKA/fl2va --pika-ref2va $PIKA/ref2va
 ```
 
 The adapter is merged into the weights while loading, so the denoising step costs the same as the base model.

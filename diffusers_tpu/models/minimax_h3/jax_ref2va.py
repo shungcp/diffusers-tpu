@@ -221,13 +221,15 @@ def encode_text_with_vision(encoder, vision_model, p, positions, cfg_text,
     from flax import nnx
     ge, se = nnx.split(encoder)
     gv, sv = nnx.split(vision_model)
-
-    @functools.partial(jax.jit, static_argnames=("stop_at_layer",))
-    def _fwd(se_, sv_, x_, stop_at_layer):
-      return text_forward(nnx.merge(ge, se_), nnx.merge(gv, sv_), x_,
-                          stop_at_layer)
-
-    _TEXT_SPLIT[key] = (_fwd, se, sv)
+    # One compiled function per module structure, so a caller that builds
+    # fresh modules per request (the server) does not retrace each time.
+    if (ge, gv) not in _TEXT_FN:
+      @functools.partial(jax.jit, static_argnames=("stop_at_layer",))
+      def _fwd(se_, sv_, x_, stop_at_layer):
+        return text_forward(nnx.merge(ge, se_), nnx.merge(gv, sv_), x_,
+                            stop_at_layer)
+      _TEXT_FN[(ge, gv)] = _fwd
+    _TEXT_SPLIT[key] = (_TEXT_FN[(ge, gv)], se, sv)
   fwd, se, sv = _TEXT_SPLIT[key]
   return fwd(se, sv, x, stop_at_layer=stop_at_layer)
 
@@ -238,6 +240,7 @@ def release_text_jit():
 
 
 _TEXT_SPLIT = {}
+_TEXT_FN = {}
 _ENC_JIT = None
 
 

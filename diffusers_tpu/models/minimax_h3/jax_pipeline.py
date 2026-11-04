@@ -592,6 +592,10 @@ def main():
     # Whole-encode jit (DT_ENC_JIT, on by default): 2.8 -> 0.5 s for a
     # 3648x2048 reference, tiles in groups (DT_ENC_GROUP) so it compiles.
     _jit_enc = os.environ.get("DT_ENC_JIT", "1") == "1"
+    if _jit_enc:
+      # Grouped tiles are what lets the whole-encode program compile; the
+      # eager path (and the server) keeps the single vmap, which fits there.
+      os.environ.setdefault("DT_ENC_GROUP", "5")
     _enc_w = _ENC_W_FN if _jit_enc else (lambda t: _encode_one(_es, _qs, t))
     cond = r2v.encode_condition(_enc_w, ref_image,
                                 _vcfg["latents_mean"], _vcfg["latents_std"],

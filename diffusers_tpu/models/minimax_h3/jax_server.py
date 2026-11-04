@@ -33,8 +33,8 @@ import time
 
 import numpy as np
 
-from .jax_pipeline import (TEXT_ENCODER_LAYER, decode_chunk_batch, scheduler_step,
-                           sigma_schedule)
+from .jax_pipeline import (TEXT_ENCODER_LAYER, _step_sigmas, decode_chunk_batch,
+                           scheduler_step, sigma_schedule)
 
 
 def parse_args():
@@ -66,6 +66,11 @@ def parse_args():
   ap.add_argument("--sparse-window", type=int, default=16,
                   help="sparse attention window for requests with lossy=true (t2va and ref2va)")
   ap.add_argument("--sparse-dense-steps", type=int, default=6)
+  ap.add_argument("--pika-fl2va", default="",
+                  help="Pika-H3-Flex fl2va adapter dir: text-to-video requests use "
+                       "its six-step ladder and re-noising sampler")
+  ap.add_argument("--pika-ref2va", default="",
+                  help="Pika-H3-Flex ref2va adapter dir, for reference requests")
   ap.add_argument("--compile-cache", default="")
   ap.add_argument("--warmup", default="",
                   help="request file used to precompile every shape at startup (3 steps, "
@@ -158,6 +163,7 @@ class Server:
     # config). Both do not fit at once, so the active one is reloaded on workflow switch.
     self.Transformer = Transformer
     self.dit_kind = None
+    self.pika = None
     self.transformer = transformer
     self._sdpa_build()
     self._load_decoder()
@@ -201,7 +207,7 @@ class Server:
 
     @jax.jit
     def encode_one(es, qs, tile):
-      with jax.default_matmul_precision(os.environ.get("DT_VAE_ENC_PRECISION", "highest")):
+      with jax.default_matmul_precision(os.environ.get("DT_VAE_ENC_PRECISION", "high")):
         return nnx.merge(qg, qs)(nnx.merge(eg, es)(tile))
     self._encode_one = encode_one
 
@@ -337,9 +343,14 @@ class Server:
     self.transformer = nnx.eval_shape(
         lambda: self.Transformer(**dit.CONFIG_FULL, dtype=self.dtype,
                                  rngs=nnx.Rngs(0)))
+    adapter = self.a.pika_ref2va if kind == "ref2va" else self.a.pika_fl2va
+    lora, self.pika = None, None
+    if adapter:
+      lora, self.pika = dit.load_lora(adapter)
     dit.load_transformer(self.transformer, os.path.join(
         self.snapshot, "transformer_ref" if kind == "ref2va" else "transformer"),
-        mesh=self.mesh)
+        mesh=self.mesh, lora=lora)
+    del lora
     if self.a.fp8:
       dit.quantize_transformer_fp8(self.transformer, mesh=self.mesh)
     self.graphdef, self.state = nnx.split(self.transformer)
@@ -455,6 +466,7 @@ class Server:
         emb = r2v.encode_text_with_vision(enc, vis, pres_in, pos_in, self.cfg_text,
                                           self.dtype, TEXT_ENCODER_LAYER, jit=True)
         emb = jax.block_until_ready(emb)[:, :n_real]
+        r2v.release_text_jit()   # the towers go back to host after this
         del vis
         print(f"  [server] ref2va text: text tower to chip {t_h2d:.1f}s, host prep {t_prep:.1f}s, "
               f"vision+text tower {time.perf_counter() - t_fwd:.1f}s", flush=True)
@@ -499,10 +511,21 @@ class Server:
     dev = self.NS(self.mesh, self.P())
     es = jax.device_put(self._es_host, dev)
     qs = jax.device_put(self._qs_host, dev)
-    enc1 = self._encode_one
-    cond = r2v.encode_condition(lambda t: enc1(es, qs, t), image,
-                                self.vae_cfg["latents_mean"],
-                                self.vae_cfg["latents_std"], mesh=self.mesh)
+    if os.environ.get("DT_ENC_JIT", "1") == "1":
+      # The whole tiled encode as one program, tiles in groups (as in
+      # `jax_pipeline`): 2.8 -> 0.5 s for a 3648x2048 reference.
+      from . import jax_pipeline as jp
+      os.environ.setdefault("DT_ENC_GROUP", "5")
+      jp._ENC_ONE[0] = self._encode_one
+      cond = r2v.encode_condition(jp._ENC_W_FN, image,
+                                  self.vae_cfg["latents_mean"],
+                                  self.vae_cfg["latents_std"], mesh=self.mesh,
+                                  weights=(es, qs))
+    else:
+      enc1 = self._encode_one
+      cond = r2v.encode_condition(lambda t: enc1(es, qs, t), image,
+                                  self.vae_cfg["latents_mean"],
+                                  self.vae_cfg["latents_std"], mesh=self.mesh)
     del es, qs
     return cond
 
@@ -554,7 +577,14 @@ class Server:
     n_ref, cond_rows = 0, None
     if image is not None:
       cond = self._encode_reference(image)
-      noise = randn_tensor(tuple(cond.shape), generator=tgen, dtype=torch.float32)
+      if self.pika is not None:
+        # Pika's anchor noise: seed + 7919, frame-major [B, F, C, H, W].
+        c_ = cond.shape
+        noise = torch.randn((c_[0], c_[2], c_[1], c_[3], c_[4]),
+                            generator=torch.Generator().manual_seed(seed + 7919),
+                            dtype=torch.float32).permute(0, 2, 1, 3, 4)
+      else:
+        noise = randn_tensor(tuple(cond.shape), generator=tgen, dtype=torch.float32)
       noised = r2v.NOISE_AUG * torch.from_numpy(cond) + (1 - r2v.NOISE_AUG) * noise
       cond_rows = patchify_video_latents(noised, (1, 2, 2)).numpy().astype(np.float32)
       layout = r2v.layout(pres["tags"], pres["references"], r2v.condition_shape(image),
@@ -597,6 +627,27 @@ class Server:
                       generator=tgen, dtype=torch.float32)
     video = jnp.asarray(patchify_video_latents(v, (1, 2, 2)).numpy())[None]
     audio = jnp.asarray(au.numpy())[None]
+    pika_eps = None
+    if self.pika is not None:
+      # Pika's draws, as in `jax_pipeline --pika-adapter`: video then audio
+      # from seed in its external layouts, re-noising eps from seed + 1.
+      C_ = dit.CONFIG_FULL["in_channels"]
+      vs_ = (1, latent_frames, C_, latent_h, latent_w)
+      T_ = int(audio_idx.shape[0]) // 2
+      ach = dit.CONFIG_FULL["audio_in_channels"]
+      vrows = lambda x: jnp.asarray(patchify_video_latents(
+          x.permute(0, 2, 1, 3, 4), (1, 2, 2)).reshape(1, -1, 4 * C_).numpy())
+      arows = lambda x: jnp.asarray(x.view(1, T_, 2, ach).permute(0, 2, 1, 3)
+                                    .reshape(1, 2 * T_, ach).numpy())
+      g = torch.Generator().manual_seed(seed)
+      video = vrows(torch.randn(vs_, generator=g, dtype=torch.float32))
+      audio = arows(torch.randn((1, T_, 2 * ach), generator=g, dtype=torch.float32))
+      g = torch.Generator().manual_seed(seed + 1)
+      pika_eps = []
+      for _ in range(len(self.pika["sampling"]["knots"]) - 2):
+        ev = vrows(torch.randn(vs_, generator=g, dtype=torch.float32))
+        ea = arows(torch.randn((1, T_, 2 * ach), generator=g, dtype=torch.float32))
+        pika_eps.append((ev, ea))
     if n_ref:
       video = jnp.concatenate([jnp.asarray(cond_rows)[None], video], axis=1)
     row_step = jnp.zeros((seq,), jnp.int32).at[audio_idx].set(1)
@@ -609,8 +660,10 @@ class Server:
     steps = int(req.get("steps", a.steps))
     dense_steps = int(req.get("sparse_dense_steps", a.sparse_dense_steps))
     sigmas = sigma_schedule(steps, a.shift)
-    timesteps = 1.0 - sigmas[:-1]
     a_sigmas = sigma_schedule(steps, a.audio_shift)
+    if self.pika is not None:
+      sigmas, a_sigmas = _step_sigmas(a, self.pika)
+    timesteps = 1.0 - sigmas[:-1]
     a_timesteps = 1.0 - a_sigmas[:-1]
     call = self._call(self.sdpa, (kind, "dense"))
     call_sparse, sparse_args = None, ()
@@ -654,7 +707,15 @@ class Server:
       return (h @ W[2].T + W[3]).mean(0)
 
     cache = ({"last_mod": None, "last_out": None, "drift": 0.0, "skipped": 0}
-             if lossy else None)
+             if lossy and self.pika is None else None)
+
+    def pika_step(x, v_, i, j):
+      """Re-noising step: x0 = x + sigma v, then fresh noise at the next level."""
+      sg, sn = (sigmas, a_sigmas)[j][i], (sigmas, a_sigmas)[j][i + 1]
+      x0 = x.astype(jnp.float32) + float(sg) * v_.astype(jnp.float32)
+      if i >= len(pika_eps):
+        return x0
+      return (1.0 - float(sn)) * x0 + float(sn) * pika_eps[i][j]
     args_layout = (row_step, token_tags, position_ids, video_idx, audio_idx,
                    text_idx) + T_layout
 
@@ -692,15 +753,20 @@ class Server:
             dv, da = call(self.state, video, audio, emb, tt, *args_layout)
           if cache is not None:
             cache["last_out"] = (dv, da)
-        if n_ref:
+        if pika_eps is not None:
+          gen = pika_step(video[:, n_ref:], dv[:, n_ref:], i, 0)
+          video = jnp.concatenate([video[:, :n_ref], gen], axis=1) if n_ref else gen
+          audio = pika_step(audio, da, i, 1)
+        elif n_ref:
           gen = scheduler_step(video[:, n_ref:], dv[:, n_ref:], float(timesteps[i]),
                                float(sigmas[i]), float(sigmas[i + 1]))
           video = jnp.concatenate([video[:, :n_ref], gen], axis=1)
         else:
           video = scheduler_step(video, dv, float(timesteps[i]), float(sigmas[i]),
                                  float(sigmas[i + 1]))
-        audio = scheduler_step(audio, da, float(a_timesteps[i]), float(a_sigmas[i]),
-                               float(a_sigmas[i + 1]))
+        if pika_eps is None:
+          audio = scheduler_step(audio, da, float(a_timesteps[i]), float(a_sigmas[i]),
+                                 float(a_sigmas[i + 1]))
         if os.environ.get("DT_SERVER_STEP_TIMES") == "1":
           jax.block_until_ready(video)
           print(f"    step {i}: {time.perf_counter() - t:.1f}s", flush=True)
