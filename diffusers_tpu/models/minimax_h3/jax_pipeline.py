@@ -187,6 +187,10 @@ def parse_args():
                        "DINO 0.9709 -> 0.9377")
   ap.add_argument("--qk-fp8", action="store_true",
                   help="Cast Q and K to float8_e4m3fn inside Pallas splash attention.")
+  ap.add_argument("--cache-only", action="store_true",
+                  help="With DT_WEIGHT_CACHE: build the text tower and DiT caches "
+                       "and exit. Runs on the CPU too (JAX_PLATFORMS=cpu), so the "
+                       "int8 conversion can happen on any big-memory machine.")
   ap.add_argument("--pallas-ffn", action="store_true",
                   help="Use sequence-tiled Pallas SwiGLU FFN megakernel (DT_PALLAS_FFN=1).")
   ap.add_argument("--dense-attention", action="store_true",
@@ -275,6 +279,64 @@ def _step_sigmas(args, pika=None):
             shift(q, pika["sampling"]["audio_shift"]))
   return (sigma_schedule(args.steps, args.shift),
           sigma_schedule(args.steps, args.audio_shift))
+
+
+def _load_dit(args, snapshot, mesh, dtype, dit_host, wc):
+  """The DiT, its adapter merged, read from the weight cache when there is
+  one and written to it when there is not. Returns
+  `(transformer, trunk, pika, adaln modulation on the host or None)`."""
+  import os
+  from flax import nnx
+  from . import jax_dit as dit
+  _wc = wc
+  pika = None
+  _, Transformer = dit._build_modules()
+  transformer = nnx.eval_shape(
+      lambda: Transformer(**dit.CONFIG_FULL, dtype=dtype, rngs=nnx.Rngs(0)))
+  # ref2va reads the `transformer_ref` partition: same config, 638 keys
+  # by the same names, different weights.
+  trunk = "transformer_ref" if args.reference else "transformer"
+  lora = None
+  if args.pika_adapter:
+    lora, pika = dit.load_lora(args.pika_adapter)
+    if pika["trunk"] != trunk:
+      raise ValueError(f"adapter {pika['task']} wants {pika['trunk']}, "
+                       f"this request reads {trunk}")
+  adaln_temb = _levels = None
+  if args.adaln_host:
+    _sv, _sa = _step_sigmas(args, pika if args.pika_adapter else None)
+    _levels = [[1.0 - _sv[i], 1.0 - _sa[i]]
+               + ([max(1.0 - float(_sv[i]), 0.999)] if args.reference else [])
+               for i in range(len(_sv) - 1)]
+  _dc = None
+  if _wc:
+    _dc = os.path.join(_wc, "dit_" + "_".join(filter(None, [
+        trunk, os.path.basename(os.path.normpath(args.pika_adapter or "")) or "base",
+        "int8" if args.int8_weights else "",
+        f"adaln{len(_levels)}" if _levels is not None else "",
+        "bf16w" if args.bf16_weights else ""])))
+  _mods_host = None
+  if _dc and os.path.exists(os.path.join(_dc, "index.json")):
+    _extra = dit.load_param_cache(transformer, _dc, mesh,
+                                  lambda n, nd: dit._spec_for(n),
+                                  memory_kind=dit_host)
+    _mods_host = _extra.get("adaln")
+    print(f"  [weight-cache] DiT from {_dc}", flush=True)
+  else:
+    if _dc:
+      dit.CACHE_WRITE["dir"] = _dc
+    # Only when building: a cached start then needs no transformer shard.
+    if _levels is not None:
+      adaln_temb = dit.host_temb(os.path.join(snapshot, trunk), _levels)
+    dit.load_transformer(transformer, os.path.join(snapshot, trunk),
+                         mesh=mesh, memory_kind=dit_host,
+                         round_bf16=args.bf16_weights, lora=lora,
+                         int8=args.int8_weights, adaln_temb=adaln_temb)
+    if args.adaln_host:
+      _mods_host = dit.ADALN_MODS.pop("last")
+    if _dc:
+      dit.cache_finish(extra={"adaln": _mods_host} if _mods_host is not None else None)
+  return transformer, trunk, pika, _mods_host
 
 
 def scheduler_step(sample, model_output, timestep, sigma, sigma_next):
@@ -438,6 +500,13 @@ def main():
     if _tc:
       dit.cache_finish()
   print(f"text encoder loaded  {time.perf_counter() - began:.0f}s", flush=True)
+  if args.cache_only:
+    if not _wc:
+      raise SystemExit("--cache-only needs DT_WEIGHT_CACHE=<dir>")
+    del encoder
+    _load_dit(args, snapshot, mesh, dtype, dit_host, _wc)
+    print(f"weight caches in {_wc}", flush=True)
+    return
 
   if args.reference:
     # ref2va: `"<Picture 1>: " + 7168 image_pad tokens + prompt`. Vision tower
@@ -766,52 +835,8 @@ def main():
         f"audio {audio_idx.shape[0]}, video {video_idx.shape[0]}", flush=True)
 
   # -- transformer -----------------------------------------------------
-  _, Transformer = dit._build_modules()
-  transformer = nnx.eval_shape(
-      lambda: Transformer(**dit.CONFIG_FULL, dtype=dtype, rngs=nnx.Rngs(0)))
-  # ref2va reads the `transformer_ref` partition: same config, 638 keys
-  # by the same names, different weights.
-  trunk = "transformer_ref" if args.reference else "transformer"
-  lora = None
-  if args.pika_adapter:
-    lora, pika = dit.load_lora(args.pika_adapter)
-    if pika["trunk"] != trunk:
-      raise ValueError(f"adapter {pika['task']} wants {pika['trunk']}, "
-                       f"this request reads {trunk}")
-  adaln_temb = _levels = None
-  if args.adaln_host:
-    _sv, _sa = _step_sigmas(args, pika if args.pika_adapter else None)
-    _levels = [[1.0 - _sv[i], 1.0 - _sa[i]]
-               + ([max(1.0 - float(_sv[i]), 0.999)] if args.reference else [])
-               for i in range(len(_sv) - 1)]
-  _dc = None
-  if _wc:
-    _dc = os.path.join(_wc, "dit_" + "_".join(filter(None, [
-        trunk, os.path.basename(os.path.normpath(args.pika_adapter or "")) or "base",
-        "int8" if args.int8_weights else "",
-        f"adaln{len(_levels)}" if _levels is not None else "",
-        "bf16w" if args.bf16_weights else ""])))
-  _mods_host = None
-  if _dc and os.path.exists(os.path.join(_dc, "index.json")):
-    _extra = dit.load_param_cache(transformer, _dc, mesh,
-                                  lambda n, nd: dit._spec_for(n),
-                                  memory_kind=dit_host)
-    _mods_host = _extra.get("adaln")
-    print(f"  [weight-cache] DiT from {_dc}", flush=True)
-  else:
-    if _dc:
-      dit.CACHE_WRITE["dir"] = _dc
-    # Only when building: a cached start then needs no transformer shard.
-    if _levels is not None:
-      adaln_temb = dit.host_temb(os.path.join(snapshot, trunk), _levels)
-    dit.load_transformer(transformer, os.path.join(snapshot, trunk),
-                         mesh=mesh, memory_kind=dit_host,
-                         round_bf16=args.bf16_weights, lora=lora,
-                         int8=args.int8_weights, adaln_temb=adaln_temb)
-    if args.adaln_host:
-      _mods_host = dit.ADALN_MODS.pop("last")
-    if _dc:
-      dit.cache_finish(extra={"adaln": _mods_host} if _mods_host is not None else None)
+  transformer, trunk, pika, _mods_host = _load_dit(args, snapshot, mesh, dtype,
+                                                   dit_host, _wc)
   adaln_mods = None
   if args.adaln_host:
     if len(devices) == 1 and _small_hbm:
@@ -822,7 +847,6 @@ def main():
     else:
       adaln_mods = [jax.device_put(m, jax.sharding.NamedSharding(
           mesh, jax.sharding.PartitionSpec())) for m in _mods_host]
-  del lora
   if args.fp8:
     dit.quantize_transformer_fp8(transformer, mesh=mesh)
   if (args.pallas_ffn or os.environ.get("DT_PALLAS_FFN") == "1"

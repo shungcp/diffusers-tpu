@@ -164,6 +164,9 @@ Run with `--chips 1 --offload --int8-weights --adaln-host`: the DiT is held in h
 Set `DT_WEIGHT_CACHE=<dir>` to keep the converted weights on disk: loading drops from 375 s to 178 s on the next start, and the transformer and text-encoder checkpoint shards are no longer read.
 设置 `DT_WEIGHT_CACHE=<目录>` 把转换好的权重存在磁盘上:下次启动时加载从 375 秒降到 178 秒,而且不再读取 transformer 和文本编码器的原始权重分片。
 
+Add `--cache-only` to build the cache and exit. It also runs without a TPU (`JAX_PLATFORMS=cpu`, about 95 GB of memory), and the files are identical to the ones a TPU run writes, so the conversion can happen on any big-memory machine and the cache be copied over.
+加上 `--cache-only` 只构建缓存然后退出。它也能在没有 TPU 的机器上运行(`JAX_PLATFORMS=cpu`,约需 95 GB 内存),生成的文件与 TPU 上写出的逐字节相同,所以可以在任意大内存机器上转换,再把缓存拷过去。
+
 On one chip the audio is decoded on the host, in the background while the chip decodes the video, so it adds no time.
 单 chip 时音频在主机上解码,与 chip 解码视频同时进行,不增加时间。
 
