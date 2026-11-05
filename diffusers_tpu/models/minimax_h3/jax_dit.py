@@ -1103,7 +1103,7 @@ def host_temb(transformer_dir, levels_per_step, freq_dim=256):
   import os
 
   import numpy as np
-  from safetensors import safe_open
+  from ...safetensors_io import safe_open
 
   index = json.load(open(os.path.join(
       transformer_dir, "diffusion_pytorch_model.safetensors.index.json")))
@@ -1169,7 +1169,7 @@ def load_transformer(model, transformer_dir, mesh=None, verbose=False,
   import jax
   import jax.numpy as jnp
   from flax import nnx
-  from safetensors import safe_open
+  from ...safetensors_io import safe_open
 
   shards = sorted(glob.glob(os.path.join(transformer_dir, "*.safetensors")))
   if not shards:
@@ -1249,7 +1249,7 @@ def _load_transformer_parallel(model, shards, mesh, memory_kind, resolve,
   import numpy as np
   import torch
   from flax import nnx
-  from safetensors import safe_open
+  from ...safetensors_io import safe_open
 
   want_dtypes = {}
 

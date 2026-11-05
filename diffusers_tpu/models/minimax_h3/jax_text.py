@@ -94,7 +94,7 @@ def load(model, text_encoder_dir, mesh=None, spec_fn=param_spec, place=None,
   resolve is an error rather than a warning, because the failure this
   guards against is a silently skipped weight.
   """
-  from safetensors import safe_open
+  from ...safetensors_io import safe_open
   from jax.sharding import NamedSharding
 
   shards = sorted(glob.glob(os.path.join(text_encoder_dir, "*.safetensors")))
@@ -159,7 +159,7 @@ def _load_parallel(model, shards, mesh, spec_fn, memory_kind, int8=False,
   import numpy as np
   import torch
   from jax.sharding import NamedSharding
-  from safetensors import safe_open
+  from ...safetensors_io import safe_open
 
   def target(name):
     if name == "embed_tokens.weight":

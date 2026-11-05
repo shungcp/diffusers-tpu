@@ -188,7 +188,7 @@ class Server:
   def _load_vae_encoder(self):
     import glob
     import torch
-    from safetensors import safe_open
+    from ...safetensors_io import safe_open
     jax, nnx, jvae = self.jax, self.nnx, self.jvae
     vae_dir = os.path.join(self.snapshot, "vae")
     params = {}
@@ -392,7 +392,7 @@ class Server:
 
   def _load_decoder(self):
     import glob
-    from safetensors import safe_open
+    from ...safetensors_io import safe_open
     jax, jnp, nnx, jvae, mesh = self.jax, self.jnp, self.nnx, self.jvae, self.mesh
     dec_dtype = self.dtype
     decoder = nnx.eval_shape(

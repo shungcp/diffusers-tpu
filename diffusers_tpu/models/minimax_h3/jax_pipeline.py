@@ -682,7 +682,7 @@ def main():
   tgen = _torch.Generator().manual_seed(args.seed)
   if args.reference:
     import glob as _glob
-    from safetensors import safe_open as _safe_open
+    from ...safetensors_io import safe_open as _safe_open
     import torch as _torch
 
     began_enc = time.perf_counter()
@@ -1269,7 +1269,7 @@ def main():
       decoder = nnx.eval_shape(
           lambda: jvae.ViTDecoder(**jvae.CONFIG, dtype=dec_dtype,
                                   rngs=nnx.Rngs(0)))
-      from safetensors import safe_open
+      from ...safetensors_io import safe_open
       import glob as _glob
 
       # The reference decodes `decoder(post_quant_conv(z))`; skipping

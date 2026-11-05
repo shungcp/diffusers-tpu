@@ -78,7 +78,7 @@ def load(model, text_encoder_dir, mesh=None, spec_fn=None, place=None,
   error rather than a warning, to catch silently skipped weights.
   """
   from jax.sharding import NamedSharding
-  from safetensors import safe_open
+  from ...safetensors_io import safe_open
 
   shards = sorted(glob.glob(os.path.join(text_encoder_dir, "*.safetensors")))
   if not shards:
@@ -141,7 +141,7 @@ def _load_parallel(model, shards, mesh, spec_fn, memory_kind, resolve):
   import numpy as np
   import torch
   from jax.sharding import NamedSharding
-  from safetensors import safe_open
+  from ...safetensors_io import safe_open
 
   keys = []
   for shard in shards:
