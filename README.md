@@ -151,7 +151,7 @@ Measured 2026-11-04 on a v5litepod-1 (16 GB HBM, 47 GB host memory), Pika-H3-Fle
 | per request / 每个请求 | 480x832, 141 frames / 141 帧 | 480x832, 362 frames / 362 帧 | 768x1344, 345 frames / 345 帧 |
 |---|---|---|---|
 | text-to-video / 文生视频 | 55 s | 272 s (251 s ¹) | 748 s |
-| reference-to-video / 参考图生视频 | 121 s | 314 s (288 s ¹) | — |
+| reference-to-video / 参考图生视频 | 121 s | 314 s (288 s ¹) | 1005 s |
 
 ¹ With `DT_INT8_ACT=1`. ¹ 使用 `DT_INT8_ACT=1`。
 
@@ -167,8 +167,8 @@ Set `DT_WEIGHT_CACHE=<dir>` to keep the converted weights on disk: loading drops
 On one chip the audio is decoded on the host, in the background while the chip decodes the video, so it adds no time.
 单 chip 时音频在主机上解码,与 chip 解码视频同时进行,不增加时间。
 
-Reference-to-video also needs `DT_TEXT_ATTN_CHUNK=1024`; 768x1344, 345 frames needs `DT_FF_CHUNK=4096 --block-q 1024 --block-kv 2048`.
-参考图生视频还需要 `DT_TEXT_ATTN_CHUNK=1024`;768x1344、345 帧需要 `DT_FF_CHUNK=4096 --block-q 1024 --block-kv 2048`。
+768x1344, 345 frames needs `DT_FF_CHUNK=4096 --block-q 1024 --block-kv 2048` for text-to-video, and `DT_FF_CHUNK=4096 DT_QKV_CHUNK=16384 --block-q 512 --block-kv 1024` for reference-to-video.
+768x1344、345 帧的文生视频需要 `DT_FF_CHUNK=4096 --block-q 1024 --block-kv 2048`,参考图生视频需要 `DT_FF_CHUNK=4096 DT_QKV_CHUNK=16384 --block-q 512 --block-kv 1024`。
 
 `DT_INT8_ACT=1` also quantizes activations and uses the int8 matrix units: denoising is 10-22% faster, and the output changes more.
 `DT_INT8_ACT=1` 会把激活也量化,使用 int8 矩阵单元:去噪快 10-22%,结果的变化也更大。

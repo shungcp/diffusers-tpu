@@ -325,17 +325,39 @@ def _build_modules():
 
     def __call__(self, x, rope, sdpa=None, true_len=None):
       shape = x.shape[:-1] + (self.heads, self.head_dim)
-      if CMM and rope is not None and x.shape[1] % _tp_size() == 0:
-        qx, kx, vx = _cmm(x, [self.to_q.weight[...], self.to_k.weight[...],
-                              self.to_v.weight[...]])
+      turn = apply_rope_full_lane if FULL_LANE_ROPE else apply_rope
+      if QKV_CHUNK and rope is not None and x.shape[1] > QKV_CHUNK:
+        # DT_QKV_CHUNK=<rows>: projections, q/k norm and rope a slab of rows
+        # at a time. Their float32 intermediates are 3.2 GB each at 768p
+        # ref2va (118,784 rows), one too many for a 16 GB v5e chip.
+        c, b, s_ = QKV_CHUNK, x.shape[0], x.shape[1]
+        n = -(-s_ // c)
+        pad = n * c - s_
+        xp = jnp.pad(x, ((0, 0), (0, pad), (0, 0))) if pad else x
+        cos, sin = (jnp.pad(t, ((0, pad), (0, 0))) if pad else t for t in rope)
+        xs = xp.reshape(b, n, c, x.shape[2]).swapaxes(0, 1)
+        cs = cos.reshape(n, c, -1)
+        ss = sin.reshape(n, c, -1)
+
+        def one(args):
+          xc, cc, sc = args
+          sh = xc.shape[:-1] + (self.heads, self.head_dim)
+          qc = turn(self.norm_q(self.to_q(xc).reshape(sh)), cc, sc)
+          kc = turn(self.norm_k(self.to_k(xc).reshape(sh)), cc, sc)
+          return qc, kc, self.to_v(xc).reshape(sh)
+        q, k, v = (t.swapaxes(0, 1).reshape((b, n * c) + shape[2:])[:, :s_]
+                   for t in jax.lax.map(one, (xs, cs, ss)))
       else:
-        qx, kx, vx = self.to_q(x), self.to_k(x), self.to_v(x)
-      q = self.norm_q(qx.reshape(shape))
-      k = self.norm_k(kx.reshape(shape))
-      v = vx.reshape(shape)
-      if rope is not None:
-        turn = apply_rope_full_lane if FULL_LANE_ROPE else apply_rope
-        q, k = turn(q, *rope), turn(k, *rope)
+        if CMM and rope is not None and x.shape[1] % _tp_size() == 0:
+          qx, kx, vx = _cmm(x, [self.to_q.weight[...], self.to_k.weight[...],
+                                self.to_v.weight[...]])
+        else:
+          qx, kx, vx = self.to_q(x), self.to_k(x), self.to_v(x)
+        q = self.norm_q(qx.reshape(shape))
+        k = self.norm_k(kx.reshape(shape))
+        v = vx.reshape(shape)
+        if rope is not None:
+          q, k = turn(q, *rope), turn(k, *rope)
       dynamic = true_len is not None and not isinstance(true_len, int)
       if dynamic:
         # A traced true length (`jax_server`'s bucketed shapes): keep the
@@ -974,6 +996,7 @@ def _quantize_int8(t, rows=1024):
 
 INT8_ACT = os.environ.get("DT_INT8_ACT", "0") == "1"
 FF_CHUNK = int(os.environ.get("DT_FF_CHUNK", "0"))
+QKV_CHUNK = int(os.environ.get("DT_QKV_CHUNK", "0"))
 
 # Write-through weight cache: set CACHE_WRITE["dir"] before a load and the
 # loaders save each host array as it is made, before it goes to the chips.
