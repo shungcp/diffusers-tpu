@@ -61,6 +61,60 @@ TEXT_ATTN_F32 = os.environ.get("DT_TEXT_ATTN_F32", "1") == "1"
 # Causal text attention a block of queries at a time (DT_TEXT_ATTN_CHUNK=<rows>),
 # for one small chip and a long ref2va prompt.
 TEXT_ATTN_CHUNK = int(os.environ.get("DT_TEXT_ATTN_CHUNK", "0"))
+# Long causal prompts (ref2va's ~7.5k tokens) go through JAX's splash kernel,
+# heads sharded over this mesh axis. The dense path materializes float32
+# scores: text/vision encode 1.0 -> 0.6 s warm, video DINO 0.955 against it
+# (c345; noise floor ~0.948). DT_TEXT_SPLASH=0 restores the dense path.
+TEXT_SPLASH = os.environ.get("DT_TEXT_SPLASH", "1") == "1"
+TEXT_SPLASH_MIN = int(os.environ.get("DT_TEXT_SPLASH_MIN", "2048"))
+TEXT_SPLASH_AXIS = "tp"
+TEXT_SPLASH_BLK = int(os.environ.get("DT_TEXT_SPLASH_BLK", "512"))
+if TEXT_SPLASH:
+  # Imported here, not inside the first trace: a Pallas import during
+  # tracing changes the trace context and every later call retraces (c287).
+  from jax.experimental.pallas.ops.tpu.splash_attention import (  # noqa: F401
+      splash_attention_kernel as _sk_preload)
+
+
+_SPLASH_KERNELS = {}
+
+
+def _causal_kernel(n, g, blk):
+  """One splash kernel per shape: building the mask info for a 7.7k causal
+  mask is host work, and the 50 layers would otherwise each redo it while
+  tracing (server's first ref2va request: text 7 -> 24 s, c346)."""
+  key = (n, g, blk)
+  if key not in _SPLASH_KERNELS:
+    from jax.experimental.pallas.ops.tpu.splash_attention import (
+        splash_attention_kernel as sk, splash_attention_mask as sm)
+    import jax
+    # Concrete even when first reached inside a trace: the kernel keeps its
+    # mask arrays, and a traced copy cached here leaks into the next trace.
+    with jax.ensure_compile_time_eval():
+      _SPLASH_KERNELS[key] = sk.make_splash_mqa_single_device(
+          sm.MultiHeadMask([sm.CausalMask((n, n))] * g),
+          block_sizes=sk.BlockSizes(block_q=blk, block_kv=blk, block_kv_compute=blk))
+  return _SPLASH_KERNELS[key]
+
+
+def _splash_causal(q, k, v, scale):
+  """Device-local causal GQA attention. q `(s, hq, d)`, k/v `(s, hkv, d)`."""
+  import jax
+  import jax.numpy as jnp
+  s, hq, d = q.shape
+  hkv = k.shape[1]
+  g = hq // hkv
+  blk = TEXT_SPLASH_BLK
+  sp = (-s) % blk
+  n = s + sp
+  # Padding goes at the end: causal rows never reach a padded key.
+  q, k, v = (jnp.pad(t, ((0, sp), (0, 0), (0, 0))) for t in (q, k, v))
+  kernel = _causal_kernel(n, g, blk)
+  qh = (q * scale).reshape(n, hkv, g, d).transpose(1, 2, 0, 3)   # (hkv, g, n, d)
+  kh, vh = k.transpose(1, 0, 2), v.transpose(1, 0, 2)              # (hkv, n, d)
+  out = jax.vmap(kernel)(qh, kh, vh)                              # (hkv, g, n, d)
+  return out.transpose(2, 0, 1, 3).reshape(n, hq, d)[:s]
+
 
 def _build_modules():
   """Imports flax lazily so the file can be read without it installed."""
@@ -125,7 +179,13 @@ def _build_modules():
       k = apply_rope(k, cos, sin).astype(v.dtype)
       # jax's attention does grouped queries itself when the head counts
       # differ, so no explicit repeat.
-      if TEXT_ATTN_CHUNK and mask is None and s > TEXT_ATTN_CHUNK:
+      if TEXT_SPLASH and mask is None and b == 1 and s >= TEXT_SPLASH_MIN:
+        from jax.sharding import PartitionSpec as P
+        spec = P(None, TEXT_SPLASH_AXIS, None)
+        local = lambda a, c, e: _splash_causal(a, c, e, self.scale)
+        out = jax.shard_map(local, in_specs=(spec, spec, spec), out_specs=spec,
+                            check_vma=False)(q[0], k[0], v[0])[None]
+      elif TEXT_ATTN_CHUNK and mask is None and s > TEXT_ATTN_CHUNK:
         # Causal attention a block of queries at a time (DT_TEXT_ATTN_CHUNK):
         # one 16 GB v5e chip cannot hold the 64 x 7518^2 float32 scores of a
         # ref2va prompt (27.5 GB of temporaries in the whole-tower program).
@@ -257,14 +317,21 @@ def mrope_cos_sin(position_ids, head_dim=128, rope_theta=5_000_000.0,
   if position_ids.shape[0] != 3:
     raise ValueError(f"expected (3, seq) positions, got {position_ids.shape}")
   inv_freq = 1.0 / (rope_theta ** (np.arange(0, head_dim, 2) / head_dim))
-  freqs = position_ids[:, :, None] * inv_freq[None, None, :]  # (3, seq, dim/2)
-
-  merged = freqs[0].copy()
+  half = head_dim // 2
+  slot_axis = np.zeros(half, np.int64)
   for axis, offset in ((1, 1), (2, 2)):
-    stop = mrope_section[axis] * 3
-    merged[:, offset:stop:3] = freqs[axis][:, offset:stop:3]
-  merged = np.concatenate([merged, merged], axis=-1)
-  return np.cos(merged).astype(np.float32), np.sin(merged).astype(np.float32)
+    slot_axis[offset:mrope_section[axis] * 3:3] = axis
+  # Positions repeat (a ref2va prompt has ~7.5k tokens but a few hundred
+  # distinct values): take cos/sin of each distinct value once and gather.
+  # The same float64 products, so the tables are unchanged.
+  uniq, inv = np.unique(position_ids, return_inverse=True)
+  inv = inv.reshape(position_ids.shape)                       # (3, seq)
+  angles = uniq[:, None] * inv_freq[None, :]                  # (U, dim/2)
+  rows = inv[slot_axis].T                                     # (seq, dim/2)
+  cols = np.arange(half)[None, :]
+  cos = np.cos(angles).astype(np.float32)[rows, cols]
+  sin = np.sin(angles).astype(np.float32)[rows, cols]
+  return np.concatenate([cos, cos], -1), np.concatenate([sin, sin], -1)
 
 
 # --------------------------------------------------------------------------

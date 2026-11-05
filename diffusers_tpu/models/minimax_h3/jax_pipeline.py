@@ -466,8 +466,8 @@ def main():
     _ri = r2v.load_reference(args.reference)
     _pr = r2v.presentation(snapshot, args.prompt, _ri)
     r2v.text_positions(snapshot, _pr["ids"], _pr["grid_thw"], _pr["mm_token_type_ids"])
-    print(f"  [ref2va] host-side image preparation (warm) "
-          f"{time.perf_counter() - _t:.2f}s", flush=True)
+    r2v_prep_warm = time.perf_counter() - _t
+    print(f"  [ref2va] host-side image preparation (warm) {r2v_prep_warm:.2f}s", flush=True)
     del _ri, _pr
     vision, _ = jvision.build(text_dir, dtype=dtype, abstract=True)
     # Host-resident vision weights on a multi-chip mesh crash the TPU:
@@ -1543,9 +1543,11 @@ def main():
     if args.reference:
       # The ref2va encodes run before the DiT is loaded, outside `generate`;
       # the traced backends count them inside, so print both.
-      print(f"  [ref2va] request incl. encodes (warm): {request + r2v_text_warm + r2v_enc_warm:.1f}s"
-            f" = generate {request:.1f} + text/vision {r2v_text_warm:.1f}"
-            f" + reference encode {r2v_enc_warm:.1f}", flush=True)
+      # Host prep too: a new reference image pays all four.
+      print(f"  [ref2va] request incl. encodes (warm): "
+            f"{request + r2v_prep_warm + r2v_text_warm + r2v_enc_warm:.1f}s"
+            f" = generate {request:.1f} + host prep {r2v_prep_warm:.2f}"
+            f" + text/vision {r2v_text_warm:.2f} + reference encode {r2v_enc_warm:.2f}", flush=True)
     print(f"  denoise {denoise_wall:.1f}s, decode {decode_wall:.1f}s, "
           + (f"audio {audio_wall:.2f}s ({20 * np.log10(np.sqrt(np.mean(wave ** 2)) + 1e-12):.0f} dBFS), "
              if wave is not None else "") +

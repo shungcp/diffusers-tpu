@@ -145,10 +145,15 @@ def vision_rope(position_ids, hidden_size=1152, num_heads=16,
   head_dim = hidden_size // num_heads
   spatial = head_dim // 2
   inv_freq = 1.0 / (rope_theta ** (np.arange(0, spatial, 2) / spatial))
-  freqs = np.asarray(position_ids, np.float64)[..., None] * inv_freq
-  merged = np.concatenate([freqs[:, 0], freqs[:, 1]], axis=-1)
-  merged = np.concatenate([merged, merged], axis=-1)
-  return np.cos(merged).astype(np.float32), np.sin(merged).astype(np.float32)
+  # Row and column indices repeat: cos/sin of each distinct value once, then
+  # gather (same float64 products, same tables).
+  uniq, inv = np.unique(np.asarray(position_ids, np.float64), return_inverse=True)
+  inv = inv.reshape(np.shape(position_ids))                   # (seq, 2)
+  angles = uniq[:, None] * inv_freq
+  tc, ts = np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
+  cos = np.concatenate([tc[inv[:, 0]], tc[inv[:, 1]]], -1)
+  sin = np.concatenate([ts[inv[:, 0]], ts[inv[:, 1]]], -1)
+  return np.concatenate([cos, cos], -1), np.concatenate([sin, sin], -1)
 
 
 # --------------------------------------------------------------------------

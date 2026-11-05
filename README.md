@@ -99,11 +99,11 @@ A resident server (`--runs`) keeps the model and decoder on the chips; these are
 | Pika-H3-Flex, v6e-8 | per request / 每个请求 |
 |---|---|
 | text-to-video / 文生视频 | **10.8 s** |
-| reference-to-video, same reference image / 参考图生视频,参考图不变 | **13.5 s** |
-| reference-to-video, a new reference image every request / 参考图生视频,每次换新参考图 | **14.8 s** |
+| reference-to-video, same reference image / 参考图生视频,参考图不变 | **13.6 s** |
+| reference-to-video, a new reference image every request / 参考图生视频,每次换新参考图 | **14.9 s** |
 
-Reference-to-video uses `--sparse-window 16 --sparse-dense-steps 2`; a new image adds the text/vision encode (0.8 s) and the reference encode (0.5 s); preparing the image on the host takes another 0.2 s.
-参考图生视频使用 `--sparse-window 16 --sparse-dense-steps 2`;换新图时要加上文本/视觉编码(0.8 秒)和参考图编码(0.5 秒);在主机上准备图片另需 0.2 秒。
+Reference-to-video uses `--sparse-window 16 --sparse-dense-steps 2`; a new image adds preparing it on the host (0.25 s), the text/vision encode (0.6 s) and the reference encode (0.45 s), all included in 14.9 s.
+参考图生视频使用 `--sparse-window 16 --sparse-dense-steps 2`;换新图时要加上主机上准备图片(0.25 秒)、文本/视觉编码(0.6 秒)和参考图编码(0.45 秒),都已计入 14.9 秒。
 
 Without the sparse attention, reference-to-video takes 15.0 s with the same image and 16.4 s with a new one.
 不用稀疏注意力时,参考图生视频在参考图不变时为 15.0 秒,每次换新图时为 16.4 秒。
@@ -111,8 +111,8 @@ Without the sparse attention, reference-to-video takes 15.0 s with the same imag
 The same sparse attention brings text-to-video to 9.9 s.
 文生视频加上同样的稀疏注意力是 9.9 秒。
 
-Through the resident server, with a new prompt or reference image on every request, text-to-video takes 11.5 s and reference-to-video 15.8–16.5 s (`sparse_dense_steps` 3).
-通过常驻服务、每个请求换新的提示词或参考图时,文生视频为 11.5 秒,参考图生视频为 15.8–16.5 秒(`sparse_dense_steps` 设为 3)。
+Through the resident server, with a new prompt or reference image on every request, text-to-video takes 11.5 s and reference-to-video 15.6–16.4 s (`sparse_dense_steps` 3).
+通过常驻服务、每个请求换新的提示词或参考图时,文生视频为 11.5 秒,参考图生视频为 15.6–16.4 秒(`sparse_dense_steps` 设为 3)。
 
 ### Fewer chips / 更少的 chip
 
@@ -151,7 +151,7 @@ Measured 2026-11-04 on a v5litepod-1 (16 GB HBM, 47 GB host memory), Pika-H3-Fle
 | per request / 每个请求 | 480x832, 141 frames / 141 帧 | 480x832, 362 frames / 362 帧 | 768x1344, 345 frames / 345 帧 |
 |---|---|---|---|
 | text-to-video / 文生视频 | 55 s | 272 s (251 s ¹) | 748 s |
-| reference-to-video / 参考图生视频 | 142 s | 314 s (288 s ¹) | — |
+| reference-to-video / 参考图生视频 | 121 s | 314 s (288 s ¹) | — |
 
 ¹ With `DT_INT8_ACT=1`. ¹ 使用 `DT_INT8_ACT=1`。
 
