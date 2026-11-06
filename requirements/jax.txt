@@ -2,7 +2,7 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 jax==0.12.0.1
 jaxlib==0.12.0.1
-libtpu==0.0.51
+libtpu==0.0.52
 flax==0.12.12
 torch==2.10.0+cpu        # torchax runs PyTorch model code on JAX; no torch compute on TPU
 torchax==0.0.13
