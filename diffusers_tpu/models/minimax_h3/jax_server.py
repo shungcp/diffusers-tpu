@@ -876,7 +876,7 @@ class Server:
         f = j * chunk_frames
         piece = out[:, :, f:f + chunk_frames][:, :, pre_pad:]
         if j == 0:
-          pieces.append(piece if carry is None else _server_helpers()[0](carry, piece, frame_overlap))
+          pieces.append(piece if carry is None else _server_helpers(self.mesh)[0](carry, piece, frame_overlap))
         else:
           carry = piece
     if carry is not None:
@@ -888,11 +888,12 @@ class Server:
       pad_frames = sum(intra_tail if intra_tail and (before + k) % tokens_chunk == 0
                        else ratio for k in range(pad_tokens))
       frames = frames[:, :, :-pad_frames]
-    return np.asarray(_server_helpers()[1](frames))
+    shape = (frames.shape[2], frames.shape[3], frames.shape[4], frames.shape[1])
+    return np.asarray(_server_helpers(self.mesh)[1](frames)).reshape(shape)
 
 
 @functools.lru_cache(maxsize=1)
-def _server_helpers():
+def _server_helpers(mesh):
   """`(blend, frames_to_uint8)`, jitted on first use: jax is imported lazily
   in this module, so nothing here may touch it at import time."""
   import jax
@@ -907,12 +908,11 @@ def _server_helpers():
     head = x[:, :, -extent:] * (1.0 - w) + y[:, :, :extent] * w
     return head if extent == y.shape[2] else jnp.concatenate([head, y[:, :, extent:]], axis=2)
 
-  @jax.jit
+  @functools.partial(jax.jit, out_shardings=jax.sharding.NamedSharding(
+      mesh, jax.sharding.PartitionSpec()))
   def frames_to_uint8(frames):
-    mean = jnp.asarray((0.485, 0.456, 0.406), jnp.float32).reshape(1, -1, 1, 1, 1)
-    std = jnp.asarray((0.229, 0.224, 0.225), jnp.float32).reshape(1, -1, 1, 1, 1)
-    frames = jnp.clip(frames.astype(jnp.float32) * std + mean, 0.0, 1.0)
-    return jnp.round(jnp.transpose(frames[0], (1, 2, 3, 0)) * 255.0).astype(jnp.uint8)
+    from .jax_pipeline import uint8_frames
+    return uint8_frames(frames)
 
   return blend, frames_to_uint8
 

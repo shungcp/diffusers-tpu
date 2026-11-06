@@ -339,6 +339,26 @@ def _load_dit(args, snapshot, mesh, dtype, dit_host, wc):
   return transformer, trunk, pika, _mods_host
 
 
+def uint8_frames(frames):
+  """Decoder output `(1, 3, F, H, W)` -> uint8 RGB `(F, H * W * 3)`, on the chip.
+
+  Reshape to `(F, H, W, 3)` on the host. Two layouts are avoided on purpose:
+  a `(F, H, W, 3)` result comes back frame-minor (TPU will not pad the
+  3-wide minor dimension), a strided numpy view that took 18 s to np.save;
+  flattening the whole clip at once materializes that padded layout (17.7 GB
+  of temporaries). One frame at a time, flattened, needs neither.
+  """
+  import jax
+  import jax.numpy as jnp
+  mean = jnp.asarray((0.485, 0.456, 0.406), jnp.float32).reshape(-1, 1, 1)
+  std = jnp.asarray((0.229, 0.224, 0.225), jnp.float32).reshape(-1, 1, 1)
+
+  def one(frame):
+    u = jnp.round(jnp.clip(frame.astype(jnp.float32) * std + mean, 0.0, 1.0) * 255.0)
+    return jnp.transpose(u.astype(jnp.uint8), (1, 2, 0)).reshape(-1)
+  return jax.lax.map(one, jnp.transpose(frames[0], (1, 0, 2, 3)), batch_size=4)
+
+
 def scheduler_step(sample, model_output, timestep, sigma, sigma_next):
   """One Euler step of H3's scheduler, in float32.
 
@@ -1377,13 +1397,7 @@ def main():
           ),
       )
       def _frames_to_uint8(f):
-        pm = jnp.asarray((0.485, 0.456, 0.406), jnp.float32).reshape(
-            1, -1, 1, 1, 1)
-        ps = jnp.asarray((0.229, 0.224, 0.225), jnp.float32).reshape(
-            1, -1, 1, 1, 1)
-        f = jnp.clip(f.astype(jnp.float32) * ps + pm, 0.0, 1.0)
-        return jnp.round(jnp.transpose(f[0], (1, 2, 3, 0)) * 255.0).astype(
-            jnp.uint8)
+        return uint8_frames(f)
 
       @functools.partial(jax.jit, static_argnums=(2,))
       def blend(a, b, extent):
@@ -1637,7 +1651,8 @@ def main():
       frames = out_frames
     else:
       # uint8 on TPU, matching the torch pipeline's output (4x smaller PCIe transfer).
-      frames = np.asarray(_frames_to_uint8(frames))
+      _shape = (frames.shape[2], frames.shape[3], frames.shape[4], frames.shape[1])
+      frames = np.asarray(_frames_to_uint8(frames)).reshape(_shape)
       mesh_ctx.__exit__(None, None, None)
 
     os.makedirs(args.out, exist_ok=True)

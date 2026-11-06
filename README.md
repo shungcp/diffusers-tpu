@@ -25,6 +25,9 @@ Every model can run through three backends, so you can pick the one that fits yo
 Newest first. Each entry links a date to what changed.
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-07** — Back-to-back requests on the resident server: 33 s -> 15.3 s each (480p reference-to-video on a v6e-8). Saving each clip's frames took 18 s, outside the timed request, because they reached the host as a strided array; the chips now hand back a contiguous one (0.2 s). Output unchanged.
+  **2026-11-07** — 常驻服务连续处理请求:每条从 33 秒降到 15.3 秒(v6e-8 上 480p 参考图生视频)。原来每段视频的帧存盘要 18 秒(不在计时范围内),原因是帧以跨步数组的形式回到主机;现在 chip 直接交回连续数组(0.2 秒)。输出不变。
+
 - **2026-11-06** — Faster video decode (tile extraction and blending fused, frames converted to uint8 on the chips): 768p Pika text-to-video 40.6 -> 38.3 s on a v6e-8 and 31.3 -> 29.3 s on a v7x-8; output unchanged (DINO 0.9999+). Weights are now read with sequential reads instead of memory maps.
   **2026-11-06** — 视频解码加速(切块和拼接融合,帧在 chip 上转成 uint8):v6e-8 上 768p Pika 文生视频 40.6 -> 38.3 秒,v7x-8 上 31.3 -> 29.3 秒;输出不变(DINO 0.9999 以上)。权重改为顺序读取,不再用内存映射。
 
