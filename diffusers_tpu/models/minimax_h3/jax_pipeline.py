@@ -1484,6 +1484,15 @@ def main():
               _w_outs, _n_chk, 3, 20, 3, 5, _p_frm)
           jax.block_until_ready(_frames_to_uint8(_w_frames))
           del _w_outs, _w_frames
+        elif not (len(devices) == 1 and _small_hbm):
+          # The uint8 conversion is a program of its own (71 s to compile
+          # at 768p): compile it here, outside `generate`, on input laid out
+          # as the decoder leaves it (rows split across chips).
+          jax.block_until_ready(_frames_to_uint8(jax.device_put(
+              jnp.zeros((1, 3, args.num_frames, args.height, args.width),
+                        _w_out.dtype),
+              jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(
+                  None, None, None, "tp" if tile_shard else None)))))
         del _w_out
         print(f"  decode warmup {time.perf_counter() - warm:.1f}s", flush=True)
     if run == 0 and not args.no_audio:
