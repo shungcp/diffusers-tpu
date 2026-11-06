@@ -1348,7 +1348,9 @@ def main():
         dec_state = jax.device_put(dec_state, _NS2(mesh, _PS2()))
         pq_state = jax.device_put(pq_state, _NS2(mesh, _PS2()))
 
-      @functools.partial(jax.jit, out_shardings=NamedSharding(mesh, P()))
+      _dec_out_sharding = None if tile_shard else NamedSharding(mesh, P())
+
+      @functools.partial(jax.jit, out_shardings=_dec_out_sharding)
       def decode(state, z, pq=pq_state):
         # `decoder(post_quant_conv(z))`, as in the reference. `highest` makes
         # float32 matmuls run at full precision on TPU (otherwise bfloat16);
@@ -1368,6 +1370,63 @@ def main():
                                  batch=args.vae_tile_batch,
                                  mesh=mesh if tile_shard else None)
 
+      @functools.partial(
+          jax.jit,
+          out_shardings=jax.sharding.NamedSharding(
+              mesh, jax.sharding.PartitionSpec()
+          ),
+      )
+      def _frames_to_uint8(f):
+        pm = jnp.asarray((0.485, 0.456, 0.406), jnp.float32).reshape(
+            1, -1, 1, 1, 1)
+        ps = jnp.asarray((0.229, 0.224, 0.225), jnp.float32).reshape(
+            1, -1, 1, 1, 1)
+        f = jnp.clip(f.astype(jnp.float32) * ps + pm, 0.0, 1.0)
+        return jnp.round(jnp.transpose(f[0], (1, 2, 3, 0)) * 255.0).astype(
+            jnp.uint8)
+
+      @functools.partial(jax.jit, static_argnums=(2,))
+      def blend(a, b, extent):
+        """Linear cross-fade over the temporal axis, as `_blend` does."""
+        extent = min(a.shape[2], b.shape[2], extent)
+        if extent <= 0:
+          return b
+        w = jnp.arange(extent, dtype=b.dtype).reshape(1, 1, extent, 1, 1) / extent
+        head = a[:, :, -extent:] * (1.0 - w) + b[:, :, :extent] * w
+        return (head if extent == b.shape[2]
+                else jnp.concatenate([head, b[:, :, extent:]], axis=2))
+
+      @functools.partial(jax.jit, static_argnums=(1, 2, 3, 4, 5, 6))
+      def _pack_chunk_group(z_in, start_g, c_batch, n_chunks, t_chunk,
+                            t_overlap, p_tokens):
+        if p_tokens:
+          z_in = jnp.concatenate(
+              [z_in, jnp.repeat(z_in[:, :, -1:], p_tokens, axis=2)], axis=2)
+        group = [min(start_g + k, n_chunks - 1) for k in range(c_batch)]
+        zs = [z_in[:, :, g * t_chunk:g * t_chunk + t_chunk + t_overlap]
+              for g in group]
+        return jnp.concatenate(zs, axis=0).astype(dec_dtype)
+
+      @functools.partial(jax.jit, static_argnums=(1, 2, 3, 4, 5, 6))
+      def _assemble_chunks(outs, n_chunks, t_drop, c_frames, p_pad, f_overlap,
+                           p_frames):
+        pieces = []
+        carry = None
+        for i in range(n_chunks):
+          out = outs[i:i + 1]
+          for j in range(int(t_drop > 0) + 1):
+            f = j * c_frames
+            piece = out[:, :, f:f + c_frames][:, :, p_pad:]
+            if j == 0:
+              done = piece if carry is None else blend(carry, piece, f_overlap)
+              pieces.append(done)
+            else:
+              carry = piece
+        if carry is not None:
+          pieces.append(carry)
+        res = jnp.concatenate(pieces, axis=2)
+        return res[:, :, :-p_frames] if p_frames else res
+
       # Temporal chunking bounds attention and intermediates (the decoder is a
       # 36-layer transformer over one token per latent voxel). The chunk size
       # is fixed by the VAE geometry at `tokens_chunk + token_overlap` latents;
@@ -1386,10 +1445,32 @@ def main():
             "DT_DECODE_CHUNK_BATCH",
             args.decode_chunk_batch or (1 if mesh.devices.size == 1 else 0))),
             cap=_cap)
-        jax.block_until_ready(
-            decode_tiled(dec_state,
-                         jnp.concatenate([latents[:, :, :WARM_CHUNK]] * _cb,
-                                         axis=0).astype(dec_dtype)))
+        _w_out = decode_tiled(
+            dec_state,
+            jnp.concatenate([latents[:, :, :WARM_CHUNK]] * _cb,
+                            axis=0).astype(dec_dtype))
+        jax.block_until_ready(_w_out)
+        # The fused path holds every decoded chunk in HBM at once: 12.5 GB at
+        # 480p/362, which a 32 GB v6e chip with the DiT still resident
+        # (`--runs 2`) cannot spare. Large-HBM chips only (v7x).
+        if not _small_hbm:
+          _f_lat = latents.shape[2]
+          _n_tok = _f_lat + 3
+          _p_tok = (-_n_tok) % 5
+          _n_chk = (_n_tok + _p_tok) // 5 - 1
+          _p_frm = sum(
+              1 if (17 % 4) and (_f_lat + k) % 5 == 0 else 4
+              for k in range(_p_tok)) if _p_tok else 0
+          for _g0 in range(0, _n_chk, _cb):
+            jax.block_until_ready(
+                _pack_chunk_group(latents, _g0, _cb, _n_chk, 5, 2, _p_tok))
+          _w_outs = jnp.concatenate(
+              [_w_out] * (-(-_n_chk // _cb)), axis=0)[:_n_chk]
+          _w_frames = _assemble_chunks(
+              _w_outs, _n_chk, 3, 20, 3, 5, _p_frm)
+          jax.block_until_ready(_frames_to_uint8(_w_frames))
+          del _w_outs, _w_frames
+        del _w_out
         print(f"  decode warmup {time.perf_counter() - warm:.1f}s", flush=True)
     if run == 0 and not args.no_audio:
       # Small (one jitted program); built and compiled here so its setup
@@ -1417,24 +1498,10 @@ def main():
     frame_overlap = max(tok_overlap * ratio - pre_pad, 0)   # 5
     chunk_frames = tokens_chunk * ratio              # 20
 
-    def blend(a, b, extent):
-      """Linear cross-fade over the temporal axis, as `_blend` does."""
-      extent = min(a.shape[2], b.shape[2], extent)
-      if extent <= 0:
-        return b
-      w = jnp.arange(extent, dtype=b.dtype).reshape(1, 1, extent, 1, 1) / extent
-      head = a[:, :, -extent:] * (1.0 - w) + b[:, :, :extent] * w
-      return (head if extent == b.shape[2]
-              else jnp.concatenate([head, b[:, :, extent:]], axis=2))
-
     frames_lat = latents.shape[2]
     num_tokens = frames_lat + token_drop
     pad_tokens = (-num_tokens) % tokens_chunk
     num_chunks = (num_tokens + pad_tokens) // tokens_chunk - int(token_drop > 0)
-    z = latents
-    if pad_tokens:
-      z = jnp.concatenate(
-          [z, jnp.repeat(z[:, :, -1:], pad_tokens, axis=2)], axis=2)
 
     # DT_DECODE_TIMING=1 splits decode time between decode_tiled and the
     # slicing / blending. It blocks after each call, which removes async
@@ -1442,7 +1509,6 @@ def main():
     dt_timing = os.environ.get("DT_DECODE_TIMING") == "1"
     t_dec = t_blend = 0.0
     per_call = []
-    pieces, carry = [], None
     host_pieces = mesh.devices.size == 1 and _small_hbm
     # DT_DECODE_CHUNK_BATCH=K stacks K temporal chunks along the batch axis per
     # decode call. Chunks are independent (cross-fading happens afterwards).
@@ -1454,57 +1520,82 @@ def main():
         args.decode_chunk_batch or (1 if mesh.devices.size == 1 else 0))),
         cap=_cap)
     print(f"  decode: {num_chunks} chunks, {chunk_batch} per call", flush=True)
-    decoded = {}
 
-    def chunk_out(i):
-      if i not in decoded:
-        group = list(range(i, min(i + chunk_batch, num_chunks)))
-        zs = [z[:, :, g * tokens_chunk:g * tokens_chunk + tokens_chunk + tok_overlap]
-              for g in group]
-        zs += [zs[-1]] * (chunk_batch - len(zs))
-        out_g = decode_tiled(dec_state,
-                             jnp.concatenate(zs, axis=0).astype(dec_dtype))
-        for k, g in enumerate(group):
-          decoded[g] = out_g[k:k + 1]
-      return decoded.pop(i)
-
-    for i in range(num_chunks):
-      s = i * tokens_chunk
-      _t0 = time.perf_counter() if dt_timing else 0.0
-      out = chunk_out(i)
-      if dt_timing:
-        out = jax.block_until_ready(out)
-        _t1 = time.perf_counter(); t_dec += _t1 - _t0
-        per_call.append(_t1 - _t0)
-      for j in range(int(token_drop > 0) + 1):
-        f = j * chunk_frames
-        piece = out[:, :, f:f + chunk_frames][:, :, pre_pad:]
-        if j == 0:
-          done = piece if carry is None else blend(carry, piece, frame_overlap)
-          # One small chip cannot hold the whole decoded clip (362 frames at
-          # 480p: 6.3 GB on a 16 GB v5e); move each finished piece to host.
-          pieces.append(np.asarray(done) if host_pieces else done)
-        else:
-          carry = piece
-      if dt_timing:
-        carry = jax.block_until_ready(carry) if carry is not None else carry
-        if pieces:
-          pieces[-1] = jax.block_until_ready(pieces[-1])
-        t_blend += time.perf_counter() - _t1
-    if carry is not None:
-      pieces.append(np.asarray(carry) if host_pieces else carry)
-    frames = (np.concatenate(pieces, axis=2) if host_pieces
-              else jnp.concatenate(pieces, axis=2))
-    if pad_tokens:
+    if not host_pieces and not dt_timing and not _small_hbm:
+      out_groups = []
+      for i in range(0, num_chunks, chunk_batch):
+        zs_cat = _pack_chunk_group(
+            latents, i, chunk_batch, num_chunks, tokens_chunk, tok_overlap,
+            pad_tokens)
+        out_groups.append(decode_tiled(dec_state, zs_cat))
+      all_outs = (out_groups[0] if len(out_groups) == 1
+                  else jnp.concatenate(out_groups, axis=0))[:num_chunks]
       intra_tail = clip_length % ratio
-      before = z.shape[2] - pad_tokens
       pad_frames = sum(
-          intra_tail if intra_tail and (before + k) % tokens_chunk == 0 else ratio
-          for k in range(pad_tokens))
-      frames = frames[:, :, :-pad_frames]
-    if not host_pieces:
+          intra_tail if intra_tail and (frames_lat + k) % tokens_chunk == 0 else ratio
+          for k in range(pad_tokens)) if pad_tokens else 0
+      frames = _assemble_chunks(
+          all_outs, num_chunks, token_drop, chunk_frames, pre_pad,
+          frame_overlap, pad_frames)
       frames = jax.block_until_ready(frames)
-    del pieces, z
+      del out_groups, all_outs
+    else:
+      z = latents
+      if pad_tokens:
+        z = jnp.concatenate(
+            [z, jnp.repeat(z[:, :, -1:], pad_tokens, axis=2)], axis=2)
+      pieces, carry = [], None
+      decoded = {}
+
+      def chunk_out(i):
+        if i not in decoded:
+          group = list(range(i, min(i + chunk_batch, num_chunks)))
+          zs = [z[:, :, g * tokens_chunk:g * tokens_chunk + tokens_chunk + tok_overlap]
+                for g in group]
+          zs += [zs[-1]] * (chunk_batch - len(zs))
+          out_g = decode_tiled(dec_state,
+                               jnp.concatenate(zs, axis=0).astype(dec_dtype))
+          for k, g in enumerate(group):
+            decoded[g] = out_g[k:k + 1]
+        return decoded.pop(i)
+
+      for i in range(num_chunks):
+        s = i * tokens_chunk
+        _t0 = time.perf_counter() if dt_timing else 0.0
+        out = chunk_out(i)
+        if dt_timing:
+          out = jax.block_until_ready(out)
+          _t1 = time.perf_counter(); t_dec += _t1 - _t0
+          per_call.append(_t1 - _t0)
+        for j in range(int(token_drop > 0) + 1):
+          f = j * chunk_frames
+          piece = out[:, :, f:f + chunk_frames][:, :, pre_pad:]
+          if j == 0:
+            done = piece if carry is None else blend(carry, piece, frame_overlap)
+            # One small chip cannot hold the whole decoded clip (362 frames at
+            # 480p: 6.3 GB on a 16 GB v5e); move each finished piece to host.
+            pieces.append(np.asarray(done) if host_pieces else done)
+          else:
+            carry = piece
+        if dt_timing:
+          carry = jax.block_until_ready(carry) if carry is not None else carry
+          if pieces:
+            pieces[-1] = jax.block_until_ready(pieces[-1])
+          t_blend += time.perf_counter() - _t1
+      if carry is not None:
+        pieces.append(np.asarray(carry) if host_pieces else carry)
+      frames = (np.concatenate(pieces, axis=2) if host_pieces
+                else jnp.concatenate(pieces, axis=2))
+      if pad_tokens:
+        intra_tail = clip_length % ratio
+        before = z.shape[2] - pad_tokens
+        pad_frames = sum(
+            intra_tail if intra_tail and (before + k) % tokens_chunk == 0 else ratio
+            for k in range(pad_tokens))
+        frames = frames[:, :, :-pad_frames]
+      if not host_pieces:
+        frames = jax.block_until_ready(frames)
+      del pieces, z
     decode_wall = time.perf_counter() - began_decode
     wave = None
     if not args.no_audio:
@@ -1525,16 +1616,16 @@ def main():
     print(f"  decode: {frames_lat} latents -> {frames.shape[2]} frames "
           f"({num_chunks} chunks of {tokens_chunk}+{tok_overlap} latents, "
           f"overlap {frame_overlap} frames)", flush=True)
-    mesh_ctx.__exit__(None, None, None)
 
     # Back to pixels: undo ImageNet normalisation, then clamp.
-    pixel_mean = jnp.asarray((0.485, 0.456, 0.406), jnp.float32).reshape(
-        1, -1, 1, 1, 1)
-    pixel_std = jnp.asarray((0.229, 0.224, 0.225), jnp.float32).reshape(
-        1, -1, 1, 1, 1)
     if len(devices) == 1 and _small_hbm:
+      mesh_ctx.__exit__(None, None, None)
       # One small chip (v5e: 16 GB) cannot hold a float32 copy of the clip
       # beside the decoder; finish on the host, a few frames at a time.
+      pixel_mean = jnp.asarray((0.485, 0.456, 0.406), jnp.float32).reshape(
+          1, -1, 1, 1, 1)
+      pixel_std = jnp.asarray((0.229, 0.224, 0.225), jnp.float32).reshape(
+          1, -1, 1, 1, 1)
       _f = np.asarray(frames)[0]
       _m = np.asarray(pixel_mean).reshape(-1, 1, 1, 1)
       _sd = np.asarray(pixel_std).reshape(-1, 1, 1, 1)
@@ -1545,11 +1636,9 @@ def main():
             np.transpose(_c, (1, 2, 3, 0)) * 255.0).astype(np.uint8)
       frames = out_frames
     else:
-      frames = jnp.clip(frames.astype(jnp.float32) * pixel_std + pixel_mean,
-                        0.0, 1.0)
-      # uint8, matching the torch pipeline's output (and 4x smaller than float32).
-      frames = np.asarray(
-          jnp.round(jnp.transpose(frames[0], (1, 2, 3, 0)) * 255.0), np.uint8)
+      # uint8 on TPU, matching the torch pipeline's output (4x smaller PCIe transfer).
+      frames = np.asarray(_frames_to_uint8(frames))
+      mesh_ctx.__exit__(None, None, None)
 
     os.makedirs(args.out, exist_ok=True)
     path = os.path.join(args.out, f"{args.tag}_frames.npy")

@@ -25,6 +25,9 @@ Every model can run through three backends, so you can pick the one that fits yo
 Newest first. Each entry links a date to what changed.
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-06** — Faster video decode (tile extraction and blending fused, frames converted to uint8 on the chips): 768p Pika text-to-video 40.6 -> 38.3 s on a v6e-8 and 31.3 -> 29.3 s on a v7x-8; output unchanged (DINO 0.9999+). Weights are now read with sequential reads instead of memory maps.
+  **2026-11-06** — 视频解码加速(切块和拼接融合,帧在 chip 上转成 uint8):v6e-8 上 768p Pika 文生视频 40.6 -> 38.3 秒,v7x-8 上 31.3 -> 29.3 秒;输出不变(DINO 0.9999 以上)。权重改为顺序读取,不再用内存映射。
+
 - **2026-11-04** — TPU v7x results on 1, 2, 4 and 8 devices (a v7x chip has two TensorCores, each a JAX device with 95 GB of HBM, so no `--offload` is needed even at 768p on one device), plus a sequence-tiled Pallas SwiGLU FFN kernel (`--pallas-ffn`): Pika-H3-Flex generates a 14-second 768p clip in 36.0 s on a v7x-8 (8 devices, 4 chips; 13.5 s at 480p), 63.3 s on 4 devices, 108.4 s on 2 devices, and 197.6 s on a single device.
   **2026-11-04** — 新增 TPU v7x 在 1、2、4、8 个 device 上的性能数据(一个 v7x chip 有两个 TensorCore,每个是一个 JAX device,各有 95 GB HBM,所以单个 device 跑 768p 也无需 `--offload`)及序列分块 Pallas SwiGLU FFN kernel(`--pallas-ffn`):Pika-H3-Flex 生成 14 秒 768p 视频在 v7x-8(8 个 device,4 个 chip)上为 36.0 秒(480p 为 13.5 秒),4 个 device 为 63.3 秒,2 个 device 为 108.4 秒,单个 device 为 197.6 秒。
 
@@ -52,7 +55,7 @@ Software: jax 0.12.0.1, libtpu 0.0.51, torch_tpu 0.2.0, diffusers `cc8644b` (see
 | | JAX | torchax | torch_tpu |
 |---|---|---|---|
 | text-to-video, lossless / 文生视频,无损 | **110.0 s** | 117.8 s | 139.0 s |
-| text-to-video, lossy / 文生视频,有损 | **37.2 s** | 42.9 s | 52.5 s |
+| text-to-video, lossy / 文生视频,有损 | **35.1 s** | 42.9 s | 52.5 s |
 | reference-to-video, lossless / 参考图生视频,无损 | **139.2 s** | 186.7 s | 189 s |
 | reference-to-video, lossy / 参考图生视频,有损 | **51.2 s** | 77.3 s | 86 s |
 
@@ -65,8 +68,8 @@ JAX 的时间包含音频解码;两个无损 JAX 数字是加入音频解码之�
 The visual quality stays close to lossless; check it on your own prompts before relying on it.
 画质与无损版本接近;正式使用前,请先用自己的提示词检查效果。
 
-The resident server keeps the model on the chips between requests: 36.6 s (text) and 51.4 s (reference) per lossy request.
-常驻服务在请求之间把模型保留在 chip 上:每个有损请求 36.6 秒(文生)和 51.4 秒(参考图生)。
+The resident server keeps the model on the chips between requests: 34.4 s (text) and 49.0 s (reference) per lossy request.
+常驻服务在请求之间把模型保留在 chip 上:每个有损请求 34.4 秒(文生)和 49.0 秒(参考图生)。
 
 ### Qwen-Image-2.1 — 1024x1024
 
@@ -85,7 +88,7 @@ Measured 2026-11-04 on a TPU v6e-8, same size as the MiniMax-H3 table (768x1344,
 
 | | Pika-H3-Flex, 6 steps / 6 步 | MiniMax-H3, lossless / 无损 |
 |---|---|---|
-| text-to-video / 文生视频 | **40.6 s** | 110.0 s |
+| text-to-video / 文生视频 | **38.3 s** | 110.0 s |
 | reference-to-video / 参考图生视频 | **51.1 s** | 139.2 s |
 
 Our six-step sampler matches Pika's own code within numerical noise, checked with the same initial noise.
@@ -98,12 +101,12 @@ A resident server (`--runs`) keeps the model and decoder on the chips; these are
 
 | Pika-H3-Flex, v6e-8 | per request / 每个请求 |
 |---|---|
-| text-to-video / 文生视频 | **10.8 s** |
-| reference-to-video, same reference image / 参考图生视频,参考图不变 | **13.6 s** |
-| reference-to-video, a new reference image every request / 参考图生视频,每次换新参考图 | **14.9 s** |
+| text-to-video / 文生视频 | **10.2 s** |
+| reference-to-video, same reference image / 参考图生视频,参考图不变 | **13.0 s** |
+| reference-to-video, a new reference image every request / 参考图生视频,每次换新参考图 | **14.1 s** |
 
-Reference-to-video uses `--sparse-window 16 --sparse-dense-steps 2`; a new image adds preparing it on the host (0.25 s), the text/vision encode (0.6 s) and the reference encode (0.45 s), all included in 14.9 s.
-参考图生视频使用 `--sparse-window 16 --sparse-dense-steps 2`;换新图时要加上主机上准备图片(0.25 秒)、文本/视觉编码(0.6 秒)和参考图编码(0.45 秒),都已计入 14.9 秒。
+Reference-to-video uses `--sparse-window 16 --sparse-dense-steps 2`; a new image adds preparing it on the host (0.25 s), the text/vision encode (0.6 s) and the reference encode (0.45 s), all included in 14.1 s.
+参考图生视频使用 `--sparse-window 16 --sparse-dense-steps 2`;换新图时要加上主机上准备图片(0.25 秒)、文本/视觉编码(0.6 秒)和参考图编码(0.45 秒),都已计入 14.1 秒。
 
 Without the sparse attention, reference-to-video takes 15.0 s with the same image and 16.4 s with a new one.
 不用稀疏注意力时,参考图生视频在参考图不变时为 15.0 秒,每次换新图时为 16.4 秒。
@@ -111,8 +114,8 @@ Without the sparse attention, reference-to-video takes 15.0 s with the same imag
 The same sparse attention brings text-to-video to 9.9 s.
 文生视频加上同样的稀疏注意力是 9.9 秒。
 
-Through the resident server, with a new prompt or reference image on every request, text-to-video takes 11.5 s and reference-to-video 15.6–16.4 s (`sparse_dense_steps` 3).
-通过常驻服务、每个请求换新的提示词或参考图时,文生视频为 11.5 秒,参考图生视频为 15.6–16.4 秒(`sparse_dense_steps` 设为 3)。
+Through the resident server, with a new prompt or reference image on every request, text-to-video takes 10.8 s and reference-to-video 15.0–15.7 s (`sparse_dense_steps` 3).
+通过常驻服务、每个请求换新的提示词或参考图时,文生视频为 10.8 秒,参考图生视频为 15.0–15.7 秒(`sparse_dense_steps` 设为 3)。
 
 ### Fewer chips / 更少的 chip
 
@@ -121,13 +124,13 @@ Measured 2026-11-02 to 2026-11-03; "4 chips" means four chips of the same v6e-8 
 
 | | 1 chip | 4 chips / 4 chip | 8 chips / 8 chip |
 |---|---|---|---|
-| MiniMax-H3 text-to-video, lossy / 文生视频,有损 | 30.7 s ¹ | 63.7 s | 37.2 s |
+| MiniMax-H3 text-to-video, lossy / 文生视频,有损 | 30.7 s ¹ | 63.7 s | 35.1 s |
 | MiniMax-H3 text-to-video, lossless / 文生视频,无损 | 65.0 s ¹ | 208.4 s | 110.0 s |
 | Qwen-Image-2.1, 20 steps, JAX / 20 步,JAX | 8.1 s ² | 1.34 s ³ | 0.74 s |
 | Qwen-Image-2.1, 20 steps, torchax / 20 步,torchax | does not fit / 放不下 | 1.66 s | 1.28 s |
 | Qwen-Image-2.1, 20 steps, torch_tpu / 20 步,torch_tpu | 8.8 s | does not fit / 放不下 | 1.18 s |
 | MiniMax-H3 reference-to-video, lossy / 参考图生视频,有损 | — | 92.7 s | 51.2 s |
-| Pika-H3-Flex text-to-video / 文生视频 | 55 s ⁴ | 70.8 s | 40.6 s |
+| Pika-H3-Flex text-to-video / 文生视频 | 55 s ⁴ | 70.8 s | 38.3 s |
 
 ¹ 480x832, 121 frames, `--chips 1 --offload`. ¹ 480x832,121 帧,`--chips 1 --offload`。
 
@@ -183,28 +186,34 @@ Measured 2026-11-04 on TPU v7x, JAX backend with `--fp8 --qk-fp8 --adaln-host`. 
 
 #### Pika-H3-Flex (6 steps / 6 步)
 
+Measured 2026-11-06 with audio, on the code of this commit. 8 and 4 devices: steady state (`--runs 2`, second request); 1 and 2 devices: a single run (`--runs 1`).
+测于 2026-11-06,含音频,即本提交的代码。8 和 4 个 device:稳态(`--runs 2` 的第二次请求);1 和 2 个 device:单次运行(`--runs 1`)。
+
 | | 1 device | 2 devices / 2 个 device | 4 devices / 4 个 device | 8 devices (v7x-8) / 8 个 device |
 |---|---|---|---|---|
-| text-to-video, 768x1344, 345 frames / 文生视频,768p 345 帧 | **197.6 s** (179.7 + 14.3) | **108.4 s** (91.3 + 12.9) | **63.3 s** (49.3 + 9.7) | **36.0 s** (25.1 + 6.6) |
-| reference-to-video, 768x1344, 345 frames / 参考图生视频,768p 345 帧 | — | **123.3 s** (104.9 + 13.0) | **71.5 s** (56.6 + 9.7) | **40.5 s** (28.8 + 6.6) |
-| text-to-video, 480x832, 362 frames (15 s) / 文生视频,480p 362 帧 | — | — | — | **13.5 s** (6.1 + 4.4) |
-| text-to-video, 480x832, 141 frames (6 s) / 文生视频,480p 141 帧 | **14.3 s** (9.2 + 3.3) | — | — | **7.3 s** (2.2 + 2.8) |
+| text-to-video, 768x1344, 345 frames / 文生视频,768p 345 帧 | **192.7 s** (179.5 + 12.1) | **101.4 s** (91.1 + 9.2) | **56.6 s** (49.5 + 6.7) | **29.3 s** (25.2 + 3.6) |
+| reference-to-video, 768x1344, 345 frames / 参考图生视频,768p 345 帧 | — | — | — | **33.1 s** (29.0 + 3.6) |
+| text-to-video, 480x832, 362 frames (15 s) / 文生视频,480p 362 帧 | — | — | — | **8.4 s** (6.1 + 2.0) |
+| text-to-video, 480x832, 141 frames (6 s) / 文生视频,480p 141 帧 | **12.4 s** (9.4 + 2.1) | — | — | **3.1 s** (2.2 + 0.8) |
 
-Parentheses show `(denoise + video decode)` in seconds; on 8 devices, steady-state compute (`denoise + decode + text`) for 480x832, 362 frames is 10.7 s, faster than the 15-second clip itself. Measured before the JAX audio decode was added (adds about 0.2–0.3 s).
-括号内为 `(去噪 + 视频解码)` 秒数;在 8 个 device 上,480x832、362 帧的纯计算时间(`去噪 + 解码 + 文本编码`)仅 10.7 秒,快于 15 秒视频本身的时长。这些数字是在加入 JAX 音频解码之前测的(加上音频解码约多 0.2–0.3 秒)。
+Parentheses show `(denoise + video decode)` in seconds. On a v7x-8, a 15-second 480p clip with sound takes 8.4 s.
+括号内为 `(去噪 + 视频解码)` 秒数。在 v7x-8 上,一段 15 秒带声音的 480p 视频只需 8.4 秒。
 
 #### MiniMax-H3 — 768x1344, 345 frames (14.4 s), 20 steps
 
+Measured 2026-11-04, before the audio decode and the faster video decode; 8-device lossy text-to-video is now 32.0 s (27.9 + 3.6) steady state with audio.
+测于 2026-11-04,早于音频解码和视频解码加速;8 个 device 有损文生视频现在为 32.0 秒(27.9 + 3.6,稳态,含音频)。
+
 | | 2 devices / 2 个 device | 4 devices / 4 个 device | 8 devices (v7x-8) / 8 个 device |
 |---|---|---|---|
-| text-to-video, lossy / 文生视频,有损 ¹ | **111.1 s** (93.9 + 12.9) | **68.5 s** (54.0 + 9.7) | **44.8 s** (33.6 + 6.6) ² |
+| text-to-video, lossy / 文生视频,有损 ¹ | **111.1 s** (93.9 + 12.9) | **68.5 s** (54.0 + 9.7) | **44.8 s** (33.6 + 6.6) |
 | text-to-video, lossless / 文生视频,无损 | **305.8 s** (289.0 + 12.8) | **170.3 s** (156.6 + 9.6) | **90.3 s** (79.4 + 6.6) ³ |
 | reference-to-video, lossy / 参考图生视频,有损 ¹ | **137.4 s** (119.1 + 12.8) | **83.0 s** (67.6 + 9.7) | **52.6 s** (41.4 + 6.6) |
 | reference-to-video, lossless / 参考图生视频,无损 | — | — | **101.9 s** (91.2 + 6.6) |
 
 ¹ Measured with `--sparse-window 2 --sparse-dense-steps 6 --cache-threshold 0.08` (11 of 19 DiT calls run). ¹ 使用 `--sparse-window 2 --sparse-dense-steps 6 --cache-threshold 0.08` 测得(19 次 DiT 调用中执行 11 次)。
 
-² With `--pallas-ffn` (sequence-tiled Pallas SwiGLU FFN megakernel, `DT_PALLAS_FFN=1`), which saves 2.7 s on 19-step denoising (36.3 s -> 33.6 s). ² 启用 `--pallas-ffn`(序列分块 Pallas SwiGLU FFN megakernel,`DT_PALLAS_FFN=1`),19 步去噪节省 2.7 秒(36.3 秒 -> 33.6 秒)。
+² `--pallas-ffn` (a sequence-tiled Pallas SwiGLU FFN kernel) is opt-in. It was slower than XLA on 1 and 2 devices and on long sequences, and where it is faster (8 devices, 480x832, 141 frames: 0.2 s) the output drifts (DINO 0.943). ² `--pallas-ffn`(序列分块 Pallas SwiGLU FFN kernel)需要手动开启。它在 1、2 个 device 和长序列上比 XLA 慢;唯一更快的场景(8 个 device、480x832、141 帧,快 0.2 秒)输出会漂移(DINO 0.943)。
 
 ³ On a v7x-8 (8 devices), `torchax` lossless text-to-video takes 128.5 s. ³ 在 v7x-8(8 个 device)上,`torchax` 无损文生视频为 128.5 秒。
 
@@ -331,7 +340,7 @@ bash scripts/run_h3_torchtpu.sh t2va --pika-adapter $PIKA/fl2va --prompt "..."
 
 | Pika-H3-Flex, 768x1344, 345 frames | JAX | torchax | torch_tpu |
 |---|---|---|---|
-| text-to-video / 文生视频 | **40.6 s** | 47.3 s | 71.1 s |
+| text-to-video / 文生视频 | **38.3 s** | 47.3 s | 71.1 s |
 | reference-to-video / 参考图生视频 | **51.1 s** | 67.0 s | 79.4 s |
 
 The adapter is merged into the weights while loading, so the denoising step costs the same as the base model.
@@ -350,8 +359,8 @@ The first run compiles for a few minutes; compiled programs are cached under `~/
 `--fp8` and `--qk-fp8` use float8 math, which helps on TPU v7x but is slower on v6e.
 `--fp8` 和 `--qk-fp8` 使用 float8 计算,在 TPU v7x 上有帮助,在 v6e 上反而更慢。
 
-`--pallas-ffn` enables the sequence-tiled Pallas SwiGLU FFN kernel (`diffusers_tpu/kernels/pallas_ffn.py`), keeping the `(B, S, 14336/tp)` gate/value activations in VMEM instead of round-tripping to HBM.
-`--pallas-ffn` 启用序列分块 Pallas SwiGLU FFN kernel(`diffusers_tpu/kernels/pallas_ffn.py`),将 `(B, S, 14336/tp)` 中间激活保留在 VMEM 中,避免读写 HBM。
+`--pallas-ffn` enables the sequence-tiled Pallas SwiGLU FFN kernel (`diffusers_tpu/kernels/pallas_ffn.py`) on TPU v7x. It is opt-in: it was slower than XLA on 1 and 2 devices and on long sequences, and where it was faster (8 devices, 480x832, 141 frames: 0.2 s) the output drifts (DINO 0.943), because each device scales its FP8 activations separately.
+`--pallas-ffn` 在 TPU v7x 上启用序列分块 Pallas SwiGLU FFN kernel(`diffusers_tpu/kernels/pallas_ffn.py`),需要手动开启:它在 1、2 个 device 和长序列上比 XLA 慢;唯一更快的场景(8 个 device、480x832、141 帧,快 0.2 秒)输出会漂移(DINO 0.943),因为每个 device 各自计算 FP8 激活的缩放因子。
 
 A single v6e chip can run MiniMax-H3 at 480p with `--chips 1 --offload`, streaming weights from host memory.
 单个 v6e chip 可以用 `--chips 1 --offload` 运行 480p 的 MiniMax-H3,权重从主机内存流式加载。

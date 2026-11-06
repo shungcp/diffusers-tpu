@@ -397,7 +397,11 @@ def _build_modules():
       self.swiglu_tp = 1
 
     def __call__(self, x):
-      if os.environ.get("DT_PALLAS_FFN") == "1" and x.shape[1] >= 1024:
+      if (
+          os.environ.get("DT_PALLAS_FFN") == "1"
+          and getattr(self, "swiglu_tp", 1) == _tp_size()
+          and x.shape[1] >= 1024
+      ):
         from ...kernels import pallas_ffn
         ws_proj = (
             self.proj.weight_scale[...]

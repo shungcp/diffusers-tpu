@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import functools
+import os
 import jax
 from jax import lax
 from jax.experimental import pallas as pl
@@ -261,6 +262,12 @@ def pallas_swiglu_ffn_sharded(
       if mesh is not None
       else functools.partial(jax.shard_map, check_vma=False)
   )
+  scatter_seq = (
+      x.ndim == 3
+      and x.shape[1] % tp_size == 0
+      and os.environ.get("DT_PALLAS_FFN_ALLREDUCE") != "1"
+  )
+  out_spec = P(None, tp_axis, None) if scatter_seq else P(None, None, None)
 
   if is_fp8:
     def _local_fp8(x_l, wp_l, wo_l, wsp_l, wso_l):
@@ -276,6 +283,8 @@ def pallas_swiglu_ffn_sharded(
             wso_l,
             block_m=block_m,
         )
+      if scatter_seq:
+        return lax.psum_scatter(part, tp_axis, scatter_dimension=1, tiled=True)
       return lax.psum(part, tp_axis)
 
     return smap(
@@ -287,7 +296,7 @@ def pallas_swiglu_ffn_sharded(
             P(tp_axis),
             P(),
         ),
-        out_specs=P(None, None, None),
+        out_specs=out_spec,
     )(x, w_proj, w_out, ws_proj, ws_out)
   else:
     def _local_bf16(x_l, wp_l, wo_l):
@@ -296,10 +305,12 @@ def pallas_swiglu_ffn_sharded(
         part = pallas_swiglu_ffn_local(
             x_l, wp_l[:fl], wp_l[fl:], wo_l, block_m=block_m
         )
+      if scatter_seq:
+        return lax.psum_scatter(part, tp_axis, scatter_dimension=1, tiled=True)
       return lax.psum(part, tp_axis)
 
     return smap(
         _local_bf16,
         in_specs=(P(None, None, None), P(tp_axis, None), P(None, tp_axis)),
-        out_specs=P(None, None, None),
+        out_specs=out_spec,
     )(x, w_proj, w_out)

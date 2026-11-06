@@ -242,7 +242,8 @@ class ViTDecoder(nnx.Module):
         coords,
         jnp.zeros((batch, self.num_register_tokens + 1, 3), coords.dtype),
     ], axis=1)
-    rope = rope_angles(coords, self.rope_dim, self.rope_theta)
+    cos, sin = rope_angles(coords, self.rope_dim, self.rope_theta)
+    rope = (cos.astype(x.dtype), sin.astype(x.dtype))
 
     for block in self.transformer_blocks:
       x = block(x, rope, sdpa)
@@ -664,6 +665,63 @@ def blend_axis(a, b, extent, axis):
   return jnp.concatenate([head, b[tuple(rest)]], axis=axis)
 
 
+@functools.partial(jax.jit, static_argnums=(1, 2, 3, 4))
+def _extract_tiles(z, cuts, ratio, pad_n, shard_axis=None):
+  """Fuse spatial tile extraction and stacking into a single XLA program."""
+  import jax
+  import jax.numpy as jnp
+  from jax.sharding import PartitionSpec as P
+
+  tiles = [z[..., i_pos // ratio:i_pos // ratio + i_len // ratio,
+             j_pos // ratio:j_pos // ratio + j_len // ratio]
+           for i_pos, i_len, j_pos, j_len in cuts]
+  stacked = jnp.stack(tiles + ([tiles[-1]] * pad_n if pad_n else []))
+  if shard_axis is not None:
+    stacked = jax.lax.with_sharding_constraint(stacked, P(shard_axis))
+  return stacked
+
+
+@functools.partial(jax.jit, static_argnums=(1, 2, 3, 4))
+def _blend_tiles(flat, yo, xo, shard_axis=None, ndev=1):
+  """Fuse spatial tile blending and concatenation into a single XLA program."""
+  import jax
+  import jax.numpy as jnp
+  from jax.sharding import PartitionSpec as P
+
+  orig_mid = flat.shape[1:-2]
+  mid_prod = math.prod(orig_mid)
+  use_mid_shard = shard_axis is not None and ndev > 1 and mid_prod % ndev == 0
+  if use_mid_shard:
+    flat = flat.reshape(flat.shape[0], mid_prod, flat.shape[-2], flat.shape[-1])
+    flat = jax.lax.with_sharding_constraint(
+        flat, P(None, shard_axis, None, None))
+  nrow = len(yo) + 1
+  ncol = len(xo) + 1
+  rows = [[flat[i * ncol + j] for j in range(ncol)]
+          for i in range(nrow)]
+  out_rows = []
+  for i, row in enumerate(rows):
+    out = []
+    for j, tile in enumerate(row):
+      if i > 0:
+        tile = blend_axis(rows[i - 1][j], tile, yo[i - 1], -2)
+      if j > 0:
+        tile = blend_axis(row[j - 1], tile, xo[j - 1], -1)
+      if i < nrow - 1:
+        tile = tile[..., :-yo[i], :]
+      if j < ncol - 1:
+        tile = tile[..., :, :-xo[j]]
+      out.append(tile)
+    out_rows.append(jnp.concatenate(out, axis=-1))
+  res = jnp.concatenate(out_rows, axis=-2)
+  if use_mid_shard:
+    res = res.reshape(orig_mid + res.shape[-2:])
+    if res.shape[-2] % ndev == 0:
+      res = jax.lax.with_sharding_constraint(
+          res, P(None, None, None, shard_axis, None))
+  return res
+
+
 def tiled_decode(decode_one, z, tile_px=256, overlap_px=64,
                  ratio=SPATIAL_RATIO, batch=0, mesh=None):
   """`_decode_clip` with tiling on: decode each tile, blend, stitch.
@@ -682,35 +740,32 @@ def tiled_decode(decode_one, z, tile_px=256, overlap_px=64,
   xs, xl, xo = split_tiles(z.shape[-1] * ratio, tile_px, overlap_px, ratio)
   if not yo and not xo:
     return decode_one(z)
-  cuts = [(i_pos, i_len, j_pos, j_len)
-          for i_pos, i_len in zip(ys, yl)
-          for j_pos, j_len in zip(xs, xl)]
-  tiles = [z[..., i_pos // ratio:i_pos // ratio + i_len // ratio,
-             j_pos // ratio:j_pos // ratio + j_len // ratio]
-           for i_pos, i_len, j_pos, j_len in cuts]
+  cuts = tuple(
+      (i_pos, i_len, j_pos, j_len)
+      for i_pos, i_len in zip(ys, yl)
+      for j_pos, j_len in zip(xs, xl)
+  )
   if mesh is not None and mesh.devices.size == 1 and not batch:
     batch = 4
   if mesh is not None and mesh.devices.size > 1:
     # Tiles split over the chips (weights replicated), the way
     # `tiled_encode(mesh=)` does it: 28 tiles of a 768p chunk -> 4 a chip.
-    from jax.sharding import NamedSharding, PartitionSpec as P
-    n = len(tiles)
+    n = len(cuts)
     ndev = mesh.devices.size
-    stacked = jnp.stack(tiles + [tiles[-1]] * ((-n) % ndev))
-    stacked = jax.device_put(stacked, NamedSharding(mesh, P(mesh.axis_names[0])))
-    flat = jax.vmap(decode_one)(stacked)[:n]
-    ncol = len(xs)
-    rows = [[flat[i * ncol + j] for j in range(ncol)]
-            for i in range(len(ys))]
+    ax = mesh.axis_names[0]
+    stacked = _extract_tiles(z, cuts, ratio, (-n) % ndev, ax)
+    flat = jax.vmap(decode_one)(stacked)
+    return _blend_tiles(flat, tuple(yo), tuple(xo), ax, ndev)
   elif batch:
-    stacked = jnp.stack(tiles)
+    stacked = _extract_tiles(z, cuts, ratio, 0, None)
     outs = [jax.vmap(decode_one)(stacked[s:s + batch])
             for s in range(0, stacked.shape[0], batch)]
     flat = jnp.concatenate(outs, axis=0) if len(outs) > 1 else outs[0]
-    ncol = len(xs)
-    rows = [[flat[i * ncol + j] for j in range(ncol)]
-            for i in range(len(ys))]
+    return _blend_tiles(flat, tuple(yo), tuple(xo), None, 1)
   else:
+    tiles = [z[..., i_pos // ratio:i_pos // ratio + i_len // ratio,
+               j_pos // ratio:j_pos // ratio + j_len // ratio]
+             for i_pos, i_len, j_pos, j_len in cuts]
     rows = [[decode_one(t) for t in tiles[i * len(xs):(i + 1) * len(xs)]]
             for i in range(len(ys))]
   out_rows = []

@@ -849,14 +849,6 @@ class Server:
           overlap_px=a.vae_tile_overlap_px,
           batch=28 if self.mesh.devices.size > 1 else 4)
 
-    def blend(x, y, extent):
-      extent = min(x.shape[2], y.shape[2], extent)
-      if extent <= 0:
-        return y
-      w = jnp.arange(extent, dtype=y.dtype).reshape(1, 1, extent, 1, 1) / extent
-      head = x[:, :, -extent:] * (1.0 - w) + y[:, :, :extent] * w
-      return head if extent == y.shape[2] else jnp.concatenate([head, y[:, :, extent:]], axis=2)
-
     frames_lat = latents.shape[2]
     num_tokens = frames_lat + token_drop
     pad_tokens = (-num_tokens) % tokens_chunk
@@ -884,7 +876,7 @@ class Server:
         f = j * chunk_frames
         piece = out[:, :, f:f + chunk_frames][:, :, pre_pad:]
         if j == 0:
-          pieces.append(piece if carry is None else blend(carry, piece, frame_overlap))
+          pieces.append(piece if carry is None else _server_helpers()[0](carry, piece, frame_overlap))
         else:
           carry = piece
     if carry is not None:
@@ -896,10 +888,33 @@ class Server:
       pad_frames = sum(intra_tail if intra_tail and (before + k) % tokens_chunk == 0
                        else ratio for k in range(pad_tokens))
       frames = frames[:, :, :-pad_frames]
+    return np.asarray(_server_helpers()[1](frames))
+
+
+@functools.lru_cache(maxsize=1)
+def _server_helpers():
+  """`(blend, frames_to_uint8)`, jitted on first use: jax is imported lazily
+  in this module, so nothing here may touch it at import time."""
+  import jax
+  import jax.numpy as jnp
+
+  @functools.partial(jax.jit, static_argnums=(2,))
+  def blend(x, y, extent):
+    extent = min(x.shape[2], y.shape[2], extent)
+    if extent <= 0:
+      return y
+    w = jnp.arange(extent, dtype=y.dtype).reshape(1, 1, extent, 1, 1) / extent
+    head = x[:, :, -extent:] * (1.0 - w) + y[:, :, :extent] * w
+    return head if extent == y.shape[2] else jnp.concatenate([head, y[:, :, extent:]], axis=2)
+
+  @jax.jit
+  def frames_to_uint8(frames):
     mean = jnp.asarray((0.485, 0.456, 0.406), jnp.float32).reshape(1, -1, 1, 1, 1)
     std = jnp.asarray((0.229, 0.224, 0.225), jnp.float32).reshape(1, -1, 1, 1, 1)
     frames = jnp.clip(frames.astype(jnp.float32) * std + mean, 0.0, 1.0)
-    return np.asarray(jnp.round(jnp.transpose(frames[0], (1, 2, 3, 0)) * 255.0), np.uint8)
+    return jnp.round(jnp.transpose(frames[0], (1, 2, 3, 0)) * 255.0).astype(jnp.uint8)
+
+  return blend, frames_to_uint8
 
 
 def main():
