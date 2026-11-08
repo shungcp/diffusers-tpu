@@ -1046,6 +1046,30 @@ def pin_modulation(model: torch.nn.Module, mesh: jax.sharding.Mesh) -> None:
     module.forward = forward
 
 
+
+def _install_jax_video_decode(pipe, snapshot, mesh):
+  """Replace the video decode step with `jax_video_decoder.VideoDecoder`."""
+  import numpy as np
+  import torchax
+  from diffusers.modular_pipelines.minimax_h3.decoders import MiniMaxH3VideoDecodeStep
+
+  from .jax_video_decoder import VideoDecoder
+
+  env = torchax.default_env()
+  decoder = VideoDecoder(snapshot, mesh)
+  print("  [vae] video decode: JAX decoder (jax_video_decoder)", flush=True)
+
+  def __call__(self, components, state):
+    block_state = self.get_block_state(state)
+    latents = block_state.latents
+    lat = env.t2j_iso(latents) if isinstance(latents, torchax.tensor.Tensor) else (
+        __import__("jax").numpy.asarray(latents.float().numpy()))
+    block_state.videos = decoder.decode(lat)[None]
+    self.set_block_state(state, block_state)
+    return components, state
+
+  MiniMaxH3VideoDecodeStep.__call__ = __call__
+
 def main() -> None:
   ap = argparse.ArgumentParser()
   ap.add_argument(
@@ -1173,6 +1197,13 @@ def main() -> None:
   # Swept at 128 granularity on the real 103,976 sequence; the
   # autotuner's analytic pick is 4096/2048 and measures 4.3% slower.
   ap.add_argument("--block-kv", type=int, default=KV_BLOCK)
+  ap.add_argument(
+      "--jax-vae",
+      action="store_true",
+      help="Decode the video with the JAX backend's decoder (tensor-parallel "
+      "ViT, chunks and tiles batched over the mesh, uint8 on the chips) "
+      "instead of diffusers' VAE: 9.5 -> ~5 s at 768p/345 frames.",
+  )
   ap.add_argument(
       "--fast-vae",
       action="store_true",
@@ -1469,7 +1500,16 @@ def main() -> None:
   # compiled program serves them all.
   from .vae_batched import BatchedTileDecoder, install_fast_video_vae
 
-  if args.fast_vae:
+  if args.jax_vae:
+    _install_jax_video_decode(pipe, model_path, mesh)
+    if args.workflow == "ref2va":
+      # The reference encode still uses diffusers' VAE encoder; on the host
+      # it costs ~30 s at 768p, so it runs on the mesh, its weights placed
+      # only for the encode (resident, they leave the decoder 60 MB short).
+      from .vae_batched import install_batched_encoder
+      install_batched_encoder(pipe.vae, mesh, on_demand=True)
+      print("  [vae] encoder on the mesh, weights placed per encode")
+  elif args.fast_vae:
     # Compared with `BatchedTileDecoder`:
     #   - batches several clips so the tile count divides the mesh (a
     #     28-tile clip padded to 32 wastes 14%; four clips are 112 = 8 x 14);

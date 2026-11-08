@@ -961,7 +961,10 @@ class BatchedTileEncoder:
   and the model's own `_stitch_tiles` over the latent-space overlaps.
   """
 
-  def __init__(self, vae, mesh: jax.sharding.Mesh):
+  def __init__(self, vae, mesh: jax.sharding.Mesh, on_demand: bool = False):
+    """`on_demand`: keep the weights on the host and place them on the mesh
+    only for an encode, for when the chips are needed for something else
+    between encodes (the JAX video decoder beside the reference DiT)."""
     import torchax
 
     self._vae = vae
@@ -969,11 +972,18 @@ class BatchedTileEncoder:
     self._env = torchax.default_env()
     self._inner = torch.nn.Sequential(vae.encoder, vae.quant_conv).eval()
     self._cache: dict = {}
-    self._params = {
-        name: jax.device_put(_to_jax(tensor), NamedSharding(mesh, P()))
-        for name, tensor in list(self._inner.named_parameters())
-        + list(self._inner.named_buffers())
-    }
+    tensors = (list(self._inner.named_parameters())
+               + list(self._inner.named_buffers()))
+    if on_demand:
+      self._host = {name: np.asarray(jax.device_get(_to_jax(tensor)))
+                    for name, tensor in tensors}
+      self._params = None
+    else:
+      self._host = None
+      self._params = {
+          name: jax.device_put(_to_jax(tensor), NamedSharding(mesh, P()))
+          for name, tensor in tensors
+      }
     self.calls = 0
 
   def _program(self, shape: tuple[int, ...]):
@@ -997,6 +1007,15 @@ class BatchedTileEncoder:
     return fn
 
   def __call__(self, x: torch.Tensor) -> torch.Tensor:
+    if self._host is None:
+      return self._encode(x)
+    self._params = jax.device_put(self._host, NamedSharding(self._mesh, P()))
+    try:
+      return self._encode(x)
+    finally:
+      self._params = None
+
+  def _encode(self, x: torch.Tensor) -> torch.Tensor:
     vae = self._vae
     self.calls += 1
     if not vae.use_tiling:
@@ -1059,8 +1078,9 @@ class BatchedTileEncoder:
     return out  # type: ignore[return-value]
 
 
-def install_batched_encoder(vae, mesh: jax.sharding.Mesh) -> BatchedTileEncoder:
+def install_batched_encoder(vae, mesh: jax.sharding.Mesh,
+                            on_demand: bool = False) -> BatchedTileEncoder:
   """Puts `_encode_clip` on the mesh. Returns it so callers can read `calls`."""
-  encoder = BatchedTileEncoder(vae, mesh)
+  encoder = BatchedTileEncoder(vae, mesh, on_demand=on_demand)
   vae._encode_clip = encoder
   return encoder
