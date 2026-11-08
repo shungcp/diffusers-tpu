@@ -778,6 +778,11 @@ def install_attention(
     bind(block.attn)
 
 
+# Head rows from which the segmented modulation selects in place instead
+# of concatenating (DT_SEGMOD_SELECT_MIN; 0 always selects).
+SEGMOD_SELECT_MIN = int(os.environ.get("DT_SEGMOD_SELECT_MIN", "4096"))
+
+
 def segment_runs(
     token_tags: torch.Tensor, timestep_indices: torch.Tensor
 ) -> tuple[tuple[int, int, int], ...]:
@@ -821,6 +826,18 @@ def install_segmented_modulation(
   def apply(hidden, combine):
     out = combine(hidden, bulk_index)
     if not head_runs:
+      return out
+    if head_width >= SEGMOD_SELECT_MIN:
+      # Long heads (ref2va: 15.5k text + reference + audio rows): each run
+      # selected in place over the full tensor, elementwise, so a sharded
+      # sequence stays where it is. Concatenating the head and
+      # `index_copy`ing it back made XLA gather those rows and pass slices
+      # around every block: ref2va DiT calls 8.4 -> 6.7 s (dense), 6.1 ->
+      # 4.4 s (sparse); video DINO 0.980 against it. A t2va head (~1.2k
+      # rows) is cheaper the old way.
+      pos = torch.arange(hidden.shape[1], device=hidden.device).view(1, -1, 1)
+      for start, end, index in head_runs:
+        out = torch.where((pos >= start) & (pos < end), combine(hidden, index), out)
       return out
     head = torch.cat(
         [combine(hidden[:, start:end], index) for start, end, index in head_runs],

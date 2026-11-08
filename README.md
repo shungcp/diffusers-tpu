@@ -25,6 +25,9 @@ Every model can run through three backends, so you can pick the one that fits yo
 Newest first. Each entry links a date to what changed.
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-08** — torchax reference-to-video: the AdaLN modulation of the 15.5k text, reference and audio rows no longer gathers them across chips every block; DiT calls match the JAX backend, lossy 768p 68.5 -> 58.0 s on a v6e-8.
+  **2026-11-08** — torchax 参考图生视频:文本、参考图和音频共 1.55 万行的 AdaLN 调制不再每个 block 都跨 chip 汇总;DiT 调用与 JAX 后端持平,v6e-8 上 768p 有损 68.5 -> 58.0 秒。
+
 - **2026-11-08** — torchax decodes the video with the JAX backend's decoder (`--jax-vae`, now the default): 768p Pika-H3-Flex 47.3 -> 40.9 s, lossless MiniMax-H3 117.8 -> 110.0 s on a v6e-8; video DINO 0.999 against diffusers' VAE.
   **2026-11-08** — torchax 改用 JAX 后端的视频解码器(`--jax-vae`,现为默认):v6e-8 上 768p Pika-H3-Flex 47.3 -> 40.9 秒,MiniMax-H3 无损 117.8 -> 110.0 秒;视频与 diffusers VAE 的 DINO 为 0.999。
 
@@ -66,7 +69,7 @@ Software: jax 0.12.0.1, libtpu 0.0.52 (0.0.51 for torch_tpu; JAX numbers re-meas
 | text-to-video, lossless / 文生视频,无损 | **110.0 s** | 110.0 s | 135.2 s |
 | text-to-video, lossy / 文生视频,有损 | **34.0 s** | 36.4 s | 48.3 s |
 | reference-to-video, lossless / 参考图生视频,无损 | **139.2 s** | 186.7 s | 189 s |
-| reference-to-video, lossy / 参考图生视频,有损 | **51.2 s** | 68.5 s | 82.2 s |
+| reference-to-video, lossy / 参考图生视频,有损 | **51.2 s** | 58.0 s | 82.2 s |
 
 JAX times include decoding the audio; the two lossless JAX numbers were measured before it was added (about 0.1 s more).
 JAX 的时间包含音频解码;两个无损 JAX 数字是加入音频解码之前测的(会多约 0.1 秒)。
