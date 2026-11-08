@@ -15,8 +15,10 @@ case "$WF" in
   # Text encoder tensor-parallel on the chips (8 x 7.3 GiB) instead of on
   # the host, freed after encoding so the lossless denoise still fits:
   # Pika 768p t2va 71.1 -> 51.9 s, lossy 52.5 -> 49.8 s, video DINO 0.967.
+  # The VAE stays resident (1-2 s less a request); ref2va, which also holds
+  # the reference encoder, does not fit that way and moves it per request.
   t2va) EXTRA=(--shard-text --free-text-after --seg-mod) ;;
-  ref2va) EXTRA=(--free-text-after)
+  ref2va) EXTRA=(--free-text-after --vae-on-demand)
     case " $* " in *" --reference "*) ;; *) echo "ref2va needs --reference <image>" >&2; exit 2 ;; esac ;;
   *) echo "workflow must be t2va or ref2va" >&2; exit 2 ;;
 esac
@@ -40,5 +42,5 @@ exec "${PYTHON:-python}" -m torch.distributed.run --nproc_per_node 8 --master_po
   -m diffusers_tpu.backends.torchtpu_h3 --workflow "$WF" --runs 2 \
   --num-frames 345 --max-duration 15 --height 768 --width 1344 --steps 20 --vae-clip 0 \
   --shard-decode --shard-adaln --aot-dit --ours-attn --text-layers 51 --aot-vae \
-  --no-offload --aot-group 10 --vae-on-demand --prefetch 1 \
+  --no-offload --aot-group 10 --prefetch 1 \
   --out out --tag "torchtpu_$WF" ${EXTRA[@]+"${EXTRA[@]}"} "$@"

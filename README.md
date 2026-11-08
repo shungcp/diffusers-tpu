@@ -28,8 +28,8 @@ Newest first. Each entry links a date to what changed.
 - **2026-11-08** — torchax decodes the video with the JAX backend's decoder (`--jax-vae`, now the default): 768p Pika-H3-Flex 47.3 -> 40.9 s, lossless MiniMax-H3 117.8 -> 110.0 s on a v6e-8; video DINO 0.999 against diffusers' VAE.
   **2026-11-08** — torchax 改用 JAX 后端的视频解码器(`--jax-vae`,现为默认):v6e-8 上 768p Pika-H3-Flex 47.3 -> 40.9 秒,MiniMax-H3 无损 117.8 -> 110.0 秒;视频与 diffusers VAE 的 DINO 为 0.999。
 
-- **2026-11-08** — torch_tpu text-to-video runs the text encoder tensor-parallel on the chips instead of on the host: Pika-H3-Flex 768p 71.1 -> 51.9 s on a v6e-8.
-  **2026-11-08** — torch_tpu 文生视频改为在 chip 上张量并行运行文本编码器,不再放在主机上:v6e-8 上 Pika-H3-Flex 768p 71.1 -> 51.9 秒。
+- **2026-11-08** — torch_tpu text-to-video runs the text encoder tensor-parallel on the chips instead of on the host: Pika-H3-Flex 768p 71.1 -> 51.3 s on a v6e-8 (the VAE also stays resident for text-to-video).
+  **2026-11-08** — torch_tpu 文生视频改为在 chip 上张量并行运行文本编码器,不再放在主机上:v6e-8 上 Pika-H3-Flex 768p 71.1 -> 51.3 秒(文生视频的 VAE 也改为常驻)。
 
 - **2026-11-07** — Back-to-back requests on the resident server: 33 s -> 15.3 s each (480p reference-to-video on a v6e-8). Saving each clip's frames took 18 s, outside the timed request, because they reached the host as a strided array; the chips now hand back a contiguous one (0.2 s). Output unchanged.
   **2026-11-07** — 常驻服务连续处理请求:每条从 33 秒降到 15.3 秒(v6e-8 上 480p 参考图生视频)。原来每段视频的帧存盘要 18 秒(不在计时范围内),原因是帧以跨步数组的形式回到主机;现在 chip 直接交回连续数组(0.2 秒)。输出不变。
@@ -63,10 +63,10 @@ Software: jax 0.12.0.1, libtpu 0.0.52 (0.0.51 for torch_tpu; JAX numbers re-meas
 
 | | JAX | torchax | torch_tpu |
 |---|---|---|---|
-| text-to-video, lossless / 文生视频,无损 | **110.0 s** | 110.0 s | 136.8 s |
-| text-to-video, lossy / 文生视频,有损 | **34.0 s** | 36.4 s | 49.8 s |
+| text-to-video, lossless / 文生视频,无损 | **110.0 s** | 110.0 s | 135.2 s |
+| text-to-video, lossy / 文生视频,有损 | **34.0 s** | 36.4 s | 48.3 s |
 | reference-to-video, lossless / 参考图生视频,无损 | **139.2 s** | 186.7 s | 189 s |
-| reference-to-video, lossy / 参考图生视频,有损 | **51.2 s** | 68.5 s | 86 s |
+| reference-to-video, lossy / 参考图生视频,有损 | **51.2 s** | 68.5 s | 82.2 s |
 
 JAX times include decoding the audio; the two lossless JAX numbers were measured before it was added (about 0.1 s more).
 JAX 的时间包含音频解码;两个无损 JAX 数字是加入音频解码之前测的(会多约 0.1 秒)。
@@ -349,7 +349,7 @@ bash scripts/run_h3_torchtpu.sh t2va --pika-adapter $PIKA/fl2va --prompt "..."
 
 | Pika-H3-Flex, 768x1344, 345 frames | JAX | torchax | torch_tpu |
 |---|---|---|---|
-| text-to-video / 文生视频 | **36.5 s** | 40.9 s | 51.9 s |
+| text-to-video / 文生视频 | **36.5 s** | 40.9 s | 51.3 s |
 | reference-to-video / 参考图生视频 | **51.1 s** | 67.0 s | 79.4 s |
 
 The adapter is merged into the weights while loading, so the denoising step costs the same as the base model.
