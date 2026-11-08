@@ -12,7 +12,10 @@ R=$(cd "$(dirname "$0")/.." && pwd)
 WF=${1:?usage: run_h3_torchtpu.sh t2va|ref2va [args...]}; shift
 EXTRA=()
 case "$WF" in
-  t2va) EXTRA=(--cpu-text --seg-mod) ;;
+  # Text encoder tensor-parallel on the chips (8 x 7.3 GiB) instead of on
+  # the host, freed after encoding so the lossless denoise still fits:
+  # Pika 768p t2va 71.1 -> 51.9 s, lossy 52.5 -> 49.8 s, video DINO 0.967.
+  t2va) EXTRA=(--shard-text --free-text-after --seg-mod) ;;
   ref2va) EXTRA=(--free-text-after)
     case " $* " in *" --reference "*) ;; *) echo "ref2va needs --reference <image>" >&2; exit 2 ;; esac ;;
   *) echo "workflow must be t2va or ref2va" >&2; exit 2 ;;
