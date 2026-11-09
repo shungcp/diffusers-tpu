@@ -69,7 +69,7 @@ Software: jax 0.12.0.1, libtpu 0.0.52 (0.0.51 for torch_tpu; JAX numbers re-meas
 | text-to-video, lossless / 文生视频,无损 | **110.0 s** | 110.0 s | 135.2 s |
 | text-to-video, lossy / 文生视频,有损 | **34.0 s** | 36.4 s | 48.3 s |
 | reference-to-video, lossless / 参考图生视频,无损 | **139.2 s** | 186.7 s | 189 s |
-| reference-to-video, lossy / 参考图生视频,有损 | **51.2 s** | 58.0 s | 82.2 s |
+| reference-to-video, lossy / 参考图生视频,有损 | **51.2 s** | 55.4 s | 82.2 s |
 
 JAX times include decoding the audio; the two lossless JAX numbers were measured before it was added (about 0.1 s more).
 JAX 的时间包含音频解码;两个无损 JAX 数字是加入音频解码之前测的(会多约 0.1 秒)。
@@ -352,7 +352,7 @@ bash scripts/run_h3_torchtpu.sh t2va --pika-adapter $PIKA/fl2va --prompt "..."
 
 | Pika-H3-Flex, 768x1344, 345 frames | JAX | torchax | torch_tpu |
 |---|---|---|---|
-| text-to-video / 文生视频 | **36.5 s** | 40.9 s | 51.3 s |
+| text-to-video / 文生视频 | **36.5 s** | 39.7 s | 51.3 s |
 | reference-to-video / 参考图生视频 | **51.1 s** | 67.0 s | 79.4 s |
 
 The adapter is merged into the weights while loading, so the denoising step costs the same as the base model.

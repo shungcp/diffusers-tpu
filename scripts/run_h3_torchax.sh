@@ -23,6 +23,6 @@ export LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"--xla_tpu_dvfs_p_state=7 \
 exec "${PYTHON:-python}" -u -m diffusers_tpu.models.minimax_h3.torchax_pipeline \
   --num-frames 345 --steps 20 \
   --fixed-m --warmup --scoped-vmem-kib 98304 --full-lane-rope --timestep-pad \
-  --jax-vae \
+  --jax-vae --text-encoder-on-tpu --text-encoder-tp \
   --cache-threshold 0.20 --sparse-window 16 --sparse-dense-steps 6 \
   --out out --tag torchax "$@"
