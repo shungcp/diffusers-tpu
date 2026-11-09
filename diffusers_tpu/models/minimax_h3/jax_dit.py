@@ -1070,13 +1070,37 @@ def load_param_cache(model, cache_dir, mesh, spec_fn, memory_kind=None):
     index = json.load(f)
 
   def get(fname):
-    arr = np.load(os.path.join(cache_dir, fname + ".npy"), mmap_mode="r")
+    # One large sequential read per file, not a memory map: on a disk that
+    # is limited in operations rather than bytes (Colab's loop device, read-
+    # ahead fixed at 128 KB) page-faulting a 20 GB DiT cache in ran at
+    # ~20 MB/s. Same bytes either way.
+    with open(os.path.join(cache_dir, fname + ".npy"), "rb", buffering=0) as f:
+      version = np.lib.format.read_magic(f)
+      read_header = (np.lib.format.read_array_header_1_0 if version == (1, 0)
+                     else np.lib.format.read_array_header_2_0)
+      shape, fortran, dtype = read_header(f)
+      arr = np.empty(shape, dtype, order="F" if fortran else "C")
+      view, got = memoryview(arr.reshape(-1).view(np.uint8)), 0
+      while got < view.nbytes:
+        k = f.readinto(view[got:])
+        if not k:
+          raise IOError(f"short read in {fname}.npy")
+        got += k
     if index["dtypes"][fname] == "bfloat16":
       arr = arr.view(ml_dtypes.bfloat16)
     return arr
 
-  for name in index["params"]:
-    arr = get(name)
+  # A few files read ahead on threads: each read stays large and
+  # sequential, and a fast disk still gets parallel requests (one thread
+  # alone loaded the v5e DiT cache in 165 s against 117 s memory-mapped).
+  import concurrent.futures as cf
+  names = list(index["params"])
+  pool = cf.ThreadPoolExecutor(int(os.environ.get("DT_CACHE_READ_THREADS", "4")))
+  pending = {n: pool.submit(get, n) for n in names[:8]}
+  for i, name in enumerate(names):
+    if i + 8 < len(names):
+      pending[names[i + 8]] = pool.submit(get, names[i + 8])
+    arr = pending.pop(name).result()
     parts = name.split(".")
     node = model
     for part in parts[:-1]:
@@ -1088,11 +1112,13 @@ def load_param_cache(model, cache_dir, mesh, spec_fn, memory_kind=None):
     kind = memory_kind(name) if callable(memory_kind) else memory_kind
     value = jax.device_put(np.ascontiguousarray(arr),
                            NamedSharding(mesh, spec, memory_kind=kind))
+    del arr
     current = getattr(node, parts[-1], None)
     if isinstance(current, nnx.Param):
       current.value = value
     else:
       setattr(node, parts[-1], nnx.data(nnx.Param(value)))
+  pool.shutdown()
   return {k: np.asarray(get("_extra." + k)) for k in index["extra"]}
 
 
