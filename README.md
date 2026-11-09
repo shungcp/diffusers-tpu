@@ -25,6 +25,8 @@ Every model can run through three backends, so you can pick the one that fits yo
 Newest first. Each entry links a date to what changed.
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-09** — Colab notebook for one free TPU v5e chip, plus a copy with the outputs of an end-to-end run ([details](#free-colab-notebook--免费-colab-notebook)).
+  **2026-11-09** — 新增单个免费 TPU v5e chip 的 Colab notebook,以及一份端到端跑过的带输出版本([详情](#free-colab-notebook--免费-colab-notebook))。
 - **2026-11-08** — torchax reference-to-video: the AdaLN modulation of the 15.5k text, reference and audio rows no longer gathers them across chips every block; DiT calls match the JAX backend, lossy 768p 68.5 -> 58.0 s on a v6e-8.
   **2026-11-08** — torchax 参考图生视频:文本、参考图和音频共 1.55 万行的 AdaLN 调制不再每个 block 都跨 chip 汇总;DiT 调用与 JAX 后端持平,v6e-8 上 768p 有损 68.5 -> 58.0 秒。
 
@@ -190,6 +192,16 @@ On one chip the audio is decoded on the host, in the background while the chip d
 
 `DT_INT8_ACT=1` also quantizes activations and uses the int8 matrix units: denoising is 10-22% faster, and the output changes more.
 `DT_INT8_ACT=1` 会把激活也量化,使用 int8 矩阵单元:去噪快 10-22%,结果的变化也更大。
+
+#### Free Colab notebook / 免费 Colab notebook
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/shungcp/diffusers-tpu/blob/main/notebooks/h3_colab_v5e.ipynb)
+
+[`notebooks/h3_colab_v5e.ipynb`](notebooks/h3_colab_v5e.ipynb) runs Pika-H3-Flex text-to-video with audio (480x832, 141 frames) on the free Colab TPU v5e-1 runtime. It contains code only: it downloads the weights from the official Hugging Face repositories, and you must comply with the MiniMax H3 Community License, including its territory restrictions. [`h3_colab_v5e_executed.ipynb`](notebooks/h3_colab_v5e_executed.ipynb) is the same notebook with the outputs of one end-to-end run, video included.
+[`notebooks/h3_colab_v5e.ipynb`](notebooks/h3_colab_v5e.ipynb) 在免费 Colab TPU v5e-1 上运行 Pika-H3-Flex 带音频文生视频(480x832,141 帧)。notebook 只含代码:权重从 Hugging Face 官方仓库下载,使用者须遵守 MiniMax H3 Community License,包括其中的地域限制。[`h3_colab_v5e_executed.ipynb`](notebooks/h3_colab_v5e_executed.ipynb) 是同一个 notebook 端到端跑过一次的带输出版本,含视频。
+
+In that run, with the int8 cache restored from a Cloud Storage bucket: cache restore ~10 min, weight download ~8 min, the generation step 66 min, of which `generate` itself was 81.5 s (denoise 48.5 s, video decode 5.1 s, audio 13.5 s). Most of the 66 min was reading the cache page by page from Colab's slow disk; the run predates commit `824a60d`, which reads it sequentially. The audio, decoded on the host, took 13.5 s there and did not hide behind the video decode as it does on a v5litepod-1.
+那次运行从 GCS 恢复 int8 缓存:恢复缓存约 10 分钟,下载权重约 8 分钟,生成那一步 66 分钟,其中 `generate` 本身 81.5 秒(去噪 48.5 秒、视频解码 5.1 秒、音频 13.5 秒)。66 分钟里大部分是从 Colab 慢盘按页读取缓存;那次运行早于提交 `824a60d`,该提交改为顺序读取。音频在主机上解码,在 Colab 上用了 13.5 秒,没有像在 v5litepod-1 上那样藏到视频解码后面。
 
 ### TPU v7x — 1, 2, 4 and 8 devices / TPU v7x(1、2、4、8 个 device)
 
