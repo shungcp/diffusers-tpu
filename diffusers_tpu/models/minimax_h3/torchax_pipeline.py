@@ -1604,7 +1604,7 @@ def main() -> None:
     # `DT_TX_VISION_ON_HOST=1`: language model on the TPU, vision tower
     # left on the host, to isolate the two when debugging.
     if os.environ.get("DT_TX_VISION_ON_HOST") != "1":
-      text_encoder_tpu.install_vision(pipe.text_encoder)
+      text_encoder_tpu.install_vision(pipe.text_encoder, mesh)
     else:
       print("  [text_encoder] vision tower left on host (DT_TX_VISION_ON_HOST=1)",
             flush=True)

@@ -175,20 +175,40 @@ def _splash_full(module, query, key, value, attention_mask, **kwargs):
     pad = ((0, 0), (0, 0), (0, padded - length), (0, 0))
     q, k, v = (jnp.pad(x, pad) for x in (q, k, v))
 
-  mask = masks.MultiHeadMask(
-      [masks.FullMask((padded, padded)) for _ in range(heads)]
-  )
-  splash = kernel.make_splash_mha(
-      mask,
-      block_sizes=kernel.BlockSizes(
-          block_q=block, block_kv=block, block_kv_compute=block
-      ),
-      head_shards=1,
-      q_seq_shards=1,
-  )
-  out = jax.vmap(splash)(q * module.scaling, k, v)
+  # Padded keys are masked out by segment: zero keys still score 0 and
+  # would otherwise take a share of every softmax.
+  ids = jnp.concatenate([jnp.zeros((length,), jnp.int32),
+                         jnp.ones((padded - length,), jnp.int32)])
+  segments = kernel.SegmentIds(q=ids, kv=ids)
+
+  def local(q_, k_, v_):
+    mask = masks.MultiHeadMask(
+        [masks.FullMask((padded, padded)) for _ in range(q_.shape[1])]
+    )
+    splash = kernel.make_splash_mha(
+        mask,
+        block_sizes=kernel.BlockSizes(
+            block_q=block, block_kv=block, block_kv_compute=block
+        ),
+        head_shards=1,
+        q_seq_shards=1,
+    )
+    return jax.vmap(lambda a, b, c: splash(a, b, c, segment_ids=segments))(q_, k_, v_)
+
+  q = q * module.scaling
+  if VISION_MESH is not None and heads % VISION_MESH.devices.size == 0:
+    # Heads split over the mesh (16 heads, 2 a chip): each chip runs its
+    # own heads' attention on the replicated sequence.
+    spec = P(None, "tp", None, None)
+    out = jax.shard_map(local, mesh=VISION_MESH, in_specs=(spec, spec, spec),
+                        out_specs=spec, check_vma=False)(q, k, v)
+  else:
+    out = local(q, k, v)
   out = out[:, :, :length, :dim]
   return env.j2t_iso(out).transpose(1, 2), None
+
+
+VISION_MESH = None
 
 
 def register_splash_attention() -> None:
@@ -639,13 +659,19 @@ class VisionTowerOnChip:
   weights ride in as an argument.
   """
 
-  def __init__(self, tower):
+  def __init__(self, tower, mesh=None):
     import torchax
 
+    global VISION_MESH
     self._tower = tower
     self._env = torchax.default_env()
-    chip = jax.devices()[0]
-    self._device = jax.sharding.SingleDeviceSharding(chip, memory_kind="device")
+    if mesh is not None and mesh.devices.size > 1:
+      # Replicated over the mesh; attention splits heads across it.
+      self._device = jax.sharding.NamedSharding(mesh, P())
+      VISION_MESH = mesh
+    else:
+      chip = jax.devices()[0]
+      self._device = jax.sharding.SingleDeviceSharding(chip, memory_kind="device")
     self._blocks = list(tower.blocks)
     self._params = [
         {
@@ -747,7 +773,7 @@ class VisionTowerOnChip:
     return forward
 
 
-def install_vision(text_encoder) -> VisionTowerOnChip | None:
-  """Puts the vision blocks on chip 0. Returns None when there is none."""
+def install_vision(text_encoder, mesh=None) -> VisionTowerOnChip | None:
+  """Puts the vision blocks on the mesh (chip 0 without one). None when there is none."""
   tower = getattr(text_encoder.model, "visual", None)
-  return VisionTowerOnChip(tower) if tower is not None else None
+  return VisionTowerOnChip(tower, mesh) if tower is not None else None
