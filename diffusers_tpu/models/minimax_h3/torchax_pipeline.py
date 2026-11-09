@@ -1065,10 +1065,15 @@ def pin_modulation(model: torch.nn.Module, mesh: jax.sharding.Mesh) -> None:
 
 
 def _install_jax_video_decode(pipe, snapshot, mesh):
-  """Replace the video decode step with `jax_video_decoder.VideoDecoder`."""
+  """Replace the video decode step with `jax_video_decoder.VideoDecoder`.
+
+  With two or more chips the audio decode moves to `audio_decode.AudioDecoder`
+  as well, dispatched before the video decode so it runs beside it (diffusers'
+  audio step ran after the video, 0.7 s at 768p/345 frames)."""
   import numpy as np
   import torchax
-  from diffusers.modular_pipelines.minimax_h3.decoders import MiniMaxH3VideoDecodeStep
+  from diffusers.modular_pipelines.minimax_h3.decoders import (
+      MiniMaxH3AudioDecodeStep, MiniMaxH3VideoDecodeStep)
 
   from .jax_video_decoder import VideoDecoder
 
@@ -1076,16 +1081,45 @@ def _install_jax_video_decode(pipe, snapshot, mesh):
   decoder = VideoDecoder(snapshot, mesh)
   print("  [vae] video decode: JAX decoder (jax_video_decoder)", flush=True)
 
+  def to_jax(t):
+    return env.t2j_iso(t) if isinstance(t, torchax.tensor.Tensor) else (
+        __import__("jax").numpy.asarray(t.float().numpy()))
+
+  audio, pending = None, {}
+  if mesh.devices.size >= 2:
+    from .audio_decode import AudioDecoder
+    audio = AudioDecoder(snapshot, devices=list(mesh.devices.flat))
+    print("  [vae] audio decode: JAX BigVGAN, beside the video decode", flush=True)
+
   def __call__(self, components, state):
     block_state = self.get_block_state(state)
-    latents = block_state.latents
-    lat = env.t2j_iso(latents) if isinstance(latents, torchax.tensor.Tensor) else (
-        __import__("jax").numpy.asarray(latents.float().numpy()))
-    block_state.videos = decoder.decode(lat)[None]
+    if audio is not None:
+      z = state.get("audio_latents")
+      if z is not None:
+        # (2, C, T) -> rows (2 * T, C), channel-major as `AudioDecoder` takes them.
+        z = np.asarray(to_jax(z), np.float32)
+        pending["audio"] = audio.start(z.transpose(0, 2, 1).reshape(-1, z.shape[1]))
+    block_state.videos = decoder.decode(to_jax(block_state.latents))[None]
     self.set_block_state(state, block_state)
     return components, state
 
   MiniMaxH3VideoDecodeStep.__call__ = __call__
+  if audio is None:
+    return
+  inner_audio = MiniMaxH3AudioDecodeStep.__call__
+
+  def audio_call(self, components, state):
+    out = pending.pop("audio", None)
+    if out is None:
+      return inner_audio(self, components, state)
+    block_state = self.get_block_state(state)
+    block_state.audio = torch.from_numpy(audio.finish(out))[None]
+    block_state.sampling_rate = components.audio_sampling_rate
+    self.set_block_state(state, block_state)
+    return components, state
+
+  MiniMaxH3AudioDecodeStep.__call__ = audio_call
+
 
 def main() -> None:
   ap = argparse.ArgumentParser()
