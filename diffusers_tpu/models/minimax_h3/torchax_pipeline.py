@@ -1245,9 +1245,10 @@ def main() -> None:
       "the last computed one. 0 disables.",
   )
   ap.add_argument("--block-q", type=int, default=KV_BLOCK)
-  # Swept at 128 granularity on the real 103,976 sequence; the
-  # autotuner's analytic pick is 4096/2048 and measures 4.3% slower.
-  ap.add_argument("--block-kv", type=int, default=KV_BLOCK)
+  # 0 picks what the JAX backend picks: 4096 past 241 frames (768p Pika
+  # 5.3 -> 5.2 s a call), 2048 below that and for 768p ref2va on 32 GiB
+  # chips.
+  ap.add_argument("--block-kv", type=int, default=0)
   ap.add_argument(
       "--jax-vae",
       action="store_true",
@@ -1508,6 +1509,11 @@ def main() -> None:
     jax.block_until_ready(_ballast)
     print(f"  [hbm] ballast {args.hbm_ballast_gib:.1f} GiB/chip", flush=True)
 
+  if not args.block_kv:
+    hbm = (jax.local_devices()[0].memory_stats() or {}).get("bytes_limit", 0) / 2**30
+    args.block_kv = (KV_BLOCK if args.num_frames <= 241 or (
+        args.workflow == "ref2va" and hbm < 48 and args.height >= 768) else 4096)
+    print(f"  [auto] --block-kv {args.block_kv}", flush=True)
   install_attention(
       transformer, mesh, args.fixed_m, args.block_q, args.block_kv,
       full_lane_rope=args.full_lane_rope,
@@ -1736,6 +1742,29 @@ def main() -> None:
       return out
 
     cls.__call__ = timed_call
+  if os.environ.get("DT_CLOCK_LEAVES") == "1":
+    # Every leaf block of the tree, the denoise loop's own steps included:
+    # shows where "rest (packing etc)" goes. Not summed into `outer`.
+    def leaves(block, path):
+      subs = getattr(block, "sub_blocks", None) or {}
+      if not subs:
+        yield path, block
+      for name, sub in subs.items():
+        yield from leaves(sub, f"{path}.{name}" if path else name)
+
+    for path, block in leaves(pipe.blocks, ""):
+      cls = type(block)
+      if cls in _patched:
+        continue
+      _patched.add(cls)
+
+      def timed_leaf(self, *a, _inner=cls.__call__, _label=f"leaf:{path}", **kw):
+        begin = time.perf_counter()
+        out = _inner(self, *a, **kw)
+        stage[_label] = stage.get(_label, 0.0) + time.perf_counter() - begin
+        return out
+
+      cls.__call__ = timed_leaf
   if hasattr(pipe.vae, "encode"):
     clock("video VAE encode", pipe.vae, "encode")
 
