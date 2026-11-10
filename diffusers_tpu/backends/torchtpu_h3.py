@@ -1730,19 +1730,21 @@ def _shard_decode(vae, verbose=print):
       base = f"/dev/shm/h3_decode/r{run_id}"
       os.makedirs(base, exist_ok=True)
       for i, j, t in mine:
-        a = t.to(torch.float32).numpy() if t.dtype == torch.bfloat16 else t.numpy()
+        # bf16 travels as its raw 16 bits: half the bytes of a float32
+        # copy, and the same values.
+        a = t.view(torch.int16).numpy() if t.dtype == torch.bfloat16 else t.numpy()
         tmp = f"{base}/{i}_{j}.{t.dtype}.tmp.npy"
         np.save(tmp, a)
         os.replace(tmp, f"{base}/{i}_{j}.{t.dtype}.npy")   # atomic write
       dist.barrier(group=group)
-      for name in os.listdir(base):
+      for name in (os.listdir(base) if assemble else []):
         if not name.endswith(".npy") or ".tmp." in name:
           continue
         ij, dt = name[:-4].split(".", 1)
         i, j = (int(x) for x in ij.split("_"))
         t = torch.from_numpy(np.load(f"{base}/{name}"))
         if dt == "torch.bfloat16":
-          t = t.to(torch.bfloat16)
+          t = t.view(torch.bfloat16)
         got[(i, j)] = t
       dist.barrier(group=group)          # delete only after everyone has read
       # Each rank deletes its own files, so no single rank lags into the
@@ -1767,6 +1769,17 @@ def _shard_decode(vae, verbose=print):
               f"decoded+to host {_t_cpu % 10000:.1f} gathered {_t_out % 10000:.1f}",
               flush=True)
 
+    _t_blend = time.perf_counter()
+    if not assemble:
+      # Rank 0 alone assembles the clip; the others hand back zero frames
+      # and wait for it at the end of the decode step (`decode_done`).
+      return torch.zeros(1, 3, 0, z.shape[-2] * vae.spatial_compression_ratio,
+                         z.shape[-1] * vae.spatial_compression_ratio)
+    threads = torch.get_num_threads()
+    if rank0_only:
+      # torchrun pins every rank to one thread; with the other ranks idle,
+      # rank 0 can use the host.
+      torch.set_num_threads(int(os.environ.get("DT_DECODE_THREADS", 32)))
     # Step 3: blend and trim exactly as `_host_decode` does, in order.
     decoded_chunks = []
     overlap = None
@@ -1791,10 +1804,68 @@ def _shard_decode(vae, verbose=print):
           else temporal_ratio
           for k in range(pad_tokens))
       dec = dec[:, :, :-pad_frames]
+    if os.environ.get("DT_DECODE_TIMING") == "1":
+      verbose(f"  [dec-time] rank {rank} blend {time.perf_counter() - _t_blend:.1f}s", flush=True)
+    if host_post:
+      return dec
+    torch.set_num_threads(threads)
     return dec.to(z.device)
 
+  # The clip is assembled on the host; sending it back to the chip for the
+  # postprocessing and then out again cost 3-6 s at 768p/345 on v7x-8.
+  host_post = os.environ.get("DT_DECODE_HOST_POST", "1") == "1"
+  # Only rank 0, the rank that writes the clip, reads the chunks and
+  # assembles it, with more host threads; the others wait at a barrier at
+  # the end of the decode step, which keeps the ranks in step for the next
+  # request (nothing after the decode touches the chip). 768p/345 decode
+  # 9.0 -> 6.0 s on v7x-8. `DT_DECODE_RANK0_ONLY=0`: every rank assembles.
+  rank0_only = host_post and os.environ.get("DT_DECODE_RANK0_ONLY", "1") == "1"
+  assemble = not rank0_only or rank == 0
+  if host_post:
+    def decode_done():
+      if rank0_only:
+        torch.set_num_threads(1)
+        dist.barrier(group=group)
+    _postprocess_where_decoded(decode_done)
   vae._decode = _decode
   verbose(f"  [shard-decode] rank {rank}/{world}, chunks split across ranks", flush=True)
+
+
+def _postprocess_where_decoded(done=lambda: None):
+  """Run the video decode step's postprocessing on the decoder output's device.
+
+  Same arithmetic as `MiniMaxH3VideoDecodeStep.__call__`; only the pixel
+  mean/std are placed next to the decoded video instead of on the
+  execution device, so a decode that returns a host tensor stays there.
+  """
+  import torch
+  from diffusers.modular_pipelines.minimax_h3.decoders import MiniMaxH3VideoDecodeStep
+
+  @torch.no_grad()
+  def __call__(self, components, state):
+    block_state = self.get_block_state(state)
+    device = components._execution_device
+    if block_state.output_type not in ("pil", "np", "pt"):
+      raise ValueError(f"`output_type` must be one of 'pil', 'np' or 'pt', got {block_state.output_type!r}")
+    latents_mean = torch.tensor(components.vae.config.latents_mean, device=device).view(1, -1, 1, 1, 1)
+    latents_std = torch.tensor(components.vae.config.latents_std, device=device).view(1, -1, 1, 1, 1)
+    latents = block_state.latents * latents_std + latents_mean
+    video = components.vae.decode(latents, return_dict=False)[0]
+    t0 = time.perf_counter()
+    pixel_mean = torch.tensor(components.pixel_mean, device=video.device).view(1, -1, 1, 1, 1)
+    pixel_std = torch.tensor(components.pixel_std, device=video.device).view(1, -1, 1, 1, 1)
+    video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)
+    t1 = time.perf_counter()
+    block_state.videos = components.video_processor.postprocess_video(video, output_type=block_state.output_type)
+    if os.environ.get("DT_DECODE_TIMING") == "1":
+      print(f"  [dec-time] rank {os.environ.get('RANK', 0)} postprocess {t1 - t0:.1f}s"
+            f" to {block_state.output_type} {time.perf_counter() - t1:.1f}s"
+            f" ({video.device}, {torch.get_num_threads()} threads)", flush=True)
+    done()
+    self.set_block_state(state, block_state)
+    return components, state
+
+  MiniMaxH3VideoDecodeStep.__call__ = __call__
 
 
 def _host_decode(vae):
