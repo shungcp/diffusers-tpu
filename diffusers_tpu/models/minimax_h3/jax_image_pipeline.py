@@ -274,7 +274,11 @@ def main():
   from ...safetensors_io import safe_open
 
   devices = jax.devices()[:args.chips or None]
-  mesh = jax.make_mesh((len(devices),), ("tp",), devices=devices)
+  mesh = jax.make_mesh(
+      (len(devices),), ("tp",),
+      devices=devices,
+      axis_types=(jax.sharding.AxisType.Auto,),
+  )
   dtype = jnp.bfloat16
   replicated = NamedSharding(mesh, P())
   dit_host = "pinned_host" if args.offload else None
@@ -388,9 +392,8 @@ def main():
   if adaln_mods_host is not None:
     # Put precomputed (6, 50, levels, 6*5376*3) modulations in HBM replicated
     adaln_mods = [
-        [jax.device_put(jnp.asarray(adaln_mods_host[s, b], dtype), replicated)
-         for b in range(50)]
-        for s in range(len(timesteps_np))
+        jax.device_put(jnp.asarray(m, dtype), replicated)
+        for m in adaln_mods_host
     ]
   print(f"  DiT loaded ({time.perf_counter() - t_dit:.1f}s)", flush=True)
 
@@ -492,9 +495,13 @@ def main():
         flush=True)
 
   # Compile text-only encoder jit
-  _text_jit = nnx.jit(
-      lambda m, i, c, s: m(i, c, s, stop_at_layer=TEXT_ENCODER_LAYER)
+  _text_graph, _text_state = nnx.split(encoder)
+  _text_jit_raw = jax.jit(
+      lambda st, i, c, s: nnx.merge(_text_graph, st)(
+          i, c, s, stop_at_layer=TEXT_ENCODER_LAYER
+      )
   )
+  _text_jit = lambda _m, i, c, s: _text_jit_raw(_text_state, i, c, s)
 
   def encode_prompt_and_refs():
     """Run text (+ optional vision + reference VAE) encoding."""

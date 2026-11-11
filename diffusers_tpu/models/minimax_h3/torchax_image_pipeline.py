@@ -201,7 +201,11 @@ def main():
 
   torchax.enable_globally()
   devices = jax.devices()[:args.chips or None]
-  mesh = jax.make_mesh((len(devices),), ("tp",), devices=devices)
+  mesh = jax.make_mesh(
+      (len(devices),), ("tp",),
+      devices=devices,
+      axis_types=(jax.sharding.AxisType.Auto,),
+  )
   dtype = jnp.bfloat16
   replicated = NamedSharding(mesh, P())
 
@@ -332,9 +336,13 @@ def main():
   timesteps_np = np.asarray([1.0 - s for s in PDD_SAMPLE_SIGMAS[:-1]], dtype=np.float32)
   sigmas_np = np.concatenate([1.0 - timesteps_np, np.zeros((1,), dtype=np.float32)])
 
-  _text_jit = nnx.jit(
-      lambda m, i, c, s: m(i, c, s, stop_at_layer=TEXT_ENCODER_LAYER)
+  _text_graph, _text_state = nnx.split(encoder)
+  _text_jit_raw = jax.jit(
+      lambda st, i, c, s: nnx.merge(_text_graph, st)(
+          i, c, s, stop_at_layer=TEXT_ENCODER_LAYER
+      )
   )
+  _text_jit = lambda _m, i, c, s: _text_jit_raw(_text_state, i, c, s)
 
   def encode_prompt_and_refs():
     if not args.reference:
