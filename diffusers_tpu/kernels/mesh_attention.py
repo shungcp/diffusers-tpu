@@ -235,7 +235,14 @@ def configure(
     # hence rowmax >= 0, which the fixed-m no-flush guarantee rests on.
     # Softmax is invariant to it.
     jkey = jkey - jnp.mean(jkey, axis=2, keepdims=True)
-    if jkey.shape[2] > _MAX_SPLASH_KV_LEN:
+    # Self-attention the stock path cannot place also goes to our kernel,
+    # which takes any length: an image's packed sequence (4,149 rows at
+    # 2048x2048) is under the threshold, and the stock path shards the query
+    # sequence, which the mesh does not divide. Calls that work today keep
+    # their route.
+    if jkey.shape[2] > _MAX_SPLASH_KV_LEN or (
+        jquery.shape[2] == jkey.shape[2] and jkey.shape[2] >= 1024
+        and jquery.shape[2] % mesh.size):
       local_attention = functools.partial(
           custom_splash_attention.attention,
           scale=scale,

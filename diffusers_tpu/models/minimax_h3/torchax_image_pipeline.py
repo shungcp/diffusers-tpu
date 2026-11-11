@@ -65,18 +65,6 @@ from .torchax_pipeline import (
 )
 
 
-def _ensure_compat():
-  repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-  compat_dir = os.path.join(repo_root, "compat", "diffusers_h3_image")
-  if os.path.isdir(compat_dir) and compat_dir not in sys.path:
-    sys.path.insert(0, compat_dir)
-  try:
-    import install as compat_install
-    compat_install.install()
-  except Exception:
-    pass
-
-
 class TorchaxImageTransformer(torch.nn.Module):
   """`MiniMaxH3ImageTransformer2DModel` compiled once across all 6 PDD steps via torchax."""
 
@@ -182,7 +170,6 @@ def parse_args():
 
 def main():
   args = parse_args()
-  _ensure_compat()
 
   import torchax
   from PIL import Image, ImageOps
@@ -314,8 +301,8 @@ def main():
   if args.reference:
     jvae.load_encoder(vae_encoder, enc_params, mesh=mesh, spec_for=lambda _n, _d: P())
     jvae.load_quant_conv(quant_conv, qc_params, prefix="quant_conv.")
-    for leaf in jax.tree.leaves(nnx.state(quant_conv, nnx.Param)):
-      leaf.value = jax.device_put(leaf.value, replicated)
+    _qc = nnx.state(quant_conv, nnx.Param)
+    nnx.update(quant_conv, jax.tree.map(lambda a: jax.device_put(a, replicated), _qc))
     eg_vae, es_vae = nnx.split(vae_encoder)
     qg_vae, qs_vae = nnx.split(quant_conv)
     enc_w = (es_vae, qs_vae)

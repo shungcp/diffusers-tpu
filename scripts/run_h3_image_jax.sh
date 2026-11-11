@@ -8,7 +8,11 @@ set -eu
 CC=${H3_IMAGE_COMPILE_CACHE:-$HOME/.cache/h3_image/jax_cc}
 mkdir -p "$CC"
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+# An image is a short sequence (4k-16k rows): keep the residual stream whole
+# so each block costs two all-reduces, instead of the partitioner's
+# sequence-sharded stream and its gathers (v6e-8, 4736x3552: denoise 7.42 -> 4.24 s).
+export DT_STREAM_SHARD=${DT_STREAM_SHARD:-whole}
 export LIBTPU_INIT_ARGS=${LIBTPU_INIT_ARGS:-"--xla_tpu_dvfs_p_state=7 --xla_tpu_enable_latency_hiding_scheduler=true --xla_tpu_enable_async_collective_fusion=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_overlap_compute_collective_tc=true --xla_enable_async_all_gather=true --xla_tpu_enable_async_all_to_all=true --xla_tpu_scoped_vmem_limit_kib=65536"}
 exec "${PYTHON:-python}" -u -m diffusers_tpu.models.minimax_h3.jax_image_pipeline \
-  --chips 8 --steps 6 --seed 42 --warmup --adaln-host \
+  --chips 8 --steps 6 --seed 42 --warmup --adaln-host --full-lane-rope --segments \
   --compile-cache "$CC" --out out --tag h3_image_jax "$@"

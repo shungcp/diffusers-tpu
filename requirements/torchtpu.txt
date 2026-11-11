@@ -11,4 +11,4 @@ safetensors==0.8.0
 accelerate==1.15.0
 numpy==2.5.4
 pillow==13.0.0
-diffusers @ git+https://github.com/huggingface/diffusers@cc8644b447d8f11074d3df06d0ee0e3e7c91bf75
+diffusers @ git+https://github.com/huggingface/diffusers@875373ac7f5856071e345a3e394c74efccc6b9e6

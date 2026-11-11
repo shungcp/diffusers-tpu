@@ -92,21 +92,8 @@ def parse_args():
   return args
 
 
-def _ensure_compat():
-  repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-  compat_dir = os.path.join(repo_root, "compat", "diffusers_h3_image")
-  if os.path.isdir(compat_dir) and compat_dir not in sys.path:
-    sys.path.insert(0, compat_dir)
-  try:
-    import install as compat_install
-    compat_install.install()
-  except Exception:
-    pass
-
-
 def main():
   args = parse_args()
-  _ensure_compat()
 
   import numpy as np
   import torch
@@ -184,7 +171,7 @@ def main():
       all_gather=getattr(tp_h3.init_parallel, "all_gather", None),
   )
   segmented_mod_tt.install(transformer, verbose=say)
-  ours_splash_tt.install(transformer, verbose=say)
+  ours_splash_tt.install(verbose=say)
   transformer.to(device)
   dit_aot = aot_dit.AotBlocks(
       transformer.transformer_blocks, dynamic=False, group=args.aot_group, verbose=say
@@ -227,7 +214,7 @@ def main():
       tags = np.ones((len(token_ids),), dtype=np.int64)
       with torch.no_grad():
         p_embeds = get_qwen3vl_prompt_embeds(
-            text_encoder, processor, token_ids, {}, text_encoder_layer=50
+            text_encoder, processor, token_ids, {}, text_encoder_layer=50, device=device
         )
       return p_embeds, tags, [], []
 
@@ -259,6 +246,7 @@ def main():
               "image_grid_thw": vision["image_grid_thw"].to(device=device),
           },
           text_encoder_layer=50,
+          device=device,
       )
     ref_grids = [(im.height // 16 // 2 * 2, im.width // 16 // 2 * 2) for im in ref_imgs]
     return p_embeds, np.asarray(token_tags, dtype=np.int64), ref_imgs, ref_grids
@@ -286,10 +274,10 @@ def main():
     """8-rank parallel batched 2D ViT tile decode + ICI all_gather + on-chip uint8."""
     ratio = vae.spatial_compression_ratio
     ys, yl, yo = vae._split_tiles(
-        z_4d.shape[-2] * ratio, vae.tile_sample_min_height, vae.tile_sample_min_overlap_height, ratio
+        z_4d.shape[-2] * ratio, vae.tile_sample_min_height, vae.tile_sample_min_overlap_height
     )
     xs, xl, xo = vae._split_tiles(
-        z_4d.shape[-1] * ratio, vae.tile_sample_min_width, vae.tile_sample_min_overlap_width, ratio
+        z_4d.shape[-1] * ratio, vae.tile_sample_min_width, vae.tile_sample_min_overlap_width
     )
     if not yo and not xo:
       with torch.no_grad():
@@ -328,7 +316,7 @@ def main():
       dec = vae._stitch_tiles(rows, yo, xo)
     rgb = (dec.float() * px_std + px_mean).clamp(0.0, 1.0)
     u8 = (rgb * 255.0).clamp(0.0, 255.0).to(torch.uint8)[0].permute(1, 2, 0).contiguous()
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     return u8.to("cpu").numpy()
 
   # Initial prompt encode & sequence packing
@@ -381,17 +369,17 @@ def main():
 
   u8_host = None
   for run_idx in range(args.runs):
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     t_run = time.perf_counter()
 
     t_te0 = time.perf_counter()
     prompt_embeds, _, _, _ = encode_prompt_and_refs()
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     t_te = time.perf_counter() - t_te0
 
     t_pipe0 = time.perf_counter()
     rows = prepare_initial_rows()
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
 
     t_den0 = time.perf_counter()
     with torch.no_grad():
@@ -416,7 +404,7 @@ def main():
           .reshape(1, 24, latent_h, latent_w)
       )
       z_4d = (z_4d.float() * lat_std + lat_mean).to(dtype)
-    torch.tpu.synchronize()
+    torch.accelerator.synchronize()
     t_den = time.perf_counter() - t_den0
 
     t_dec0 = time.perf_counter()

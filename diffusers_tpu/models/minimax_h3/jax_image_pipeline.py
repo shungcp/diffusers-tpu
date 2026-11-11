@@ -388,6 +388,12 @@ def main():
     with jax.set_mesh(mesh):
       dit.quantize_transformer_fp8(transformer, mesh=mesh)
     print("  [fp8] quantized DiT block linears to float8_e4m3fn", flush=True)
+  if os.environ.get("DT_SWIGLU_INTERLEAVE", "1" if os.environ.get("DT_STREAM_SHARD") == "whole" else "0") == "1":
+    # Each chip gets matching (value, gate) rows of `ff.proj`, so the SwiGLU
+    # split is local instead of an exchange across the mesh every block.
+    with jax.set_mesh(mesh):
+      dit.interleave_swiglu_weights(transformer, mesh=mesh)
+    print("  [swiglu] ff.proj rows interleaved per chip", flush=True)
   adaln_mods = None
   if adaln_mods_host is not None:
     # Put precomputed (6, 50, levels, 6*5376*3) modulations in HBM replicated
@@ -450,8 +456,8 @@ def main():
   if args.reference:
     jvae.load_encoder(vae_encoder, enc_params, mesh=mesh, spec_for=lambda _n, _d: P())
     jvae.load_quant_conv(quant_conv, qc_params, prefix="quant_conv.")
-    for leaf in jax.tree.leaves(nnx.state(quant_conv, nnx.Param)):
-      leaf.value = jax.device_put(leaf.value, replicated)
+    _qc = nnx.state(quant_conv, nnx.Param)
+    nnx.update(quant_conv, jax.tree.map(lambda a: jax.device_put(a, replicated), _qc))
     eg_vae, es_vae = nnx.split(vae_encoder)
     qg_vae, qs_vae = nnx.split(quant_conv)
     enc_w = (es_vae, qs_vae)
@@ -482,9 +488,21 @@ def main():
         qk_fp8=args.qk_fp8 or os.environ.get("DT_QK_FP8") == "1",
     )
 
+    # With the residual stream whole (`DT_STREAM_SHARD=whole`, the default in
+    # run_h3_image_jax.sh), leave the attention output split by heads:
+    # `to_out` contracts over the heads, so its partial sums meet in one
+    # all-reduce. `_on_mesh` constrains the output to the sequence layout,
+    # which costs a heads-to-sequence exchange and a gather on every block.
+    keep_heads = os.environ.get("DT_STREAM_SHARD") == "whole" and os.environ.get(
+        "DT_ATTN_KEEP_HEADS", "1") == "1"
+
     def sdpa(q, k, v):
       k = k - jnp.mean(k, axis=2, keepdims=True)
       with jax.default_matmul_precision("default"):
+        if keep_heads and q.shape[1] % mesh.size == 0:
+          qs, kvs, _ = mesh_attention._partition_specs(mesh, q.shape, True)
+          return jax.shard_map(local_attn, mesh=mesh, in_specs=(qs, kvs, kvs),
+                               out_specs=qs, check_vma=False)(q, k, v)
         return mesh_attention._on_mesh(local_attn, mesh, q, k, v, True)
 
   out_w, out_h, gen_w, gen_h, latent_h, latent_w = prepare_canvas(
@@ -722,6 +740,9 @@ def main():
       t_pipe0 = time.perf_counter()
       rows = prepare_initial_rows()
       jax.block_until_ready(rows)
+      prof = os.environ.get("H3_IMAGE_PROFILE_DIR") if run_idx == args.runs - 1 else None
+      if prof:
+        jax.profiler.start_trace(prof)
       t_den0 = time.perf_counter()
       for i in range(args.steps):
         rows = denoise_step(
@@ -731,6 +752,9 @@ def main():
       z_4d = unpatchify_and_denorm(rows)
       jax.block_until_ready(z_4d)
       t_den = time.perf_counter() - t_den0
+      if prof:
+        jax.profiler.stop_trace()
+        print(f"  [profile] denoise of the last request -> {prof}", flush=True)
 
       t_dec0 = time.perf_counter()
       u8_dev = decode_image_2d(z_4d)

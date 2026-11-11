@@ -3,8 +3,8 @@
 Fast inference for open diffusion models on Cloud TPU, built on top of [huggingface/diffusers](https://github.com/huggingface/diffusers).
 基于 [huggingface/diffusers](https://github.com/huggingface/diffusers),在 Cloud TPU 上高速运行开源扩散模型。
 
-Two models are supported today: **MiniMax-H3** (video + audio) and **Qwen-Image-2.1** (image).
-目前支持两个模型:**MiniMax-H3**(视频 + 音频)和 **Qwen-Image-2.1**(图像)。
+Three models are supported today: **MiniMax-H3** (video + audio), **MiniMax-H3-Image** (image and image editing) and **Qwen-Image-2.1** (image).
+目前支持三个模型:**MiniMax-H3**(视频 + 音频)、**MiniMax-H3-Image**(图像与图像编辑)和 **Qwen-Image-2.1**(图像)。
 
 MiniMax-H3 also runs with the six-step **Pika-H3-Flex** adapters.
 MiniMax-H3 还可以搭配 **Pika-H3-Flex** 六步适配器运行。
@@ -25,6 +25,8 @@ Every model can run through three backends, so you can pick the one that fits yo
 Newest first. Each entry links a date to what changed.
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-11** — MiniMax-H3-Image (six-step text-to-image and editing) on all three backends; diffusers moves to `875373a`, which ships the model, for every model here (JAX, torchax and Qwen-Image outputs unchanged). On a v6e-8 the JAX backend generates a 2048x2048 image in **0.68 s** and a 4736x3552 one in **3.08 s** ([numbers](#minimax-h3-image--six-steps)). An image is a short sequence, so its JAX transformer keeps the residual stream whole, leaves the attention output split by heads and gives each chip matching SwiGLU rows: every block then needs two plain all-reduces (4736x3552 denoise 7.42 -> 2.99 s).
+  **2026-11-11** — MiniMax-H3-Image(六步文生图与图像编辑)支持三种后端;diffusers 升级到包含该模型的 `875373a`,本仓库所有模型同步升级(JAX、torchax 和 Qwen-Image 输出不变)。v6e-8 上 JAX 后端生成 2048x2048 图像 **0.68 秒**,4736x3552 **3.08 秒**([数字](#minimax-h3-image--six-steps))。图像序列短,其 JAX transformer 让残差流整份常驻、注意力输出保持按头切分、SwiGLU 行按 chip 交错:每个 block 只需两次普通 all-reduce(4736x3552 去噪 7.42 -> 2.99 秒)。
 - **2026-11-11** — torch_tpu 2-slab post-attention pipeline (`DT_POST_ATTN_PIPE=1`): splits `to_out -> all_reduce -> norm2 -> FFN -> all_reduce` into two 4096-aligned slabs so each slab's `all_reduce` overlaps the other's `norm2 + FFN` compute; 768p Pika-H3-Flex 34.6 -> **32.0 s** on a v7x-8 (denoise 29.2 -> 26.8 s, PSNR 21.8 dB; off on v6e-8 where 32 GB HBM is full; [details](docs/tpu_v7x.md)).
   **2026-11-11** — torch_tpu 注意力后 2-slab 流水线(`DT_POST_ATTN_PIPE=1`):将 `to_out -> all_reduce -> norm2 -> FFN -> all_reduce` 切为两个 4096 对齐分块,使两块的 `all_reduce` 与对方的 `norm2 + FFN` 计算重叠;v7x-8 上 768p Pika-H3-Flex 从 34.6 秒降至 **32.0 秒**(去噪 29.2 -> 26.8 秒,PSNR 21.8 dB;v6e-8 每 chip 32 GB HBM 不足故保持关闭;[详情](docs/tpu_v7x.md))。
 - **2026-11-11** — torch_tpu DiT block: fuse `residual + gate * x` before `index_copy` in segmented modulation and transpose Q/K/V to `(B, H, S, D)` before `norm_q`/`norm_k` and RoPE. Same frames; 768p Pika-H3-Flex 35.1 -> **34.6 s** on a v7x-8, and on a v6e-8 Pika 47.6 -> **46.6 s**, lossy text-to-video 45.1 -> **43.2 s**.
@@ -82,8 +84,8 @@ Hardware-specific architecture notes, optimization ledgers, and XLA flag guides 
 Measured 2026-11-02 to 2026-11-04 on a TPU v6e-8 (8 chips); warm requests, with the model already loaded and compiled.
 测于 2026-11-02 至 2026-11-04,TPU v6e-8(8 个 chip);均为热请求时间,模型已加载并编译完成。
 
-Software: jax 0.12.0.1, libtpu 0.0.52 (0.0.51 for torch_tpu; JAX numbers re-measured on 0.0.52, 2026-11-07), torch_tpu 0.2.0, diffusers `cc8644b` (see `requirements/`).
-软件版本:jax 0.12.0.1、libtpu 0.0.52(torch_tpu 用 0.0.51;JAX 数字已于 2026-11-07 在 0.0.52 上重测)、torch_tpu 0.2.0、diffusers `cc8644b`(见 `requirements/`)。
+Software: jax 0.12.0.1, libtpu 0.0.52 (0.0.51 for torch_tpu; JAX numbers re-measured on 0.0.52, 2026-11-07), torch_tpu 0.2.0, diffusers `875373a` (see `requirements/`).
+软件版本:jax 0.12.0.1、libtpu 0.0.52(torch_tpu 用 0.0.51;JAX 数字已于 2026-11-07 在 0.0.52 上重测)、torch_tpu 0.2.0、diffusers `875373a`(见 `requirements/`)。
 
 ### MiniMax-H3 — 768x1344, 345 frames (14.4 s), 20 steps
 
@@ -115,6 +117,20 @@ The resident server keeps the model on the chips between requests: 34.0 s (text)
 
 All three backends use all 8 chips for Qwen-Image.
 Qwen-Image 的三种后端都使用全部 8 个 chip。
+
+### MiniMax-H3-Image — six steps
+
+v6e-8, warm requests (text encoder, transformer and decoder resident), end to end including text encoding and decode.
+v6e-8,暖请求(文本编码器、transformer 与解码器常驻),端到端,含文本编码与解码。
+
+| | JAX | torchax | torch_tpu |
+|---|---|---|---|
+| 2048x2048 (4,149 rows / 行) | **0.68 s** | 1.04 s | 1.2–1.6 s |
+| 4736x3552 (16,481 rows / 行) | **3.08 s** | 4.00 s | 4.24 s |
+| edit 2048x2048, one reference / 编辑,一张参考图 | **1.94 s** | 3.02 s | |
+
+Six steps make the images chaotic in bfloat16: changing only an attention block size moves the latents to a cosine of 0.85 by the fifth step, so backends agree on scene and quality, not on pixels (the diffusers documentation says the same).
+六步采样在 bfloat16 下对微小差异很敏感:只改注意力分块大小,第五步的 latents 余弦相似度就降到 0.85,因此各后端的画面内容与质量一致,但像素不同(diffusers 文档也这样说明)。
 
 ### Pika-H3-Flex — six steps, JAX backend
 
@@ -348,6 +364,21 @@ bash scripts/run_qwen.sh jax     --prompt "..." --num_inference_steps 4
 bash scripts/run_qwen.sh torchax --prompt "..."
 bash scripts/run_qwen.sh torchtpu --prompt "..."
 ```
+
+---
+
+## Run MiniMax-H3-Image / 运行 MiniMax-H3-Image
+
+```bash
+bash scripts/run_h3_image_jax.sh --size 2048x2048 --prompt "..."
+bash scripts/run_h3_image_jax.sh --size 4736x3552 --prompt "..."
+bash scripts/run_h3_image_jax.sh --size 4096x4096 --reference ref.png --prompt "Keep everything in <Picture 1> ..."
+bash scripts/run_h3_image_torchax.sh --size 2048x2048 --prompt "..."
+bash scripts/run_h3_image_torchtpu.sh --size 2048x2048 --prompt "..."     # torch_tpu environment
+```
+
+The text encoder is the same file as MiniMax-H3's (the Hub deduplicates it), and the prompt is used verbatim.
+文本编码器与 MiniMax-H3 是同一个文件(Hub 会去重),提示词原样使用。
 
 ---
 
