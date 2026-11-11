@@ -45,3 +45,31 @@
 > Unlike `v7x-8` (95 GiB HBM per TensorCore device), each `v6e` chip has 32 GiB HBM. Keeping the `7.3 GiB` sharded Text Encoder resident alongside the `7.5 GiB` sharded DiT and VAE leaves insufficient HBM headroom for the `103,989`-token `768p` denoising activations, so `torchtpu_h3.py` enables `DT_RESIDENT_TEXT` automatically only on `v7x` (`TORCH_TPU_TOPOLOGY == "2,2,1,2"`).
 
 > **`DT_POST_ATTN_PIPE=1` on `v6e-8`**: the two-slab post-attention pipeline (`52aba21`) runs out of HBM in the first 768p request (`RuntimeProgramAllocationFailure`), and the process then hangs instead of exiting; keep it off on `v6e`. On `v6e` the in-graph all-reduce is synchronous, so the slabs would not overlap anyway.
+
+## 4. MiniMax-H3-Image on `v6e-8` / `v6e-8` 上的 MiniMax-H3-Image
+
+Warm requests, end to end (text encoding, six DiT steps, decode). / 暖请求,端到端(文本编码、六步 DiT、解码)。
+
+| Size / 尺寸 | JAX | `torchax` | `torch_tpu` |
+| :--- | :---: | :---: | :---: |
+| 2048x2048 t2i | **0.68 s** | 0.74 s | 0.75 s |
+| 4736x3552 t2i | **3.08 s** | 3.12 s | 3.36 s |
+| 2048x2048 edit, 1 reference / 编辑 | **1.94 s** | 2.10 s | — |
+| 4096x4096 edit, 1 reference / 编辑 | **4.37 s** | — | — |
+
+An image is a 4k-16k-row sequence, so eight-way tensor parallelism is communication-bound. What made the JAX transformer 2.4x faster at 4736x3552 (denoise 7.42 -> 2.99 s), in order:
+图像是 4k-16k 行的短序列,8 路张量并行受通信限制。JAX transformer 在 4736x3552 上快 2.4 倍(去噪 7.42 -> 2.99 秒)依次来自:
+
+| Change / 改动 | Denoise / 去噪 |
+| :--- | :---: |
+| Partitioner's default (sequence-sharded stream) / 分区器默认(按序列切的残差流) | 7.42 s |
+| `DT_STREAM_SHARD=whole` (residual stream replicated) / 残差流整份复制 | 4.24 s |
+| `--full-lane-rope`, `--segments` | 4.01 s |
+| Attention output left split by heads (`DT_ATTN_KEEP_HEADS`) / 注意力输出保持按头切 | 3.74 s |
+| SwiGLU rows interleaved per chip (`DT_SWIGLU_INTERLEAVE`) / SwiGLU 行按 chip 交错 | **2.99 s** |
+
+Each block then holds two plain all-reduces and nothing else crosses the mesh; on v6e those do not overlap compute (about 40% of a step). Tried and dropped: sequence-parallel stream with the same fixes (4.54 s), Pallas SwiGLU FFN (3.22 s), hand-written collective matmul and XLA flag variants (no change).
+此后每个 block 只有两次普通 all-reduce,再无其他跨 chip 交换;v6e 上 all-reduce 不与计算重叠(约占一步的 40%)。试过但放弃:同样修正下的序列并行残差流(4.54 秒)、Pallas SwiGLU FFN(3.22 秒)、手写 collective matmul 与 XLA 标志组合(无变化)。
+
+Fewer chips / 更少的 chip: 4 chips with `--text-int8` 0.93 s / 4.38 s; one v5e chip with `--offload --int8-weights --free-text-after` 11.4 s / 43.7 s (2048x2048 / 4736x3552).
+4 个 chip 加 `--text-int8`:0.93 / 4.38 秒;单个 v5e chip 加 `--offload --int8-weights --free-text-after`:11.4 / 43.7 秒(2048x2048 / 4736x3552)。
