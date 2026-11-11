@@ -127,7 +127,7 @@ v6e-8,暖请求(文本编码器、transformer 与解码器常驻),端到端,含�
 |---|---|---|---|
 | 2048x2048 (4,149 rows / 行) | **0.68 s** | 0.74 s | 0.75 s |
 | 4736x3552 (16,481 rows / 行) | **3.08 s** | 3.12 s | 3.36 s |
-| edit 2048x2048, one reference / 编辑,一张参考图 | **1.94 s** | 2.10 s | |
+| edit 2048x2048, one reference / 编辑,一张参考图 | **1.94 s** | 2.10 s | 3.22 s |
 | edit 4096x4096, one reference / 编辑,一张参考图 | **4.37 s** | | |
 
 On 4 chips (a v6e-4) add `--chips 4 --text-int8`: the text encoder is kept on chip in int8 (first 50 layers) beside the bf16 transformer. 2048x2048 in 0.93 s, 4736x3552 in 4.38 s. `--text-offload` keeps it in host memory instead and streams it each request (+0.5 s).

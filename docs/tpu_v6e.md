@@ -54,7 +54,7 @@ Warm requests, end to end (text encoding, six DiT steps, decode). / 暖请求,�
 | :--- | :---: | :---: | :---: |
 | 2048x2048 t2i | **0.68 s** | 0.74 s | 0.75 s |
 | 4736x3552 t2i | **3.08 s** | 3.12 s | 3.36 s |
-| 2048x2048 edit, 1 reference / 编辑 | **1.94 s** | 2.10 s | — |
+| 2048x2048 edit, 1 reference / 编辑 | **1.94 s** | 2.10 s | 3.22 s |
 | 4096x4096 edit, 1 reference / 编辑 | **4.37 s** | — | — |
 
 An image is a 4k-16k-row sequence, so eight-way tensor parallelism is communication-bound. What made the JAX transformer 2.4x faster at 4736x3552 (denoise 7.42 -> 2.99 s), in order:
