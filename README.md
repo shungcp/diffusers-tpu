@@ -25,8 +25,8 @@ Every model can run through three backends, so you can pick the one that fits yo
 Newest first. Each entry links a date to what changed.
 最新的在最上面。每条记录写明日期和变化。
 
-- **2026-11-10** — torch_tpu on TPU v7x-8: pipelined `/dev/shm` chunk writes with parallel host reads and 32-thread in-place float32 postprocessing with a zero-copy `.numpy()` view (768p Pika-H3-Flex 40.3 -> 38.1 s, decode 6.0 -> 4.7 s, gather 1.9 -> 0.5 s, `to np` 1.0 -> 0.0 s); keeping the sharded text encoder resident in v7x's 95 GB HBM with `--no-offload` instead of parking 369 storages and clearing the compile cache each request (38.1 -> 35.7 s, denoise/other 32.4 -> 29.8 s); and splitting the 4 tail decode chunks' spatial tiles across all 8 ranks (35.7 -> **35.1 s**, decode 4.7 -> 4.1 s, gather 0.6 -> 0.3 s). Bit-identical frames (`max|d| = 0`).
-  **2026-11-10** — TPU v7x-8 上的 torch_tpu 进一步优化:解码分片边算边写 `/dev/shm` 并由 rank 0 多线程并行读取、32 线程原地完成 float32 后处理并以零拷贝视图转 numpy(768p Pika-H3-Flex 40.3 -> 38.1 秒,解码 6.0 -> 4.7 秒,`gather` 1.9 -> 0.5 秒,`to np` 1.0 -> 0.0 秒);在 v7x 95 GB HBM 下(`--no-offload`)将分片后的文本编码器常驻 chip,不再每条请求来回搬移 369 个张量及清理编译缓存(38.1 -> 35.7 秒,`denoise/other` 32.4 -> 29.8 秒);并将末尾 4 个解码时间块的空间 tile 均摊到全部 8 张卡(35.7 -> **35.1 秒**,解码 4.7 -> 4.1 秒,`gather` 0.6 -> 0.3 秒)。生成帧逐位完全一致(`max|d| = 0`)。
+- **2026-11-10** — torch_tpu on TPU v7x-8: pipelined `/dev/shm` chunk writes with parallel host reads and 32-thread in-place float32 postprocessing with a zero-copy `.numpy()` view (768p Pika-H3-Flex 40.3 -> 38.1 s, decode 6.0 -> 4.7 s, gather 1.9 -> 0.5 s, `to np` 1.0 -> 0.0 s); keeping the sharded text encoder resident in v7x's 95 GB HBM with `--no-offload` instead of parking 369 storages and clearing the compile cache each request (38.1 -> 35.7 s, denoise/other 32.4 -> 29.8 s); and splitting the 4 tail decode chunks' spatial tiles across all 8 ranks (35.7 -> **35.1 s**, decode 4.7 -> 4.1 s, gather 0.6 -> 0.3 s). Bit-identical frames (`max|d| = 0`). The decode changes also apply on a v6e-8 (the resident text encoder does not): Pika 48.7 -> 47.4 s, lossy text-to-video 46.3 -> 44.5 s, lossy reference-to-video 80.0 -> 78.0 s, same frames.
+  **2026-11-10** — TPU v7x-8 上的 torch_tpu 进一步优化:解码分片边算边写 `/dev/shm` 并由 rank 0 多线程并行读取、32 线程原地完成 float32 后处理并以零拷贝视图转 numpy(768p Pika-H3-Flex 40.3 -> 38.1 秒,解码 6.0 -> 4.7 秒,`gather` 1.9 -> 0.5 秒,`to np` 1.0 -> 0.0 秒);在 v7x 95 GB HBM 下(`--no-offload`)将分片后的文本编码器常驻 chip,不再每条请求来回搬移 369 个张量及清理编译缓存(38.1 -> 35.7 秒,`denoise/other` 32.4 -> 29.8 秒);并将末尾 4 个解码时间块的空间 tile 均摊到全部 8 张卡(35.7 -> **35.1 秒**,解码 4.7 -> 4.1 秒,`gather` 0.6 -> 0.3 秒)。生成帧逐位完全一致(`max|d| = 0`)。解码部分的改动在 v6e-8 上同样生效(文本编码器常驻不生效):Pika 48.7 -> 47.4 秒,有损文生视频 46.3 -> 44.5 秒,有损参考图生视频 80.0 -> 78.0 秒,帧不变。
 - **2026-11-10** — torch_tpu video decode: the clip is assembled and postprocessed on the host by rank 0 alone, instead of on every rank and then sent back to the chip and out again; chunks cross `/dev/shm` as raw bf16. Same frames. 768p Pika-H3-Flex 44.3 -> 40.3 s on a v7x-8 (decode 9.0 -> 6.0 s); on a v6e-8 Pika 51.3 -> 48.7 s, lossy text-to-video 48.3 -> 46.1 s, lossy reference-to-video 82.2 -> 79.7 s.
   **2026-11-10** — torch_tpu 视频解码:片段只由 rank 0 在主机上拼接和后处理,不再每个 rank 各做一遍、再送回 chip 又拷出来;片段经 `/dev/shm` 以 bf16 原样交换。帧逐位不变。v7x-8 上 768p Pika-H3-Flex 44.3 -> 40.3 秒(解码 9.0 -> 6.0 秒);v6e-8 上 Pika 51.3 -> 48.7 秒,有损文生视频 48.3 -> 46.1 秒,有损参考图生视频 82.2 -> 79.7 秒。
 - **2026-11-09** — torchax picks the attention KV block the way the JAX backend does (4096 past 241 frames): 768p Pika-H3-Flex 39.3 -> 38.5 s, lossy text-to-video 35.1 -> 34.8 s on a v6e-8. A different block changes the bf16 accumulation order, so the output changes too (video DINO 0.936 against 2048; another bit-level change, dropping an optimization barrier, gives 0.968), with the same scene and quality.
@@ -77,9 +77,9 @@ Software: jax 0.12.0.1, libtpu 0.0.52 (0.0.51 for torch_tpu; JAX numbers re-meas
 | | JAX | torchax | torch_tpu |
 |---|---|---|---|
 | text-to-video, lossless / 文生视频,无损 | **110.0 s** | 110.0 s | 135.2 s |
-| text-to-video, lossy / 文生视频,有损 | **34.0 s** | 34.8 s | 46.1 s |
+| text-to-video, lossy / 文生视频,有损 | **34.0 s** | 34.8 s | 44.5 s |
 | reference-to-video, lossless / 参考图生视频,无损 | **139.2 s** | 186.7 s | 189 s |
-| reference-to-video, lossy / 参考图生视频,有损 | **51.2 s** | 51.6 s | 79.7 s |
+| reference-to-video, lossy / 参考图生视频,有损 | **51.2 s** | 51.6 s | 78.0 s |
 
 JAX times include decoding the audio; the two lossless JAX numbers were measured before it was added (about 0.1 s more).
 JAX 的时间包含音频解码;两个无损 JAX 数字是加入音频解码之前测的(会多约 0.1 秒)。
@@ -372,7 +372,7 @@ bash scripts/run_h3_torchtpu.sh t2va --pika-adapter $PIKA/fl2va --prompt "..."
 
 | Pika-H3-Flex, 768x1344, 345 frames | JAX | torchax | torch_tpu |
 |---|---|---|---|
-| text-to-video / 文生视频 | **36.5 s** | 38.5 s | 48.7 s |
+| text-to-video / 文生视频 | **36.5 s** | 38.5 s | 47.4 s |
 | reference-to-video / 参考图生视频 | **51.1 s** | 67.0 s | 79.4 s |
 
 The adapter is merged into the weights while loading, so the denoising step costs the same as the base model.

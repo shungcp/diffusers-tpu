@@ -1798,7 +1798,12 @@ def _shard_decode(vae, verbose=print):
               row_list = []
               for c_idx in range(len(xs)):
                 t_fin = f"{base}/tail_{i_tail}_{r_idx}_{c_idx}.{dt_str}.npy"
+                waited = time.perf_counter()
                 while not os.path.exists(t_fin):
+                  # A rank that died would otherwise leave rank 0 waiting
+                  # here forever, with nothing in the log.
+                  if time.perf_counter() - waited > 600:
+                    raise RuntimeError(f"tail tile {t_fin} never arrived")
                   time.sleep(0.001)
                 loaded = torch.from_numpy(np.load(t_fin))
                 if dt_str == "torch.bfloat16":
