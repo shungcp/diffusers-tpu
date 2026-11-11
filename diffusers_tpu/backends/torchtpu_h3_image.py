@@ -208,14 +208,48 @@ def main():
 
   from diffusers.modular_pipelines.minimax_h3.encoders import get_qwen3vl_prompt_embeds
 
+  # The text tower op by op cost 0.35-0.75 s a request. Compiled, with the
+  # ids padded to a bucket of 256 so prompts of similar length share one
+  # program: the tower is causal, so trailing pad tokens change nothing
+  # before them, and the real rows are sliced back out.
+  _text_fns = {}
+
+  def compiled_text(token_ids):
+    n = len(token_ids)
+    bucket = -(-n // 256) * 256
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    ids = torch.tensor([token_ids + [pad_id] * (bucket - n)], dtype=torch.long, device=device)
+    mm = torch.tensor(processor.create_mm_token_type_ids(ids.cpu().tolist()), dtype=torch.long,
+                      device=device)
+    fn = _text_fns.get(bucket)
+    if fn is None:
+      def text_fwd(ids_, mm_):
+        out = text_encoder.model(input_ids=ids_, attention_mask=torch.ones_like(ids_),
+                                 mm_token_type_ids=mm_, use_cache=False, output_hidden_states=True)
+        return out.hidden_states[50]
+      fn = torch.compile(text_fwd, backend="tpu", dynamic=False)
+      _text_fns[bucket] = fn
+    return fn(ids, mm)[:, :n].to(dtype)
+
   def encode_prompt_and_refs():
     if not args.reference:
       token_ids = tokenizer(args.prompt, add_special_tokens=False)["input_ids"][:4096]
       tags = np.ones((len(token_ids),), dtype=np.int64)
       with torch.no_grad():
-        p_embeds = get_qwen3vl_prompt_embeds(
-            text_encoder, processor, token_ids, {}, text_encoder_layer=50, device=device
-        )
+        if os.environ.get("DT_TEXT_COMPILE", "1") == "1":
+          p_embeds = compiled_text(token_ids)
+          if os.environ.get("DT_TEXT_CHECK") == "1":
+            ref = get_qwen3vl_prompt_embeds(
+                text_encoder, processor, token_ids, {}, text_encoder_layer=50, device=device)
+            d = (p_embeds.float() - ref.float()).abs()
+            a_, b_ = p_embeds.float().flatten(), ref.float().flatten()
+            say(f"  [text-check] cos {float((a_ @ b_) / (a_.norm() * b_.norm())):.6f}", flush=True)
+            say(f"  [text-check] compiled vs eager: max|d| {float(d.max()):.3g}, "
+                f"mean|d| {float(d.mean()):.3g}, |ref| {float(ref.float().abs().mean()):.3g}", flush=True)
+        else:
+          p_embeds = get_qwen3vl_prompt_embeds(
+              text_encoder, processor, token_ids, {}, text_encoder_layer=50, device=device
+          )
       return p_embeds, tags, [], []
 
     raw_imgs = [ImageOps.exif_transpose(Image.open(p)).convert("RGB") for p in args.reference]
