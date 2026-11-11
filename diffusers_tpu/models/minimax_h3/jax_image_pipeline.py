@@ -83,7 +83,7 @@ def parse_args():
   p.add_argument("--full-lane-rope", action="store_true", default=True,
                  help="Use 128-lane matrix multiply for RoPE")
   p.add_argument("--pad-sequence-to", type=int,
-                 default=0 if os.environ.get("DT_STREAM_SHARD", "whole") == "whole" else 128,
+                 default=0 if os.environ.get("DT_STREAM_SHARD") == "whole" else 128,
                  help="Pad packed sequence length up to a multiple of this")
   p.add_argument("--block-q", type=int, default=2048)
   p.add_argument("--block-kv", type=int, default=4096)
