@@ -197,6 +197,8 @@ def install(verbose=print, fixed_m: bool = True) -> bool:
           _already_bhsd=True,
       )
       out = out.flatten(2, 3).type_as(query)
+      if os.environ.get("DT_POST_ATTN_PIPE") == "1":
+        return out
       out = attn.to_out[0](out)
       out = attn.to_out[1](out)
       return out

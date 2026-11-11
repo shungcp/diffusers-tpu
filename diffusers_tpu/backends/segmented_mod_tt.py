@@ -130,6 +130,8 @@ def install(transformer, verbose=print) -> bool:
     ], dim=1)
     return out.index_copy(1, head_idx, head)
 
+  from diffusers_tpu.backends.tp_h3 import init_parallel
+
   def forward(self, hidden_states, temb, adaln_indices, rotary_emb,
               attention_mask=None, **kw):
     if _RUNS is None and not torch.compiler.is_compiling():
@@ -161,6 +163,51 @@ def install(transformer, verbose=print) -> bool:
         self.norm1(hidden_states),
         lambda x, i: x * (1.0 + scale_msa[i]) + shift_msa[i], "msa")
     attn_output = self.attn(norm_hidden_states, rotary_emb, attention_mask)
+
+    group_name = getattr(init_parallel, "group_name", None)
+    if (os.environ.get("DT_POST_ATTN_PIPE") == "1"
+        and group_name is not None
+        and torch.compiler.is_compiling()
+        and hidden_states.shape[1] >= 16384):
+      S = hidden_states.shape[1]
+      S0 = ((S // 2) // 4096) * 4096
+      runs_0 = (*runs[:-1], (runs[-1][0], S0, runs[-1][2]))
+      bulk = runs[-1][2]
+      to_out_lin = self.attn.to_out[0]
+      ff_in_act = self.ff.net[0]
+      ff_out_lin = self.ff.net[2]
+      F_linear = torch.nn.functional.linear
+
+      a0, a1 = attn_output[:, :S0], attn_output[:, S0:]
+      r0, r1 = residual[:, :S0], residual[:, S0:]
+
+      u0 = F_linear(a0, to_out_lin.weight, to_out_lin.bias)
+      ar1_0 = torch.ops._c10d_functional.all_reduce(u0, "sum", group_name)
+
+      u1 = F_linear(a1, to_out_lin.weight, to_out_lin.bias)
+      ar1_1 = torch.ops._c10d_functional.all_reduce(u1, "sum", group_name)
+
+      u0 = torch.ops._c10d_functional.wait_tensor(ar1_0)
+      h0 = (by_runs_add(r0, u0, gate_msa, runs_0, head_idx)
+            if head_idx is not None else (r0 + gate_msa[bulk] * u0))
+      n0 = by_runs(self.norm2(h0), runs_0,
+                   lambda x, i: x * (1.0 + scale_mlp[i]) + shift_mlp[i])
+      f0 = F_linear(ff_in_act(n0), ff_out_lin.weight, ff_out_lin.bias)
+      ar2_0 = torch.ops._c10d_functional.all_reduce(f0, "sum", group_name)
+
+      u1 = torch.ops._c10d_functional.wait_tensor(ar1_1)
+      h1 = r1 + gate_msa[bulk] * u1
+      n1 = self.norm2(h1) * (1.0 + scale_mlp[bulk]) + shift_mlp[bulk]
+      f1 = F_linear(ff_in_act(n1), ff_out_lin.weight, ff_out_lin.bias)
+      ar2_1 = torch.ops._c10d_functional.all_reduce(f1, "sum", group_name)
+
+      f0 = torch.ops._c10d_functional.wait_tensor(ar2_0)
+      out0 = (by_runs_add(h0, f0, gate_mlp, runs_0, head_idx)
+              if head_idx is not None else (h0 + gate_mlp[bulk] * f0))
+      f1 = torch.ops._c10d_functional.wait_tensor(ar2_1)
+      out1 = h1 + gate_mlp[bulk] * f1
+      return torch.cat([out0, out1], dim=1)
+
     if fused_res and (part == "all" or part == "msa") and head_idx is not None:
       hidden_states = by_runs_add(residual, attn_output, gate_msa, runs, head_idx)
     else:
