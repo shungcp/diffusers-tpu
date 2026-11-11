@@ -18,7 +18,7 @@
 | Workflow / 模式 | JAX | `torchax` | `torch_tpu` |
 | :--- | :---: | :---: | :---: |
 | **text-to-video, lossless / 文生视频, 无损** | **110.0 s** | 110.0 s | 135.2 s |
-| **text-to-video, lossy / 文生视频, 有损** | **34.0 s** | 34.8 s | 44.5 s |
+| **text-to-video, lossy / 文生视频, 有损** | **34.0 s** | 34.8 s | 43.2 s |
 | **reference-to-video, lossless / 参考图生视频, 无损** | **139.2 s** | 186.7 s | 189.0 s |
 | **reference-to-video, lossy / 参考图生视频, 有损** | **51.2 s** | 51.6 s | 78.0 s |
 
@@ -26,7 +26,7 @@
 
 | Workflow / 模式 | JAX | `torchax` | `torch_tpu` |
 | :--- | :---: | :---: | :---: |
-| **text-to-video (`t2va`) / 文生视频** | **36.5 s** (`38.3 s` w/o fused uint8 decode) | **38.5 s** | **47.4 s** |
+| **text-to-video (`t2va`) / 文生视频** | **36.5 s** (`38.3 s` w/o fused uint8 decode) | **38.5 s** | **46.6 s** |
 | **reference-to-video (`ref2va`) / 参考图生视频** | **51.1 s** | — | — |
 
 ---
@@ -39,6 +39,9 @@
 | **2026-11-08** | 8-chip TP Text Encoder (`--shard-text --free-text-after`) + resident VAE | `51.3 s` | `49.8 s` | `82.2 s` | `DINO 0.967` |
 | **2026-11-10** (`c841add`) | Raw `bf16` `/dev/shm` chunk exchange + Rank 0-only 32-thread host postprocessing (`decode: 9.0 -> 6.0 s`) | `48.7 s` | `46.1 ~ 46.3 s` | `79.7 ~ 80.0 s` | **`identical=True`** (`max\|d\|=0`) |
 | **2026-11-10** (`91d89fe`) | Pipelined `/dev/shm` writes + 8-thread parallel gather + zero-copy `.numpy()` (`Opt-1`) + 8-rank tail-chunk spatial tile split (`Opt-3`) | **`47.4 s`** | **`44.5 s`** | **`78.0 s`** | **`identical=True`** (`max\|d\|=0`) |
+| **2026-11-11** (`1016192`) | Fused `residual + gate * x` in segmented modulation + BHSD-first `norm_q`/`norm_k`/RoPE | **`46.6 s`** | **`43.2 s`** | `78.0 s` (unchanged) | **`identical=True`** |
 
 > **Why `Opt-2` (`DT_RESIDENT_TEXT=1`) is disabled on `v6e-8`**:
 > Unlike `v7x-8` (95 GiB HBM per TensorCore device), each `v6e` chip has 32 GiB HBM. Keeping the `7.3 GiB` sharded Text Encoder resident alongside the `7.5 GiB` sharded DiT and VAE leaves insufficient HBM headroom for the `103,989`-token `768p` denoising activations, so `torchtpu_h3.py` enables `DT_RESIDENT_TEXT` automatically only on `v7x` (`TORCH_TPU_TOPOLOGY == "2,2,1,2"`).
+
+> **`DT_POST_ATTN_PIPE=1` on `v6e-8`**: the two-slab post-attention pipeline (`52aba21`) runs out of HBM in the first 768p request (`RuntimeProgramAllocationFailure`), and the process then hangs instead of exiting; keep it off on `v6e`. On `v6e` the in-graph all-reduce is synchronous, so the slabs would not overlap anyway.
