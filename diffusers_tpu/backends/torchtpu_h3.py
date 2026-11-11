@@ -510,7 +510,10 @@ def main():
     # created there. Pin it to the chip.
     type(pipe)._execution_device = property(lambda _self, _d=dev: _d)
     print(f"  [cpu-text] execution device pinned to {dev}", flush=True)
-  if args.free_text_after:
+  _res_text = (args.no_offload and getattr(args, "shard_text", False)
+               and os.environ.get("TORCH_TPU_TOPOLOGY") == "2,2,1,2"
+               and os.environ.get("DT_RESIDENT_TEXT", "1") == "1")
+  if args.free_text_after and not _res_text:
     _free_text_after_encode(pipe)
   if args.dump_latents and int(os.environ.get('RANK', 0)) == 0:
     _dump_latents(pipe, args.dump_latents)
@@ -1181,6 +1184,16 @@ def _stream_text_encoder(pipe, args):
       _r, _w, _ar = init_parallel()
       shard_text_encoder(encoder, _r, _w, _ar)
 
+    _res_text = (getattr(args, "no_offload", False)
+                 and getattr(args, "shard_text", False)
+                 and os.environ.get("TORCH_TPU_TOPOLOGY") == "2,2,1,2"
+                 and os.environ.get("DT_RESIDENT_TEXT", "1") == "1")
+    if _res_text:
+      encoder.to(torch.device("tpu"))
+      print(f"text encoder: {len(node)} sharded layers resident on chip (v7x)",
+            flush=True)
+      return None
+
     manager = None
     if not skip_layers:
       manager = LayerwiseOffloadManager(
@@ -1681,30 +1694,141 @@ def _shard_decode(vae, verbose=print):
       else:
         clips = [vae._decode_clip(x) for x in slices]
     else:
-      todo = [i for i in range(num_chunks) if i % world == rank and not _tiles_done]
-      # Per-chunk timing (DT_DECODE_TIMING=1). Synchronize after each chunk,
-      # otherwise async dispatch attributes compute time to the later .to("cpu").
+      import numpy as np
       _tm = os.environ.get("DT_DECODE_TIMING") == "1"
+      _opt1 = (os.environ.get("DT_DECODE_SHM") == "1"
+               and os.environ.get("DT_OPT1", "1") == "1"
+               and not _tiles_done)
+      _tail_split = (
+          _opt1
+          and vae.use_tiling
+          and os.environ.get("DT_DECODE_TAIL_SPLIT", "1") == "1"
+          and (num_chunks % world) != 0
+          and (world % (num_chunks % world)) == 0
+      )
+      got = {}
+      if _opt1:
+        run_id = getattr(_decode, "_calls", 0)
+        _decode._calls = run_id + 1
+        base = f"/dev/shm/h3_decode/r{run_id}"
+        os.makedirs(base, exist_ok=True)
+
+      def _emit_clip(i, clip):
+        for j in range(int(token_drop > 0) + 1):
+          frame_start = j * chunk_num_frames
+          chunk = clip[:, :, frame_start:frame_start + chunk_num_frames]
+          t = chunk[:, :, vae.frame_pre_padding:].to("cpu")
+          if _opt1 and rank0_only and rank == 0:
+            got[(i, j)] = t
+          elif _opt1:
+            mine.append((i, j, None))
+            a = t.view(torch.int16).numpy() if t.dtype == torch.bfloat16 else t.numpy()
+            tmp = f"{base}/{i}_{j}.{t.dtype}.tmp.npy"
+            np.save(tmp, a)
+            os.replace(tmp, f"{base}/{i}_{j}.{t.dtype}.npy")
+          else:
+            mine.append((i, j, t))
+
+      rem = (num_chunks % world) if _tail_split else 0
+      full_chunks = num_chunks - rem
+      todo = [i for i in range(full_chunks) if i % world == rank and not _tiles_done]
       clips = []
       for i in todo:
         _t0 = time.perf_counter()
-        clips.append(vae._decode_clip(
+        clip = vae._decode_clip(
             z[:, :, i * tokens_chunk_size:
               i * tokens_chunk_size + tokens_chunk_size
-              + vae.token_overlap]))
+              + vae.token_overlap])
         if _tm:
           _t1 = time.perf_counter()
           torch.accelerator.synchronize()
           verbose(f"  [dec-time] rank {rank} chunk {i}: dispatch {_t1 - _t0:.1f}s, "
                   f"done {time.perf_counter() - _t0:.1f}s", flush=True)
+        if _opt1:
+          _emit_clip(i, clip)
+          del clip
+        else:
+          clips.append(clip)
+
+      if _tail_split and not _tiles_done:
+        ways = world // rem
+        i_tail = full_chunks + (rank % rem)
+        part_idx = rank // rem
+        _t0 = time.perf_counter()
+        zc = z[:, :, i_tail * tokens_chunk_size:
+               i_tail * tokens_chunk_size + tokens_chunk_size + vae.token_overlap]
+        ratio = vae.spatial_compression_ratio
+        height, width = zc.shape[-2] * ratio, zc.shape[-1] * ratio
+        ys, yl, yo = vae._split_tiles(height, vae.tile_sample_min_height,
+                                      vae.tile_sample_min_overlap_height)
+        xs, xl, xo = vae._split_tiles(width, vae.tile_sample_min_width,
+                                      vae.tile_sample_min_overlap_width)
+        nrows = len(ys)
+        r0 = (part_idx * nrows) // ways
+        r1 = ((part_idx + 1) * nrows) // ways
+        sub_rows = [
+            [vae.decoder(vae.post_quant_conv(
+                zc[..., ys[r] // ratio:(ys[r] + yl[r]) // ratio,
+                        xs[c] // ratio:(xs[c] + xl[c]) // ratio]))
+             for c in range(len(xs))]
+            for r in range(r0, r1)
+        ]
+        if part_idx > 0:
+          for r_off, row in enumerate(sub_rows):
+            r_idx = r0 + r_off
+            for c_idx, t_gpu in enumerate(row):
+              t_cpu = t_gpu.to("cpu")
+              dt_str = str(t_cpu.dtype)
+              arr = t_cpu.view(torch.int16).numpy() if t_cpu.dtype == torch.bfloat16 else t_cpu.numpy()
+              t_tmp = f"{base}/tail_{i_tail}_{r_idx}_{c_idx}.{dt_str}.tmp.npy"
+              t_fin = f"{base}/tail_{i_tail}_{r_idx}_{c_idx}.{dt_str}.npy"
+              np.save(t_tmp, arr)
+              os.replace(t_tmp, t_fin)
+          del sub_rows
+          if _tm:
+            verbose(f"  [dec-time] rank {rank} tail-chunk {i_tail} part {part_idx}/{ways}: "
+                    f"done {time.perf_counter() - _t0:.1f}s", flush=True)
+        else:
+          all_rows = list(sub_rows)
+          dt_str = str(sub_rows[0][0].dtype)
+          for p in range(1, ways):
+            p_r0 = (p * nrows) // ways
+            p_r1 = ((p + 1) * nrows) // ways
+            for r_idx in range(p_r0, p_r1):
+              row_list = []
+              for c_idx in range(len(xs)):
+                t_fin = f"{base}/tail_{i_tail}_{r_idx}_{c_idx}.{dt_str}.npy"
+                while not os.path.exists(t_fin):
+                  time.sleep(0.001)
+                loaded = torch.from_numpy(np.load(t_fin))
+                if dt_str == "torch.bfloat16":
+                  loaded = loaded.view(torch.bfloat16)
+                row_list.append(loaded.to(z.device))
+                try:
+                  os.remove(t_fin)
+                except FileNotFoundError:
+                  pass
+              all_rows.append(row_list)
+          clip = vae._stitch_tiles(all_rows, yo, xo)
+          if _tm:
+            torch.accelerator.synchronize()
+            verbose(f"  [dec-time] rank {rank} tail-chunk {i_tail} stitched (1/{ways} tiles): "
+                    f"done {time.perf_counter() - _t0:.1f}s", flush=True)
+          _emit_clip(i_tail, clip)
+          del clip, all_rows, sub_rows
+
     _t2 = time.perf_counter()
-    for i, clip in zip(todo, clips):
-      start = i * tokens_chunk_size
-      del start
-      for j in range(int(token_drop > 0) + 1):
-        frame_start = j * chunk_num_frames
-        chunk = clip[:, :, frame_start:frame_start + chunk_num_frames]
-        mine.append((i, j, chunk[:, :, vae.frame_pre_padding:].to("cpu")))
+    if not (os.environ.get("DT_DECODE_SHM") == "1"
+            and os.environ.get("DT_OPT1", "1") == "1"
+            and not _tiles_done and os.environ.get("DT_DECODE_BATCH") != "1"):
+      got = {}
+      for i, clip in zip(todo, clips):
+        start = i * tokens_chunk_size
+        del start
+        for j in range(int(token_drop > 0) + 1):
+          frame_start = j * chunk_num_frames
+          chunk = clip[:, :, frame_start:frame_start + chunk_num_frames]
+          mine.append((i, j, chunk[:, :, vae.frame_pre_padding:].to("cpu")))
     if os.environ.get("DT_DECODE_TIMING") == "1":
       verbose(f"  [dec-time] rank {rank} to host {time.perf_counter() - _t2:.1f}s",
               flush=True)
@@ -1715,7 +1839,6 @@ def _shard_decode(vae, verbose=print):
     # diverge, and the next request then hangs; identical work on every
     # rank rules that out. Assembly is host CPU work.
     _t3 = time.perf_counter()
-    got = {}
     if _tiles_done:
       # in tile mode every rank already assembled all clips
       for i, j, t in mine:
@@ -1725,35 +1848,53 @@ def _shard_decode(vae, verbose=print):
       # pickles ~1 GB per rank over TCP loopback (7.5-14 s per rank, slower
       # than the decode itself). Every rank still reads everything.
       import numpy as np
-      run_id = getattr(_decode, "_calls", 0)
-      _decode._calls = run_id + 1
-      base = f"/dev/shm/h3_decode/r{run_id}"
-      os.makedirs(base, exist_ok=True)
-      for i, j, t in mine:
-        # bf16 travels as its raw 16 bits: half the bytes of a float32
-        # copy, and the same values.
-        a = t.view(torch.int16).numpy() if t.dtype == torch.bfloat16 else t.numpy()
-        tmp = f"{base}/{i}_{j}.{t.dtype}.tmp.npy"
-        np.save(tmp, a)
-        os.replace(tmp, f"{base}/{i}_{j}.{t.dtype}.npy")   # atomic write
+      if not (os.environ.get("DT_OPT1", "1") == "1" and os.environ.get("DT_DECODE_BATCH") != "1"):
+        run_id = getattr(_decode, "_calls", 0)
+        _decode._calls = run_id + 1
+        base = f"/dev/shm/h3_decode/r{run_id}"
+        os.makedirs(base, exist_ok=True)
+        for i, j, t in mine:
+          # bf16 travels as its raw 16 bits: half the bytes of a float32
+          # copy, and the same values.
+          a = t.view(torch.int16).numpy() if t.dtype == torch.bfloat16 else t.numpy()
+          tmp = f"{base}/{i}_{j}.{t.dtype}.tmp.npy"
+          np.save(tmp, a)
+          os.replace(tmp, f"{base}/{i}_{j}.{t.dtype}.npy")   # atomic write
       dist.barrier(group=group)
-      for name in (os.listdir(base) if assemble else []):
-        if not name.endswith(".npy") or ".tmp." in name:
-          continue
-        ij, dt = name[:-4].split(".", 1)
-        i, j = (int(x) for x in ij.split("_"))
-        t = torch.from_numpy(np.load(f"{base}/{name}"))
-        if dt == "torch.bfloat16":
-          t = t.view(torch.bfloat16)
-        got[(i, j)] = t
+      if assemble:
+        if os.environ.get("DT_OPT1", "1") == "1":
+          from concurrent.futures import ThreadPoolExecutor
+          names = [n for n in os.listdir(base)
+                   if n.endswith(".npy") and ".tmp." not in n and not n.startswith("tail_")]
+          def _load_one(name):
+            ij, dt = name[:-4].split(".", 1)
+            i, j = (int(x) for x in ij.split("_"))
+            t = torch.from_numpy(np.load(f"{base}/{name}"))
+            if dt == "torch.bfloat16":
+              t = t.view(torch.bfloat16)
+            return (i, j), t
+          with ThreadPoolExecutor(max_workers=8) as ex:
+            for k_ij, t_val in ex.map(_load_one, names):
+              got[k_ij] = t_val
+        else:
+          for name in os.listdir(base):
+            if not name.endswith(".npy") or ".tmp." in name or name.startswith("tail_"):
+              continue
+            ij, dt = name[:-4].split(".", 1)
+            i, j = (int(x) for x in ij.split("_"))
+            t = torch.from_numpy(np.load(f"{base}/{name}"))
+            if dt == "torch.bfloat16":
+              t = t.view(torch.bfloat16)
+            got[(i, j)] = t
       dist.barrier(group=group)          # delete only after everyone has read
       # Each rank deletes its own files, so no single rank lags into the
       # next request. The directory itself is kept for reuse.
-      for i, j, t in mine:
-        try:
-          os.remove(f"{base}/{i}_{j}.{t.dtype}.npy")
-        except FileNotFoundError:
-          pass
+      for i, j, _ in mine:
+        for dt_cand in ("torch.bfloat16", "torch.float32", "torch.float16"):
+          try:
+            os.remove(f"{base}/{i}_{j}.{dt_cand}.npy")
+          except FileNotFoundError:
+            pass
     else:
       boxes = [None] * world
       dist.all_gather_object(boxes, mine, group=group)
@@ -1852,11 +1993,33 @@ def _postprocess_where_decoded(done=lambda: None):
     latents = block_state.latents * latents_std + latents_mean
     video = components.vae.decode(latents, return_dict=False)[0]
     t0 = time.perf_counter()
-    pixel_mean = torch.tensor(components.pixel_mean, device=video.device).view(1, -1, 1, 1, 1)
-    pixel_std = torch.tensor(components.pixel_std, device=video.device).view(1, -1, 1, 1, 1)
-    video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)
-    t1 = time.perf_counter()
-    block_state.videos = components.video_processor.postprocess_video(video, output_type=block_state.output_type)
+    if (os.environ.get("DT_OPT1", "1") == "1"
+        and block_state.output_type == "np"
+        and video.device.type == "cpu"
+        and not getattr(getattr(components.video_processor, "config", None), "do_normalize", False)):
+      if video.numel() == 0:
+        import numpy as np
+        t1 = time.perf_counter()
+        block_state.videos = np.zeros(
+            (video.shape[0], 0, video.shape[3], video.shape[4], video.shape[1]),
+            dtype=np.float32)
+      else:
+        video = video.permute(0, 2, 3, 4, 1).contiguous().float()
+        pixel_mean = torch.tensor(
+            components.pixel_mean, device=video.device, dtype=torch.float32
+        ).view(1, 1, 1, 1, -1)
+        pixel_std = torch.tensor(
+            components.pixel_std, device=video.device, dtype=torch.float32
+        ).view(1, 1, 1, 1, -1)
+        video.mul_(pixel_std).add_(pixel_mean).clamp_(0, 1)
+        t1 = time.perf_counter()
+        block_state.videos = video.numpy()
+    else:
+      pixel_mean = torch.tensor(components.pixel_mean, device=video.device).view(1, -1, 1, 1, 1)
+      pixel_std = torch.tensor(components.pixel_std, device=video.device).view(1, -1, 1, 1, 1)
+      video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)
+      t1 = time.perf_counter()
+      block_state.videos = components.video_processor.postprocess_video(video, output_type=block_state.output_type)
     if os.environ.get("DT_DECODE_TIMING") == "1":
       print(f"  [dec-time] rank {os.environ.get('RANK', 0)} postprocess {t1 - t0:.1f}s"
             f" to {block_state.output_type} {time.perf_counter() - t1:.1f}s"
