@@ -173,7 +173,9 @@ def install(transformer, verbose=print) -> bool:
       # Multiple of 4096 (and 256, matching the 256x256 MXU on TPU v6e/v7x);
       # for 768p 345f (S=103989), S0=49152 (192x256) keeps all 1,173 head rows
       # in Slab 0 so Slab 1 is 100% video rows and needs no index_copy.
-      S0 = ((S // 2) // 4096) * 4096
+      S0 = max(((S // 2) // 4096) * 4096, -(-runs[-1][0] // 4096) * 4096)
+      if S0 >= S:
+        S0 = ((S // 2) // 256) * 256
       runs_0 = (*runs[:-1], (runs[-1][0], S0, runs[-1][2]))
       bulk = runs[-1][2]
       to_out_lin = self.attn.to_out[0]

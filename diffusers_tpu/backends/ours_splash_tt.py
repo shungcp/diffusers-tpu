@@ -147,6 +147,12 @@ def install(verbose=print, fixed_m: bool = True) -> bool:
   import diffusers.models.transformers.transformer_minimax_h3 as h3
   if hasattr(h3, "dispatch_attention_fn"):
     h3.dispatch_attention_fn = dispatch
+  try:
+    import diffusers.models.transformers.transformer_minimax_h3_image as h3_img
+    if hasattr(h3_img, "dispatch_attention_fn"):
+      h3_img.dispatch_attention_fn = dispatch
+  except ImportError:
+    h3_img = None
 
   bhsd_mode = os.environ.get("DT_BHSD_ROPE", "1")
   if bhsd_mode in ("1", "full") and hasattr(h3, "MiniMaxH3AttnProcessor"):
@@ -204,6 +210,8 @@ def install(verbose=print, fixed_m: bool = True) -> bool:
       return out
 
     h3.MiniMaxH3AttnProcessor.__call__ = _bhsd_call
+    if h3_img is not None and hasattr(h3_img, "MiniMaxH3ImageAttnProcessor"):
+      h3_img.MiniMaxH3ImageAttnProcessor.__call__ = _bhsd_call
     verbose(f"  [ours] BHSD-first norm+RoPE enabled (mode={bhsd_mode})", flush=True)
 
   verbose("  [ours] attention routed to this repo's Pallas kernel", flush=True)

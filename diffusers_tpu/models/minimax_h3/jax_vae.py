@@ -185,6 +185,9 @@ class PostQuantConv(nnx.Module):
 
   def __call__(self, z):
     w = self.weight[...].reshape(self.weight[...].shape[:2]).astype(z.dtype)
+    if z.ndim == 4:
+      out = jnp.einsum("bchw,oc->bohw", z, w)
+      return out + self.bias[...].astype(z.dtype).reshape(1, -1, 1, 1)
     out = jnp.einsum("bcfhw,oc->bofhw", z, w)
     return out + self.bias[...].astype(z.dtype).reshape(1, -1, 1, 1, 1)
 
@@ -196,7 +199,7 @@ class ViTDecoder(nnx.Module):
                num_layers=36, num_attention_heads=32, attention_head_dim=64,
                num_register_tokens=4, patch_size=16, patch_size_t=4,
                ffn_mult=4, norm_eps=1e-5, rope_dim_ratio=0.75,
-               rope_theta=100.0, dtype=jnp.bfloat16, rngs=None):
+               rope_theta=100.0, num_axes=3, dtype=jnp.bfloat16, rngs=None):
     # The reference derives the width rather than taking it.
     dim = num_attention_heads * attention_head_dim
     self.patch_size = patch_size
@@ -205,6 +208,7 @@ class ViTDecoder(nnx.Module):
     self.num_register_tokens = num_register_tokens
     self.rope_dim = int(attention_head_dim * rope_dim_ratio)
     self.rope_theta = rope_theta
+    self.num_axes = num_axes
     self.proj_in = Linear(in_channels, dim, dtype=dtype, rngs=rngs)
     self.register_tokens = nnx.Param(
         jnp.zeros((1, num_register_tokens, dim), dtype))
@@ -218,6 +222,40 @@ class ViTDecoder(nnx.Module):
         dtype=dtype, rngs=rngs)
 
   def __call__(self, latents, sdpa=None):
+    if self.num_axes == 2:
+      if latents.ndim == 5:
+        latents = latents.squeeze(2)
+      batch, channels, height, width = latents.shape
+      x = jnp.transpose(latents, (0, 2, 3, 1)).reshape(
+          batch, height * width, channels)
+      x = self.proj_in(x)
+      patches = x.shape[1]
+      tail = jnp.concatenate([
+          jnp.broadcast_to(self.register_tokens[...].astype(x.dtype),
+                           (batch,) + self.register_tokens[...].shape[1:]),
+          jnp.zeros((batch, 1, x.shape[-1]), x.dtype),
+      ], axis=1)
+      x = jnp.concatenate([x, tail], axis=1)
+      grids = [2.0 * (jnp.arange(0.5, size, dtype=jnp.float32) / size) - 1.0
+               for size in (height, width)]
+      coords = jnp.stack(jnp.meshgrid(*grids, indexing="ij"), -1).reshape(-1, 2)
+      coords = jnp.broadcast_to(coords, (batch,) + coords.shape)
+      coords = jnp.concatenate([
+          coords,
+          jnp.zeros((batch, self.num_register_tokens + 1, 2), coords.dtype),
+      ], axis=1)
+      cos, sin = rope_angles(coords, self.rope_dim, self.rope_theta, num_axes=2)
+      rope = (cos.astype(x.dtype), sin.astype(x.dtype))
+      for block in self.transformer_blocks:
+        x = block(x, rope, sdpa)
+      x = self.proj_out(self.norm_out(x))[:, :patches]
+      x = x.reshape(batch, height, width, self.out_channels,
+                    self.patch_size, self.patch_size)
+      x = jnp.transpose(x, (0, 3, 1, 4, 2, 5))
+      return x.reshape(batch, self.out_channels,
+                       height * self.patch_size,
+                       width * self.patch_size)
+
     batch, channels, frames, height, width = latents.shape
     x = jnp.transpose(latents, (0, 2, 3, 4, 1)).reshape(
         batch, frames * height * width, channels)
@@ -262,6 +300,13 @@ CONFIG = dict(in_channels=24, out_channels=3, num_layers=36,
               num_attention_heads=32, attention_head_dim=64,
               num_register_tokens=4, patch_size=16, patch_size_t=4,
               rope_dim_ratio=0.75, norm_eps=1e-5)
+
+IMAGE_DECODER_CONFIG = dict(
+    in_channels=24, out_channels=3, num_layers=24,
+    num_attention_heads=16, attention_head_dim=64,
+    num_register_tokens=4, patch_size=16, patch_size_t=1,
+    rope_dim_ratio=0.5, rope_theta=100.0, norm_eps=1e-5, num_axes=2,
+)
 
 _RENAMES = (
     (".to_out.0.", ".to_out."),

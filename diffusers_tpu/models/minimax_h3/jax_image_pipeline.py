@@ -1,0 +1,757 @@
+"""MiniMax-H3-Image (t2i and multi-reference edit) end to end in native JAX.
+
+Reuses the 50-layer MiniMax-H3 DiT (`jax_dit.py`, with `audio_in_channels=0`
+and `num_pdd_heads=6`), the Qwen3-VL text and vision towers (`jax_text.py`,
+`jax_vision.py`, `jax_ref2va.py`), and the 2D ViT image decoder + 3D causal
+encoder in `jax_vae.py`.
+
+All six PDD steps share one compiled XLA graph (with `pdd_step` passed as a
+traced int32 scalar indexing the 6 output heads and the fused Euler velocity
+update inside the jitted step), followed by an 8-way tile-parallel 2D ViT
+decode and on-chip uint8 conversion.
+"""
+
+import argparse
+import functools
+import glob
+import json
+import math
+import os
+import time
+
+import numpy as np
+
+TEXT_ENCODER_LAYER = 51  # layers[:51] -> output of 50th decoder layer
+PDD_SAMPLE_SIGMAS = (
+    1.0,
+    0.9675236940383911,
+    0.8875485062599182,
+    0.75,
+    0.5327739119529724,
+    0.23200887441635132,
+    0.0,
+)
+PIXEL_MEAN = (0.485, 0.456, 0.406)
+PIXEL_STD = (0.229, 0.224, 0.225)
+TEXT_TAG = 1
+IMAGE_TAG = 0
+CANVAS_MULTIPLE = 32
+DEFAULT_MIN_GENERATION_AREA = 2048 * 2048
+
+
+def parse_args():
+  p = argparse.ArgumentParser(description=__doc__)
+  p.add_argument("--model-id", default="MiniMaxAI/MiniMax-H3-Image")
+  p.add_argument("--text-model-id", default="MiniMaxAI/MiniMax-H3",
+                 help="Fallback repo for text_encoder/ if not in --model-id")
+  p.add_argument("--prompt", default=(
+      "A cinematic close-up portrait of a red fox in a snowy pine forest at "
+      "dawn, crisp frost on whiskers, golden rim light, ultra-detailed 4K."))
+  p.add_argument("--reference", action="append", default=[],
+                 help="Reference image path for editing; repeat for <Picture 2>, ...")
+  p.add_argument("--size", default=None,
+                 help="WIDTHxHEIGHT shorthand (e.g. 2048x2048, 4096x4096, 4736x3552)")
+  p.add_argument("--width", type=int, default=2048)
+  p.add_argument("--height", type=int, default=2048)
+  p.add_argument("--min-generation-area", type=int,
+                 default=DEFAULT_MIN_GENERATION_AREA,
+                 help="Minimum generation canvas area in pixels (default 2048^2; 0 disables)")
+  p.add_argument("--steps", type=int, default=6)
+  p.add_argument("--seed", type=int, default=42)
+  p.add_argument("--chips", type=int, default=0,
+                 help="Number of TPU devices to use (default: all available)")
+  p.add_argument("--offload", action="store_true",
+                 help="Stream weights from pinned host memory (for 16 GiB v5e)")
+  p.add_argument("--text-offload", action="store_true",
+                 help="Keep text encoder in pinned host memory")
+  p.add_argument("--adaln-host", action="store_true",
+                 help="Precompute the 6 PDD timestep modulations on host and drop 26 GB of adaln weights")
+  p.add_argument("--fp8", action="store_true",
+                 help="Quantize the 6 DiT block linears to float8_e4m3fn on chip")
+  p.add_argument("--qk-fp8", action="store_true",
+                 help="Cast Q and K to float8_e4m3fn entering Pallas FlashAttention")
+  p.add_argument("--int8-weights", action="store_true",
+                 help="Quantize DiT and text encoder weights to int8 on load")
+  p.add_argument("--bf16-weights", action="store_true",
+                 help="Round float32 input/output projections to bfloat16 on load")
+  p.add_argument("--full-lane-rope", action="store_true",
+                 help="Use 128-lane matrix multiply for RoPE")
+  p.add_argument("--pad-sequence-to", type=int, default=0,
+                 help="Pad packed sequence length up to a multiple of this")
+  p.add_argument("--block-q", type=int, default=2048)
+  p.add_argument("--block-kv", type=int, default=4096)
+  p.add_argument("--block-kv-compute", type=int, default=0)
+  p.add_argument("--dense-attention", action="store_true")
+  p.add_argument("--segments", action="store_true",
+                 help="Use segment-wise AdaLN modulation in JAX DiT")
+  p.add_argument("--vae-tile-batch", type=int, default=0,
+                 help="Batch size for tiled 2D VAE decode when weights are TP-sharded")
+  p.add_argument("--decode-tile-shard", action="store_true", default=True,
+                 help="Replicate the 1.2 GB 2D ViT decoder and shard spatial tiles across devices")
+  p.add_argument("--warmup", action="store_true",
+                 help="Run one warmup pass before timed runs")
+  p.add_argument("--runs", type=int, default=2,
+                 help="Number of timed generation runs")
+  p.add_argument("--compile-cache", default="")
+  p.add_argument("--cache-only", action="store_true")
+  p.add_argument("--out", default="out")
+  p.add_argument("--tag", default="h3_image_jax")
+  args = p.parse_args()
+  if args.size:
+    w_str, h_str = args.size.lower().split("x")
+    args.width, args.height = int(w_str), int(h_str)
+  return args
+
+
+def _resolve_snapshots(model_id: str, text_model_id: str):
+  """Locate or download MiniMax-H3-Image and the shared MiniMax-H3 text_encoder."""
+  from huggingface_hub import snapshot_download
+  from ...hub import local_snapshot
+
+  if os.path.isdir(model_id):
+    img_snap = model_id
+  else:
+    try:
+      img_snap = local_snapshot(model_id)
+    except FileNotFoundError:
+      img_snap = snapshot_download(
+          model_id,
+          allow_patterns=[
+              "*.json",
+              "tokenizer/*",
+              "processor/*",
+              "scheduler/*",
+              "transformer_diffusers/*",
+              "vae_diffusers/*",
+          ],
+      )
+  text_dir = os.path.join(img_snap, "text_encoder")
+  if not os.path.isdir(text_dir) or not glob.glob(os.path.join(text_dir, "*.safetensors")):
+    if os.path.isdir(text_model_id):
+      base_snap = text_model_id
+    else:
+      try:
+        base_snap = local_snapshot(text_model_id)
+      except FileNotFoundError:
+        base_snap = snapshot_download(
+            text_model_id,
+            allow_patterns=["text_encoder/*", "tokenizer/*", "processor/*"],
+        )
+    text_dir = os.path.join(base_snap, "text_encoder")
+  return img_snap, text_dir
+
+
+def bound_short_edge(image, min_short_edge: int, max_short_edge: int,
+                     multiple: int = CANVAS_MULTIPLE):
+  """Match `MiniMaxH3ImageEditResizeStep.bound_short_edge`."""
+  from diffusers.image_processor import VaeImageProcessor
+
+  width, height = image.size
+  short = min(width, height)
+  if min_short_edge <= short <= max_short_edge:
+    return image
+  target = min_short_edge if short < min_short_edge else max_short_edge
+  scale = target / short
+  tw = max(multiple, round(width * scale / multiple) * multiple)
+  th = max(multiple, round(height * scale / multiple) * multiple)
+  if (tw, th) != (width, height):
+    image = VaeImageProcessor().resize(image, height=th, width=tw)
+  return image
+
+
+def prepare_canvas(width: int, height: int, min_area: int):
+  """Match `MiniMaxH3ImagePrepareCanvasStep`."""
+  out_w, out_h = width, height
+  if min_area and min_area > 0:
+    scale = max(1.0, math.sqrt(min_area / (width * height)))
+  else:
+    scale = 1.0
+  gen_h = max(CANVAS_MULTIPLE, round(height * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+  gen_w = max(CANVAS_MULTIPLE, round(width * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+  return out_w, out_h, gen_w, gen_h, gen_h // 16, gen_w // 16
+
+
+def _frame_position_grid(latent_h: int, latent_w: int,
+                         patch_h: int = 2, patch_w: int = 2) -> np.ndarray:
+  """Match `_frame_position_grid` in `minimax_h3_image/before_denoise.py`."""
+  sqrt_area = np.sqrt(latent_h * latent_w)
+  ranges = []
+  for size, patch in ((latent_h, patch_h), (latent_w, patch_w)):
+    ratio = size / sqrt_area
+    left = (1.0 - ratio) / 2.0
+    ranges.append(
+        np.linspace(left, left + ratio, size // patch, endpoint=False, dtype=np.float64) * 32.0
+    )
+  grid = np.meshgrid(*ranges, indexing="ij")
+  return np.stack(grid, axis=-1).reshape(-1, 2)
+
+
+def build_image_packed_sequence(text_token_tags: np.ndarray,
+                                reference_grids: list[tuple[int, int]],
+                                latent_height: int,
+                                latent_width: int):
+  """Match `build_image_packed_sequence` in `minimax_h3_image/before_denoise.py`."""
+  num_text = int(len(text_token_tags))
+  ref_row_counts = [(h // 2) * (w // 2) for h, w in reference_grids]
+  num_ref_rows = sum(ref_row_counts)
+  num_target_rows = (latent_height // 2) * (latent_width // 2)
+  seq_len = num_text + num_ref_rows + num_target_rows
+
+  position_ids = np.zeros((seq_len, 3), dtype=np.float64)
+  position_ids[:num_text, 0] = np.arange(num_text, dtype=np.float64)
+
+  cursor = num_text
+  for k, ((h_k, w_k), n_k) in enumerate(zip(reference_grids, ref_row_counts)):
+    position_ids[cursor:cursor + n_k, 0] = float(num_text + k)
+    position_ids[cursor:cursor + n_k, 1:] = _frame_position_grid(h_k, w_k, 2, 2)
+    cursor += n_k
+
+  position_ids[cursor:, 0] = float(num_text + len(reference_grids))
+  position_ids[cursor:, 1:] = _frame_position_grid(latent_height, latent_width, 2, 2)
+
+  text_indices = np.arange(num_text, dtype=np.int32)
+  image_indices = np.arange(num_text, seq_len, dtype=np.int32)
+  token_tags = np.zeros((seq_len,), dtype=np.int32)
+  token_tags[:num_text] = np.asarray(text_token_tags, dtype=np.int32)
+  token_tags[num_text:] = IMAGE_TAG
+  return (
+      position_ids.astype(np.float32),
+      token_tags,
+      image_indices,
+      text_indices,
+      num_ref_rows,
+      num_target_rows,
+  )
+
+
+def patchify_2d(latents: np.ndarray) -> np.ndarray:
+  """`(1, 24, H_lat, W_lat)` -> `(1, (H_lat//2)*(W_lat//2), 96)`."""
+  b, c, h, w = latents.shape
+  x = latents.reshape(b, c, h // 2, 2, w // 2, 2)
+  x = x.transpose(0, 2, 4, 1, 3, 5)
+  return x.reshape(b, (h // 2) * (w // 2), c * 4)
+
+
+def main():
+  args = parse_args()
+  os.environ.setdefault(
+      "LIBTPU_INIT_ARGS",
+      "--xla_tpu_dvfs_p_state=7 "
+      "--xla_tpu_enable_latency_hiding_scheduler=true "
+      "--xla_tpu_enable_async_collective_fusion=true "
+      "--xla_tpu_enable_async_collective_fusion_multiple_steps=true "
+      "--xla_tpu_overlap_compute_collective_tc=true "
+      "--xla_enable_async_all_gather=true "
+      "--xla_enable_async_collective_permute=true "
+      "--xla_tpu_scoped_vmem_limit_kib=65536",
+  )
+  if args.chips and os.environ.get("DT_VISIBLE_CHIPS") == "1":
+    os.environ.setdefault("TPU_VISIBLE_DEVICES",
+                          ",".join(str(i) for i in range(args.chips)))
+
+  import jax
+  import jax.numpy as jnp
+  from flax import nnx
+  from jax.sharding import NamedSharding, PartitionSpec as P
+
+  if args.compile_cache:
+    jax.config.update("jax_compilation_cache_dir", args.compile_cache)
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+
+  os.environ["DT_PAD_SEQUENCE_TO"] = os.environ.get(
+      "DT_PAD_SEQUENCE_TO", str(args.pad_sequence_to))
+  os.environ["DT_FULL_LANE_ROPE"] = os.environ.get(
+      "DT_FULL_LANE_ROPE", "1" if args.full_lane_rope else "0")
+
+  from . import jax_dit as dit
+  from . import jax_ref2va as r2v
+  from . import jax_text as jtext
+  from . import jax_vae as jvae
+  from . import jax_vision as jvision
+  from ..qwen3_vl import jax_text as qwen_text
+  from ..qwen3_vl import jax_vision as _qv
+  from ...safetensors_io import safe_open
+
+  devices = jax.devices()[:args.chips or None]
+  mesh = jax.make_mesh((len(devices),), ("tp",), devices=devices)
+  dtype = jnp.bfloat16
+  replicated = NamedSharding(mesh, P())
+  dit_host = "pinned_host" if args.offload else None
+  text_host = "pinned_host" if (args.offload or args.text_offload) else None
+
+  began = time.perf_counter()
+  img_snap, text_dir = _resolve_snapshots(args.model_id, args.text_model_id)
+  vae_dir = os.path.join(
+      img_snap,
+      "vae_diffusers" if os.path.isdir(os.path.join(img_snap, "vae_diffusers")) else "vae",
+  )
+  dit_dir = os.path.join(
+      img_snap,
+      "transformer_diffusers"
+      if os.path.isdir(os.path.join(img_snap, "transformer_diffusers"))
+      else "transformer",
+  )
+  with open(os.path.join(vae_dir, "config.json")) as f:
+    vae_cfg = json.load(f)
+  lat_mean_np = np.asarray(vae_cfg["latents_mean"], np.float32).reshape(1, -1, 1, 1)
+  lat_std_np = np.asarray(vae_cfg["latents_std"], np.float32).reshape(1, -1, 1, 1)
+  lat_mean_jnp = jnp.asarray(lat_mean_np)
+  lat_std_jnp = jnp.asarray(lat_std_np)
+
+  print(f"MiniMax-H3-Image JAX on {len(devices)} device(s) "
+        f"({devices[0].device_kind}), workflow={'edit' if args.reference else 't2i'}",
+        flush=True)
+
+  # -- 1. Load Text & Vision Towers ------------------------------------------
+  from transformers import AutoProcessor, AutoTokenizer
+
+  tokenizer = AutoTokenizer.from_pretrained(os.path.join(img_snap, "tokenizer"))
+  processor = AutoProcessor.from_pretrained(os.path.join(img_snap, "processor"))
+  encoder, cfg_text = jtext.build(text_dir, dtype=dtype, abstract=True)
+  _wc = os.environ.get("DT_WEIGHT_CACHE")
+  _tc = os.path.join(_wc, "text" + ("_int8" if args.int8_weights else "")) if _wc else None
+  if _tc and os.path.exists(os.path.join(_tc, "index.json")):
+    if args.int8_weights:
+      encoder.layers = nnx.List(list(encoder.layers)[:TEXT_ENCODER_LAYER])
+    dit.load_param_cache(encoder, _tc, mesh,
+                         lambda n, nd: jtext.param_spec(n.split("."), nd),
+                         memory_kind=text_host)
+    print(f"  [weight-cache] text tower from {_tc}", flush=True)
+  else:
+    if _tc:
+      dit.CACHE_WRITE["dir"] = _tc
+    jtext.load(encoder, text_dir, mesh=mesh, spec_fn=jtext.param_spec,
+               memory_kind=text_host, int8=args.int8_weights,
+               keep_layers=TEXT_ENCODER_LAYER if args.int8_weights else None)
+    if _tc:
+      dit.cache_finish()
+  print(f"  text encoder loaded ({time.perf_counter() - began:.1f}s)", flush=True)
+
+  vision_model = None
+  if args.reference:
+    vision_model, _ = jvision.build(text_dir, dtype=dtype, abstract=True)
+    jvision.load(vision_model, text_dir, mesh=mesh, spec_fn=lambda k, n: P(),
+                 memory_kind=text_host if len(devices) == 1 else None)
+    if os.environ.get("DT_VISION_HEAD_SHARD", "1") == "1" and len(devices) > 1:
+      _qv.HEAD_SHARD_AXIS = "tp"
+
+  # -- 2. Load 50-layer DiT --------------------------------------------------
+  t_dit = time.perf_counter()
+  timesteps_np = np.asarray(
+      [1.0 - s for s in PDD_SAMPLE_SIGMAS[:-1]], dtype=np.float32
+  )
+  sigmas_np = np.concatenate([1.0 - timesteps_np, np.zeros((1,), dtype=np.float32)])
+
+  _, Transformer = dit._build_modules()
+  transformer = nnx.eval_shape(
+      lambda: Transformer(**dit.IMAGE_CONFIG_FULL, dtype=dtype, rngs=nnx.Rngs(0))
+  )
+  _levels = None
+  if args.adaln_host:
+    if args.reference:
+      _levels = [[float(t), float(np.float32(0.999))] for t in timesteps_np]
+    else:
+      _levels = [[float(t)] for t in timesteps_np]
+  _dc = None
+  if _wc:
+    _dc = os.path.join(_wc, "dit_h3_image_" + "_".join(filter(None, [
+        "edit" if args.reference else "t2i",
+        "int8" if args.int8_weights else "",
+        f"adaln{len(_levels)}" if _levels is not None else "",
+        "bf16w" if args.bf16_weights else ""])))
+  adaln_mods_host = None
+  if _dc and os.path.exists(os.path.join(_dc, "index.json")):
+    _extra = dit.load_param_cache(transformer, _dc, mesh,
+                                  lambda n, nd: dit._spec_for(n),
+                                  memory_kind=dit_host)
+    adaln_mods_host = _extra.get("adaln")
+    print(f"  [weight-cache] DiT from {_dc}", flush=True)
+  else:
+    if _dc:
+      dit.CACHE_WRITE["dir"] = _dc
+    adaln_temb = dit.host_temb(dit_dir, _levels) if _levels is not None else None
+    dit.load_transformer(transformer, dit_dir, mesh=mesh,
+                         memory_kind=dit_host, round_bf16=args.bf16_weights,
+                         int8=args.int8_weights, adaln_temb=adaln_temb)
+    if args.adaln_host:
+      adaln_mods_host = dit.ADALN_MODS.pop("last")
+    if _dc:
+      dit.cache_finish(
+          extra={"adaln": adaln_mods_host} if adaln_mods_host is not None else None
+      )
+  if args.fp8 and not args.int8_weights:
+    with jax.set_mesh(mesh):
+      dit.quantize_transformer_fp8(transformer, mesh=mesh)
+    print("  [fp8] quantized DiT block linears to float8_e4m3fn", flush=True)
+  adaln_mods = None
+  if adaln_mods_host is not None:
+    # Put precomputed (6, 50, levels, 6*5376*3) modulations in HBM replicated
+    adaln_mods = [
+        [jax.device_put(jnp.asarray(adaln_mods_host[s, b], dtype), replicated)
+         for b in range(50)]
+        for s in range(len(timesteps_np))
+    ]
+  print(f"  DiT loaded ({time.perf_counter() - t_dit:.1f}s)", flush=True)
+
+  # -- 3. Load 2D Image VAE (Decoder + optional Encoder for edit) ------------
+  t_vae = time.perf_counter()
+  decoder = nnx.eval_shape(
+      lambda: jvae.ViTDecoder(**jvae.IMAGE_DECODER_CONFIG, dtype=dtype, rngs=nnx.Rngs(0))
+  )
+  post_q = jvae.PostQuantConv(jvae.IMAGE_DECODER_CONFIG["in_channels"],
+                              dtype=dtype, rngs=nnx.Rngs(0))
+  vae_encoder = quant_conv = None
+  if args.reference:
+    vae_encoder = nnx.eval_shape(
+        lambda: jvae.Encoder3d(dtype=dtype, rngs=nnx.Rngs(0))
+    )
+    quant_conv = jvae.PostQuantConv(48, dtype=dtype, rngs=nnx.Rngs(0))
+  dec_params, enc_params, qc_params = {}, {}, {}
+  for shard in sorted(glob.glob(os.path.join(vae_dir, "*.safetensors"))):
+    with safe_open(shard, framework="flax") as reader:
+      for k in reader.keys():
+        if k.startswith("decoder."):
+          dec_params[k] = reader.get_tensor(k)
+        elif k.startswith("post_quant_conv."):
+          leaf = getattr(post_q, k.split(".")[-1])
+          leaf.value = jax.device_put(
+              jnp.asarray(reader.get_tensor(k)).astype(leaf.value.dtype).reshape(leaf.value.shape),
+              replicated,
+          )
+        elif args.reference and k.startswith("encoder."):
+          enc_params[k] = reader.get_tensor(k)
+        elif args.reference and k.startswith("quant_conv."):
+          qc_params[k] = reader.get_tensor(k)
+  # Replicate the 1.2 GB 2D ViT decoder so spatial tiles can be sharded 8-way across devices
+  dec_spec = (lambda _n, _d: P()) if args.decode_tile_shard else jvae.decoder_spec
+  jvae.load_decoder(decoder, dec_params, mesh=mesh, spec_for=dec_spec)
+  dec_graph, dec_state = nnx.split(decoder)
+  pq_graph, pq_state = nnx.split(post_q)
+
+  @functools.partial(jax.jit, out_shardings=replicated)
+  def decode_tile_batch(state, z, pq=pq_state):
+    with jax.default_matmul_precision("highest"):
+      z = nnx.merge(pq_graph, pq)(z)
+      return nnx.merge(dec_graph, state)(z, sdpa=None)
+
+  @functools.partial(jax.jit, out_shardings=replicated)
+  def to_uint8_rgb(pixels):
+    mean = jnp.asarray(PIXEL_MEAN, jnp.float32).reshape(1, 3, 1, 1)
+    std = jnp.asarray(PIXEL_STD, jnp.float32).reshape(1, 3, 1, 1)
+    rgb = jnp.clip(pixels.astype(jnp.float32) * std + mean, 0.0, 1.0)
+    u8 = jnp.clip(rgb * 255.0, 0.0, 255.0).astype(jnp.uint8)
+    return jnp.transpose(u8[0], (1, 2, 0))
+
+  enc_w = None
+  if args.reference:
+    jvae.load_encoder(vae_encoder, enc_params, mesh=mesh, spec_for=lambda _n, _d: P())
+    jvae.load_quant_conv(quant_conv, qc_params, prefix="quant_conv.")
+    for leaf in jax.tree.leaves(nnx.state(quant_conv, nnx.Param)):
+      leaf.value = jax.device_put(leaf.value, replicated)
+    eg_vae, es_vae = nnx.split(vae_encoder)
+    qg_vae, qs_vae = nnx.split(quant_conv)
+    enc_w = (es_vae, qs_vae)
+
+    def _enc_one_tile(w, tile):
+      with jax.default_matmul_precision("highest"):
+        e_mod = nnx.merge(eg_vae, w[0])
+        q_mod = nnx.merge(qg_vae, w[1])
+        return jvae.encode_video(e_mod, q_mod, tile)
+
+    _ENC_ONE[0] = _enc_one_tile
+
+  print(f"  2D Image VAE loaded ({time.perf_counter() - t_vae:.1f}s)", flush=True)
+
+  # -- 4. Configure Pallas FlashAttention & Compile DiT Step -----------------
+  sdpa = None
+  if not args.dense_attention:
+    from ...kernels import mesh_attention
+    from ...kernels import splash as csa
+
+    local_attn = functools.partial(
+        csa.attention,
+        scale=None,
+        block_q=args.block_q,
+        block_kv=args.block_kv,
+        block_kv_compute=args.block_kv_compute or args.block_kv,
+        use_fixed_m=True,
+        qk_fp8=args.qk_fp8 or os.environ.get("DT_QK_FP8") == "1",
+    )
+
+    def sdpa(q, k, v):
+      k = k - jnp.mean(k, axis=2, keepdims=True)
+      with jax.default_matmul_precision("default"):
+        return mesh_attention._on_mesh(local_attn, mesh, q, k, v, True)
+
+  out_w, out_h, gen_w, gen_h, latent_h, latent_w = prepare_canvas(
+      args.width, args.height, args.min_generation_area
+  )
+  print(f"  canvas: requested {out_w}x{out_h} -> generation {gen_w}x{gen_h} "
+        f"(latent {latent_w}x{latent_h}, {(latent_h // 2) * (latent_w // 2)} image tokens)",
+        flush=True)
+
+  # Compile text-only encoder jit
+  _text_jit = nnx.jit(
+      lambda m, i, c, s: m(i, c, s, stop_at_layer=TEXT_ENCODER_LAYER)
+  )
+
+  def encode_prompt_and_refs():
+    """Run text (+ optional vision + reference VAE) encoding."""
+    if not args.reference:
+      token_ids = tokenizer(
+          args.prompt, add_special_tokens=False
+      )["input_ids"][:4096]
+      tags = np.ones((len(token_ids),), dtype=np.int64)
+      ids_np = np.asarray([token_ids], dtype=np.int32)
+      pos = np.broadcast_to(np.arange(ids_np.shape[1])[None, :], (3, ids_np.shape[1]))
+      cos, sin = qwen_text.mrope_cos_sin(
+          pos,
+          head_dim=cfg_text["head_dim"],
+          rope_theta=cfg_text["rope_theta"],
+          mrope_section=cfg_text["mrope_section"],
+      )
+      cos_j = jax.device_put(jnp.asarray(cos, dtype), replicated)
+      sin_j = jax.device_put(jnp.asarray(sin, dtype), replicated)
+      ids_j = jax.device_put(jnp.asarray(ids_np, jnp.int32), replicated)
+      p_embeds = _text_jit(encoder, ids_j, cos_j, sin_j)
+      return p_embeds, tags, [], []
+
+    from PIL import Image, ImageOps
+    raw_imgs = [
+        ImageOps.exif_transpose(Image.open(p)).convert("RGB")
+        for p in args.reference
+    ]
+    ref_imgs = [bound_short_edge(im, 1024, 2048) for im in raw_imgs]
+    vis_imgs = [bound_short_edge(im, 1024, 1024) for im in raw_imgs]
+    vision = processor.image_processor(images=vis_imgs, return_tensors="pt")
+    merge_size = processor.image_processor.merge_size ** 2
+    v_start = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    v_end = tokenizer.convert_tokens_to_ids("<|vision_end|>")
+    img_pad = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    token_ids, token_tags = [], []
+    for idx, grid in enumerate(vision["image_grid_thw"]):
+      label_ids = tokenizer(
+          f"Picture {idx + 1}: ", add_special_tokens=False
+      )["input_ids"][:4096]
+      v_len = int(grid.prod().item()) // merge_size
+      v_ids = [v_start] + [img_pad] * v_len + [v_end]
+      token_ids.extend(label_ids + v_ids)
+      token_tags.extend([TEXT_TAG] * len(label_ids) + [IMAGE_TAG] * len(v_ids))
+    p_ids = tokenizer(args.prompt, add_special_tokens=False)["input_ids"][:4096]
+    token_ids.extend(p_ids)
+    token_tags.extend([TEXT_TAG] * len(p_ids))
+    mm_ids = np.asarray(processor.create_mm_token_type_ids([token_ids]), dtype=np.int64)
+    pres = dict(
+        ids=np.asarray(token_ids, dtype=np.int32),
+        tags=np.asarray(token_tags, dtype=np.int64),
+        pixel_values=vision["pixel_values"].float().numpy(),
+        grid_thw=vision["image_grid_thw"].numpy(),
+        mm_token_type_ids=mm_ids,
+        image_pad_id=img_pad,
+    )
+    pos3 = r2v.text_positions(
+        img_snap, pres["ids"], pres["grid_thw"], pres["mm_token_type_ids"]
+    )
+    p_embeds = r2v.encode_text_with_vision(
+        encoder, vision_model, pres, pos3, cfg_text, dtype,
+        stop_at_layer=TEXT_ENCODER_LAYER, jit=True,
+    )
+    return p_embeds, pres["tags"], ref_imgs, [(im.height // 16 // 2 * 2, im.width // 16 // 2 * 2) for im in ref_imgs]
+
+  def encode_ref_latents(ref_imgs, tgen):
+    """Encode reference PIL images through the 3D VAE encoder using `tgen`."""
+    import torch
+    from diffusers.utils.torch_utils import randn_tensor
+
+    ref_latents = []
+    mean5 = np.asarray(PIXEL_MEAN, np.float32).reshape(1, 3, 1, 1, 1)
+    std5 = np.asarray(PIXEL_STD, np.float32).reshape(1, 3, 1, 1, 1)
+    for im in ref_imgs:
+      hc = im.height // 16 * 16
+      wc = im.width // 16 * 16
+      px = np.asarray(im, np.float32)[:hc, :wc].transpose(2, 0, 1)[None, :, None] / 255.0
+      px = (px - mean5) / std5
+      x_j = jnp.asarray(px, dtype)
+      moments = jvae.tiled_encode(
+          lambda t_: _ENC_ONE[0](enc_w, t_), x_j, mesh=mesh
+      )
+      moments_4d = np.asarray(moments[:, :, -1], np.float32)
+      mu, logvar = np.split(moments_4d, 2, axis=1)
+      sd = np.exp(0.5 * np.clip(logvar, -30.0, 20.0))
+      eps = randn_tensor(
+          tuple(mu.shape), generator=tgen, dtype=torch.float32
+      ).numpy()
+      lat = (mu + sd * eps).astype(np.float16).astype(np.float32)
+      lat = lat[..., :lat.shape[-2] // 2 * 2, :lat.shape[-1] // 2 * 2]
+      ref_latents.append((lat - lat_mean_np) / lat_std_np)
+    return ref_latents
+
+  # Initial prompt/vision encode to establish sequence layout
+  with jax.set_mesh(mesh):
+    prompt_embeds, text_tags, ref_imgs, ref_grids = encode_prompt_and_refs()
+    jax.block_until_ready(prompt_embeds)
+
+  (pos_np, tags_np, img_idx_np, txt_idx_np,
+   n_ref, n_target) = build_image_packed_sequence(
+      text_tags, ref_grids, latent_h, latent_w
+  )
+  seq = int(pos_np.shape[0])
+  row_step_np = np.zeros((seq,), dtype=np.int32)
+  if n_ref > 0:
+    row_step_np[img_idx_np[:n_ref]] = 1
+
+  position_ids = jax.device_put(jnp.asarray(pos_np), replicated)
+  token_tags = jax.device_put(jnp.asarray(tags_np), replicated)
+  image_idx = jax.device_put(jnp.asarray(img_idx_np), replicated)
+  text_idx = jax.device_put(jnp.asarray(txt_idx_np), replicated)
+  row_step = jax.device_put(jnp.asarray(row_step_np), replicated)
+
+  _idx = (row_step_np * dit.MODALITY_NUM + tags_np).astype(np.int64)
+  _edges = np.flatnonzero(_idx[1:] != _idx[:-1]) + 1
+  _bounds = [0, *_edges.tolist(), int(_idx.shape[0])]
+  segments = tuple((a, b, int(_idx[a])) for a, b in zip(_bounds, _bounds[1:]))
+  if not args.segments:
+    segments = None
+
+  graphdef, dit_state = nnx.split(transformer)
+
+  @jax.jit
+  def denoise_step(state, img_rows, text_emb, t_vec, dt_scalar, pdd_idx, mods=None):
+    model = nnx.merge(graphdef, state)
+    dv = model(
+        img_rows, None, text_emb, t_vec, row_step, token_tags, position_ids,
+        image_idx, None, text_idx, sdpa=sdpa, segments=segments,
+        adaln_mods=mods, pdd_step=pdd_idx,
+    )
+    gen = img_rows[:, n_ref:].astype(jnp.float32) + dt_scalar * dv[:, n_ref:].astype(jnp.float32)
+    return jnp.concatenate([img_rows[:, :n_ref], gen], axis=1) if n_ref else gen
+
+  @functools.partial(jax.jit, out_shardings=replicated)
+  def unpatchify_and_denorm(img_rows):
+    rows = img_rows[:, n_ref:] if n_ref else img_rows
+    x = rows.reshape(1, latent_h // 2, latent_w // 2, 24, 2, 2)
+    x = jnp.transpose(x, (0, 3, 1, 4, 2, 5)).reshape(1, 24, latent_h, latent_w)
+    return (x.astype(jnp.float32) * lat_std_jnp + lat_mean_jnp).astype(dtype)
+
+  def decode_image_2d(z_4d):
+    if args.decode_tile_shard and len(devices) > 1:
+      px = jvae.tiled_decode(
+          lambda t_: decode_tile_batch(dec_state, t_),
+          z_4d, tile_px=256, overlap_px=64, mesh=mesh,
+      )
+    else:
+      px = jvae.tiled_decode(
+          lambda t_: decode_tile_batch(dec_state, t_),
+          z_4d, tile_px=256, overlap_px=64,
+          batch=args.vae_tile_batch or 16,
+      )
+    return to_uint8_rgb(px)
+
+  def prepare_initial_rows():
+    import torch
+    from diffusers.utils.torch_utils import randn_tensor
+
+    tgen = torch.Generator().manual_seed(args.seed)
+    ref_latents = encode_ref_latents(ref_imgs, tgen) if n_ref else []
+    target_noise = randn_tensor(
+        (1, 24, 1, latent_h, latent_w), generator=tgen, dtype=torch.float32
+    ).numpy()[:, :, 0]
+    target_rows = patchify_2d(target_noise)
+    if not n_ref:
+      return jax.device_put(jnp.asarray(target_rows, jnp.float32), replicated)
+    cond_list = []
+    t0 = np.float32(0.999)
+    one_minus_t0 = np.float32(1.0) - t0
+    for rlat in ref_latents:
+      c_noise = randn_tensor(
+          tuple(rlat.shape), generator=tgen, dtype=torch.float32
+      ).numpy()
+      noised = t0 * rlat + one_minus_t0 * c_noise
+      cond_list.append(patchify_2d(noised))
+    all_rows = np.concatenate(cond_list + [target_rows], axis=1)
+    return jax.device_put(jnp.asarray(all_rows, jnp.float32), replicated)
+
+  def step_t_vec(i: int):
+    if n_ref:
+      return jax.device_put(
+          jnp.asarray([timesteps_np[i], np.float32(0.999)], jnp.float32),
+          replicated,
+      )
+    return jax.device_put(jnp.asarray([timesteps_np[i]], jnp.float32), replicated)
+
+  t_vecs = [step_t_vec(i) for i in range(args.steps)]
+  dt_scalars = [
+      jax.device_put(jnp.asarray(sigmas_np[i] - sigmas_np[i + 1], jnp.float32), replicated)
+      for i in range(args.steps)
+  ]
+  pdd_indices = [
+      jax.device_put(jnp.asarray(i, jnp.int32), replicated)
+      for i in range(args.steps)
+  ]
+
+  with jax.set_mesh(mesh):
+    if args.warmup:
+      t_w = time.perf_counter()
+      v0 = prepare_initial_rows()
+      v0 = denoise_step(
+          dit_state, v0, prompt_embeds, t_vecs[0], dt_scalars[0], pdd_indices[0],
+          None if adaln_mods is None else adaln_mods[0],
+      )
+      z0 = unpatchify_and_denorm(v0)
+      u0 = decode_image_2d(z0)
+      jax.block_until_ready(u0)
+      print(f"  warmup {time.perf_counter() - t_w:.2f}s", flush=True)
+      del v0, z0, u0
+
+    u8_host = None
+    for run_idx in range(args.runs):
+      t_run = time.perf_counter()
+      t_te0 = time.perf_counter()
+      prompt_embeds, _, _, _ = encode_prompt_and_refs()
+      jax.block_until_ready(prompt_embeds)
+      t_te = time.perf_counter() - t_te0
+
+      t_pipe0 = time.perf_counter()
+      rows = prepare_initial_rows()
+      jax.block_until_ready(rows)
+      t_den0 = time.perf_counter()
+      for i in range(args.steps):
+        rows = denoise_step(
+            dit_state, rows, prompt_embeds, t_vecs[i], dt_scalars[i], pdd_indices[i],
+            None if adaln_mods is None else adaln_mods[i],
+        )
+      z_4d = unpatchify_and_denorm(rows)
+      jax.block_until_ready(z_4d)
+      t_den = time.perf_counter() - t_den0
+
+      t_dec0 = time.perf_counter()
+      u8_dev = decode_image_2d(z_4d)
+      u8_host = np.asarray(u8_dev)
+      t_dec = time.perf_counter() - t_dec0
+      t_pipe = time.perf_counter() - t_pipe0
+      t_total = time.perf_counter() - t_run
+      print(
+          f"run {run_idx}: e2e {t_total:.3f}s | pipeline (warm cond) {t_pipe:.3f}s "
+          f"[text_encoder {t_te:.3f}s  denoise {t_den:.3f}s  vae_decode {t_dec:.3f}s]",
+          flush=True,
+      )
+
+  if u8_host is not None:
+    from PIL import Image
+    from diffusers.image_processor import VaeImageProcessor
+
+    os.makedirs(args.out, exist_ok=True)
+    pil_img = Image.fromarray(u8_host)
+    if (out_w, out_h) != (gen_w, gen_h):
+      pil_img = VaeImageProcessor().resize(pil_img, height=out_h, width=out_w)
+    out_path = os.path.join(args.out, f"{args.tag}.png")
+    pil_img.save(out_path)
+    np.save(os.path.join(args.out, f"{args.tag}.npy"), np.asarray(pil_img))
+    print(f"wrote {out_path} ({pil_img.size[0]}x{pil_img.size[1]})", flush=True)
+
+
+_ENC_ONE = [None]
+
+if __name__ == "__main__":
+  main()

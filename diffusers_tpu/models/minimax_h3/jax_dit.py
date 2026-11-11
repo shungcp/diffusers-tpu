@@ -59,6 +59,12 @@ CONFIG_FULL = dict(
     rope_theta=10000.0, norm_eps=1e-5, qk_norm_eps=1e-5, final_norm_eps=1e-5,
 )
 
+IMAGE_CONFIG_FULL = dict(
+    CONFIG_FULL,
+    audio_in_channels=0,
+    num_pdd_heads=6,
+)
+
 
 # Rotate all 128 lanes rather than slicing the leading 96 (see
 # `apply_rope_full_lane`). Off by default so the CPU equivalence check
@@ -632,7 +638,7 @@ def _build_modules():
                  patch_size=(1, 2, 2), text_dim=5120, freq_dim=256,
                  time_embed_hidden_dim=5376, time_embed_dim=2688,
                  rope_freq_dim=16, rope_theta=10000.0, norm_eps=1e-5,
-                 qk_norm_eps=1e-5, final_norm_eps=1e-5,
+                 qk_norm_eps=1e-5, final_norm_eps=1e-5, num_pdd_heads=0,
                  dtype=jnp.bfloat16, rngs=None):
       patch = patch_size[0] * patch_size[1] * patch_size[2]
       video_patch_dim = in_channels * patch
@@ -641,8 +647,11 @@ def _build_modules():
       self.rope_theta = rope_theta
       self.proj_in = Linear(video_patch_dim, hidden_size, bias=True,
                             dtype=jnp.float32, rngs=rngs)
-      self.audio_proj_in = Linear(audio_in_channels, hidden_size, bias=True,
-                                  dtype=jnp.float32, rngs=rngs)
+      self.audio_proj_in = (
+          Linear(audio_in_channels, hidden_size, bias=True,
+                 dtype=jnp.float32, rngs=rngs)
+          if audio_in_channels else None
+      )
       self.context_embedder = Linear(text_dim, hidden_size, bias=True,
                                      dtype=dtype, rngs=rngs)
       self.time_embedder = TimestepEmbedder(freq_dim, time_embed_hidden_dim,
@@ -658,15 +667,27 @@ def _build_modules():
           for _ in range(num_layers)])
       self.norm_out = AdaLNOut(hidden_size, time_embed_dim, final_norm_eps,
                                dtype=dtype, rngs=rngs)
-      self.proj_out = Linear(hidden_size, video_patch_dim, bias=True,
-                             dtype=jnp.float32, rngs=rngs)
-      self.audio_proj_out = Linear(hidden_size, audio_in_channels, bias=True,
-                                   dtype=jnp.float32, rngs=rngs)
+      if num_pdd_heads > 0:
+        self.proj_out = None
+        self.pdd_proj_out = nnx.List([
+            Linear(hidden_size, video_patch_dim, bias=True,
+                   dtype=jnp.float32, rngs=rngs)
+            for _ in range(num_pdd_heads)
+        ])
+      else:
+        self.proj_out = Linear(hidden_size, video_patch_dim, bias=True,
+                               dtype=jnp.float32, rngs=rngs)
+        self.pdd_proj_out = None
+      self.audio_proj_out = (
+          Linear(hidden_size, audio_in_channels, bias=True,
+                 dtype=jnp.float32, rngs=rngs)
+          if audio_in_channels else None
+      )
 
     def __call__(self, video, audio, text, timestep, timestep_indices,
                  token_tags, position_ids, video_indices, audio_indices,
                  text_indices, sdpa=None, segments=None, seq_len=None,
-                 text_len=None, adaln_mods=None):
+                 text_len=None, adaln_mods=None, pdd_step=None):
       """`seq_len` / `text_len` (optional, traced scalars): true lengths of
       the packed sequence / text. When given, inputs use bucketed shapes and
       attention masks by the true length (`jax_server`)."""
@@ -693,7 +714,6 @@ def _build_modules():
         token_tags = jnp.pad(token_tags, (0, extra))
 
       video_embeds = self.proj_in(video.astype(jnp.float32))
-      audio_embeds = self.audio_proj_in(audio.astype(jnp.float32))
       text_embeds = self.context_embedder(
           text.astype(self.context_embedder.weight[...].dtype))
       text_embeds = self.token_refiner(text_embeds, sdpa, text_len)
@@ -703,7 +723,9 @@ def _build_modules():
                     dtype)
       x = x.at[:, text_indices].set(text_embeds)
       x = x.at[:, video_indices].set(video_embeds.astype(dtype))
-      x = x.at[:, audio_indices].set(audio_embeds.astype(dtype))
+      if self.audio_proj_in is not None and audio is not None:
+        audio_embeds = self.audio_proj_in(audio.astype(jnp.float32))
+        x = x.at[:, audio_indices].set(audio_embeds.astype(dtype))
 
       temb = self.time_embedder(
           timestep_embedding(timestep, self.freq_dim))
@@ -729,8 +751,17 @@ def _build_modules():
       x = self.norm_out(x, temb, timestep_indices).astype(jnp.float32)
       if os.environ.get("DT_DUMP_BLOCKS"):
         jax.debug.callback(functools.partial(_blk_save, "normout"), x)
-      return (jnp.take(self.proj_out(x), video_indices, axis=1),
-              jnp.take(self.audio_proj_out(x), audio_indices, axis=1))
+      if self.pdd_proj_out is not None:
+        idx = 0 if pdd_step is None else pdd_step
+        w = jnp.stack([h.weight[...] for h in self.pdd_proj_out])[idx]
+        b = jnp.stack([h.bias[...] for h in self.pdd_proj_out])[idx]
+        vid_out = jnp.einsum("...i,oi->...o", x, w.astype(x.dtype)) + b.astype(x.dtype)
+      else:
+        vid_out = self.proj_out(x)
+      vid_out = jnp.take(vid_out, video_indices, axis=1)
+      if self.audio_proj_out is None:
+        return vid_out
+      return (vid_out, jnp.take(self.audio_proj_out(x), audio_indices, axis=1))
 
   return Block, Transformer
 
