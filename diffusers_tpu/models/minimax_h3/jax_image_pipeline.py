@@ -72,6 +72,9 @@ def parse_args():
                  help="Cast Q and K to float8_e4m3fn entering Pallas FlashAttention")
   p.add_argument("--int8-weights", action="store_true",
                  help="Quantize DiT and text encoder weights to int8 on load")
+  p.add_argument("--text-int8", action="store_true",
+                 help="Quantize only the text encoder to int8 (and keep its first 50 layers), "
+                      "so it stays on chip beside a bf16 DiT on 4 v6e chips")
   p.add_argument("--bf16-weights", action="store_true",
                  help="Round float32 input/output projections to bfloat16 on load")
   p.add_argument("--full-lane-rope", action="store_true",
@@ -314,9 +317,10 @@ def main():
   processor = AutoProcessor.from_pretrained(os.path.join(img_snap, "processor"))
   encoder, cfg_text = jtext.build(text_dir, dtype=dtype, abstract=True)
   _wc = os.environ.get("DT_WEIGHT_CACHE")
-  _tc = os.path.join(_wc, "text" + ("_int8" if args.int8_weights else "")) if _wc else None
+  _tc = os.path.join(_wc, "text" + ("_int8" if (args.int8_weights or args.text_int8) else "")) if _wc else None
+  text_int8 = args.int8_weights or args.text_int8
   if _tc and os.path.exists(os.path.join(_tc, "index.json")):
-    if args.int8_weights:
+    if text_int8:
       encoder.layers = nnx.List(list(encoder.layers)[:TEXT_ENCODER_LAYER])
     dit.load_param_cache(encoder, _tc, mesh,
                          lambda n, nd: jtext.param_spec(n.split("."), nd),
@@ -326,8 +330,8 @@ def main():
     if _tc:
       dit.CACHE_WRITE["dir"] = _tc
     jtext.load(encoder, text_dir, mesh=mesh, spec_fn=jtext.param_spec,
-               memory_kind=text_host, int8=args.int8_weights,
-               keep_layers=TEXT_ENCODER_LAYER if args.int8_weights else None)
+               memory_kind=text_host, int8=text_int8,
+               keep_layers=TEXT_ENCODER_LAYER if text_int8 else None)
     if _tc:
       dit.cache_finish()
   print(f"  text encoder loaded ({time.perf_counter() - began:.1f}s)", flush=True)
@@ -514,11 +518,19 @@ def main():
 
   # Compile text-only encoder jit
   _text_graph, _text_state = nnx.split(encoder)
-  _text_jit_raw = jax.jit(
-      lambda st, i, c, s: nnx.merge(_text_graph, st)(
-          i, c, s, stop_at_layer=TEXT_ENCODER_LAYER
-      )
-  )
+  # With the tower in pinned host memory (`--text-offload`), copy it in
+  # inside the jit: a `pinned_host` operand makes `gather`/`dot_general`
+  # raise rather than transfer, and inside the program XLA overlaps each
+  # layer's copy with the previous layer's compute (as in `jax_pipeline`).
+  _text_dev = (jax.tree.map(lambda a: a.sharding.with_memory_kind("device"), _text_state)
+               if text_host is not None else None)
+
+  def _text_fwd(st, i, c, s):
+    if _text_dev is not None:
+      st = jax.tree.map(jax.device_put, st, _text_dev)
+    return nnx.merge(_text_graph, st)(i, c, s, stop_at_layer=TEXT_ENCODER_LAYER)
+
+  _text_jit_raw = jax.jit(_text_fwd)
   _text_jit = lambda _m, i, c, s: _text_jit_raw(_text_state, i, c, s)
 
   def encode_prompt_and_refs():
