@@ -20,10 +20,8 @@ import time
 
 
 def _setup_env():
-  if "TORCH_TPU_TOPOLOGY" not in os.environ:
-    accel = next((f"/dev/{d}" for d in ("vfio", "accel") if os.path.isdir(f"/dev/{d}")), "")
-    devs = [e for e in (os.listdir(accel) if accel else ()) if e.isdigit()]
-    os.environ["TORCH_TPU_TOPOLOGY"] = "2,2,1,2" if len(devs) == 4 else "2,4,1"
+  from .torchtpu_h3 import _auto_env
+  _auto_env()
   _ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
   _local = max(1, int(os.environ.get("LOCAL_WORLD_SIZE", os.environ.get("WORLD_SIZE", 1))))
   _premap = min(192, max(1, (_ram // 2 // _local) >> 30)) << 30
@@ -83,7 +81,7 @@ def parse_args():
   p.add_argument("--aot-vae-group", type=int, default=12)
   p.add_argument("--vae-tile-batch", type=int, default=16)
   p.add_argument("--runs", type=int, default=2)
-  p.add_argument("--out", default="out")
+  p.add_argument("--out", "--output", dest="out", default="out")
   p.add_argument("--tag", default="h3_image_torchtpu")
   args = p.parse_args()
   if args.size:
@@ -113,9 +111,11 @@ def main():
       prepare_canvas,
   )
 
-  rank, world, all_reduce = tp_h3.init_parallel()
-  say = (lambda *a, **k: print(*a, **k)) if rank == 0 else (lambda *a, **k: None)
   device = torch.device("tpu")
+  rank, world, all_reduce = tp_h3.init_parallel()
+  if world > 1:
+    device = torch.device("tpu", rank)
+  say = (lambda *a, **k: print(*a, **k)) if rank == 0 else (lambda *a, **k: None)
   dtype = torch.bfloat16
 
   began = time.perf_counter()
@@ -240,7 +240,8 @@ def main():
           p_embeds = compiled_text(token_ids)
           if os.environ.get("DT_TEXT_CHECK") == "1":
             ref = get_qwen3vl_prompt_embeds(
-                text_encoder, processor, token_ids, {}, text_encoder_layer=50, device=device)
+                text_encoder, processor, token_ids, {},
+                text_encoder_layer=50, device=device, dtype=dtype)
             d = (p_embeds.float() - ref.float()).abs()
             a_, b_ = p_embeds.float().flatten(), ref.float().flatten()
             say(f"  [text-check] cos {float((a_ @ b_) / (a_.norm() * b_.norm())):.6f}", flush=True)
@@ -248,7 +249,8 @@ def main():
                 f"mean|d| {float(d.mean()):.3g}, |ref| {float(ref.float().abs().mean()):.3g}", flush=True)
         else:
           p_embeds = get_qwen3vl_prompt_embeds(
-              text_encoder, processor, token_ids, {}, text_encoder_layer=50, device=device
+              text_encoder, processor, token_ids, {},
+              text_encoder_layer=50, device=device, dtype=dtype
           )
       return p_embeds, tags, [], []
 
@@ -281,6 +283,7 @@ def main():
           },
           text_encoder_layer=50,
           device=device,
+          dtype=dtype,
       )
     ref_grids = [(im.height // 16 // 2 * 2, im.width // 16 // 2 * 2) for im in ref_imgs]
     return p_embeds, np.asarray(token_tags, dtype=np.int64), ref_imgs, ref_grids

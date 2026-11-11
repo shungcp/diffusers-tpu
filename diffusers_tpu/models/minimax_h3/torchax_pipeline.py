@@ -714,6 +714,7 @@ def install_attention(
     original = attention._partition_specs
 
     def partition_specs(mesh_, query_shape, self_attention):
+      self_attention = True
       query_spec, kv_spec, output = original(
           mesh_, query_shape, self_attention
       )

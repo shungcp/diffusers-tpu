@@ -14,6 +14,7 @@ for b in $(seq 20000 20 31000 | shuf | head -200); do
 done
 [ -n "$BASE" ] || { echo "no free port range" >&2; exit 1; }
 export TORCH_TPU_SLICEBUILDER_ADDRESSES=$(for j in 0 1 2 3 4 5 6 7; do printf "localhost:%d," $((BASE + j)); done | sed 's/,$//')
+unset TORCH_DEVICE_BACKEND_AUTOLOAD
 export PYTHONPATH=$R/compat/torchvision_stub${PYTHONPATH:+:$PYTHONPATH}
 export DT_SPMD_SAFE=1 DT_OURS_BQ=2048 DT_OURS_BKV=4096
 exec "${PYTHON:-python}" -m torch.distributed.run --nproc_per_node 8 --master_port $((BASE + 10)) \

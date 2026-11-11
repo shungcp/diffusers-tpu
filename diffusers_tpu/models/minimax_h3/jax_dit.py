@@ -497,6 +497,12 @@ def _build_modules():
         out = combine(h, bulk)
         if not head_runs:
           return out
+        head_width = sum(stop - start for start, stop, _ in head_runs)
+        if head_width >= 512:
+          pos = jnp.arange(h.shape[1])[None, :, None]
+          for start, stop, index in head_runs:
+            out = jnp.where((pos >= start) & (pos < stop), combine(h, index), out)
+          return out
         head = jnp.concatenate(
             [combine(h[:, start:stop], index)
              for start, stop, index in head_runs], axis=1)
@@ -734,8 +740,7 @@ def _build_modules():
       if os.environ.get("DT_DUMP_BLOCKS"):
         jax.debug.callback(functools.partial(_blk_save, "x0"), x)
         jax.debug.callback(functools.partial(_blk_save, "temb"), temb)
-      _barrier = (segments is not None or adaln_mods is not None
-                  or _tp_size() <= 2
+      _barrier = (_tp_size() <= 2
                   or os.environ.get("DT_BLOCK_BARRIER") == "1")
       for _i, block in enumerate(self.transformer_blocks):
         if _barrier and _i > 0:

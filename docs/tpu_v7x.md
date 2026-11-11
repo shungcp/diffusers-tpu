@@ -79,3 +79,34 @@ Workload / 测试负载：**Pika-H3-Flex 6-step text-to-video with audio (`t2va`
 | **`FLAGS_ASYNC_TC` (`torchax` / `JAX` extended flags)**<br>`+ async_collective_fusion`, `overlap_compute_collective_tc`, `ici_ag_pipelining`, `lhs_prioritize_async_depth`, `aggressive_opt_barrier_removal`, `scoped_vmem=65536` | `0` | `37.4 s` | `4.2 s` *(eager regression)* | `29.2 s` *(no gain)* | `4.0 s` | `identical=False`, `PSNR = 20.3 dB` | ❌ Compiler flags alone cannot overlap data-dependent unsplit `AR1`/`AR2`; global `scoped_vmem=65536` slows eager text encoder (`+2.8 s`) and barrier removal breaks bit-exactness |
 | **`FLAGS_ASYNC_TC` + `DT_POST_ATTN_PIPE=1`** | `1` (2-Slab) | **`31.9 s`** | `1.2 s` | **`26.6 s`** | `4.1 s` | `identical=False`, `PSNR = 20.2 dB` | Marginal `-0.1 s` over `BASE_FLAGS + PIPE=1`, but lowers PSNR (`21.8 -> 20.2 dB`) |
 
+---
+
+## 5. `MiniMax-H3-Image` (6-Step 2K & 4K) on TPU `v7x-8` vs. GPU Baselines / `MiniMax-H3-Image` 性能对比与优化
+
+`MiniMax-H3-Image` (`MiniMaxAI/MiniMax-H3-Image`) pairs the 33.4B `Qwen3-VL` conditioner (`stop_at_layer=51`) with a 50-layer DiT (`hidden=5376, heads=56×128, ffn=14336`, 6 step-specific output heads `pdd_proj_out.{0..5}`) and a 24-layer 2D ViT tiled VAE decoder (`tile_px=256, overlap_px=64`).
+
+### 5.1 Official GPU Baselines vs. TPU `v7x-8` (6 Steps, CFG-Free)
+
+| Hardware / Stack | Precision | 2K (`2048×2048`) `t2i` | 2K (`2048×2048`) `edit` | 4K (`4736×3552` / `4096×4096`) `t2i` | Stage Breakdown (`text + denoise + vae`) / Notes |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| **1 × RTX PRO 6000 Blackwell** (SGLang) | BF16 / FP8 | `3.434 s` / `2.338 s` | — | `18.544 s` / `14.445 s` | Warm pipeline median (excl. text encoder) |
+| **1 × NVIDIA H200** (SGLang / vLLM-Omni) | BF16 | `1.934 s` (`3.20 s` e2e) | — | `10.133 s` | SGLang warm pipeline / vLLM-Omni client e2e |
+| **2 × NVIDIA H200** (SGLang Ulysses2 / vLLM-Omni) | BF16 | `1.123 s` (`1.50 s` e2e) | — | `5.465 s` | 2-way Ulysses SP / TP |
+| **4 × NVIDIA H200** (vLLM-Omni Ulysses SP4) | BF16 | `0.88 s` (`TP4: 1.00 s`) | `1.35 s` | `3.84 s` | Resident Qwen3-VL + DiT + VAE |
+| **2 × NVIDIA B300** (SGLang Ulysses2) | BF16 | `0.604 s` | `0.931 s` | `2.654 s` (`edit: 3.146 s`) | Warm pipeline median (excl. text encoder) |
+| **TPU `v7x-8` (`JAX`)** | **BF16** | **`0.861 s`** (`0.879 s` e2e) | **`1.089 s`** (`1.496 s` w/ ref VAE) | **`3.155 s`** (`3.174 s` e2e) | `0.018 s + 0.834 s / 3.081 s + 0.024 s / 0.064 s` |
+| **TPU `v7x-8` (`JAX`)** | **FP8** | **`0.833 s`** (`0.852 s` e2e) | **`0.929 s`** (`1.322 s` w/ ref VAE) | **`3.053 s`** (`3.074 s` e2e) | `0.019 s + 0.806 s / 2.975 s + 0.024 s / 0.066 s` |
+| **TPU `v7x-8` (`torchax`)** | **BF16** | **`1.057 s`** (`1.075 s` e2e) | — | **`2.941 s`** (`2.961 s` e2e) | `0.018 s + 1.031 s / 2.865 s + 0.023 s / 0.064 s` |
+| **TPU `v7x-8` (`torch_tpu`)** | **BF16** | **`0.944 s`** (`1.287 s` e2e) | — | **`3.121 s` / `3.358 s`** (`3.709 s` e2e) | `denoise` **`0.721 s` (2K) / `2.442 s` (4K)** + `vae 0.219 s / 0.662 s` |
+| **TPU `v7x-8` (`torch_tpu`, `DT_POST_ATTN_PIPE=1`)** | **BF16** | **`0.944 s`** (`1.343 s` e2e) | — | **`2.673 s` / `2.758 s`** (`3.086 s` e2e) | `denoise` **`2.034 s` / `2.049 s` (4K)** + `vae 0.623 s / 0.696 s` |
+
+### 5.2 `MiniMax-H3-Image` Optimization Progression on `v7x-8`
+
+| Step | Optimization / 核心优化项 | 2K (`2048×2048`) | 4K (`4736×3552` / `4096×4096`) | Speedup |
+| :--- | :--- | :---: | :---: | :---: |
+| **Opt-0** | Initial `JAX` baseline (`--adaln-host` inter-block barrier, unaligned `seq`, sublane RoPE) | `2.202 s` (`FP8: 1.937 s`) | `7.771 s` (`FP8: 6.947 s`) | `1.00×` |
+| **Opt-1** | Remove inter-block `optimization_barrier` on 8-device TP (`_tp_size() > 2`) + 8-way sharded `adaln_proj` + `--segments` + `--full-lane-rope` + `--pad-sequence-to 128` | **`0.861 s`** (`FP8: 0.833 s`) | **`3.155 s`** (`FP8: 3.053 s`) | **`2.56×` (2K) / `2.46×` (4K)** |
+| **Opt-2** | `torchax` hybrid pipeline with custom Pallas Splash Attention (`jquery.shape[2] == jkey.shape[2]` self-attention routing) + segmented modulation + JAX 2D ViT tile-sharded VAE (`0.023 s` at 2K, `0.064 s` at 4K) | **`1.057 s`** (`1.075 s` e2e) | **`2.941 s`** (`2.961 s` e2e) | **`2.64×` (4K)** |
+| **Opt-3** | JIT-compiled 3D causal reference VAE encoder (`_enc_one_tile`) + elementwise `jnp.where` for long `head_runs` (`>= 512` tokens) in `edit` mode | `2.787 s` -> **`1.496 s`** (BF16) / `2.908 s` -> **`1.322 s`** (FP8; `denoise+vae` **`0.929 s`**) | — | **`2.20×` (2K Edit)** |
+| **Opt-4** | `torch_tpu` 8-rank TP (`AotBlocks(group=10)` + BHSD norm/RoPE + fused segmented mod + 8-rank batched 2D ViT VAE decode + `DT_POST_ATTN_PIPE=1` 2-slab overlap on 4K) | **`0.944 s`** (`denoise` **`0.721 s`**) | `3.121 s` -> **`2.673 s`** (`denoise` `2.442 s` -> **`2.034 s`**) | **`2.91×` (4K)** |
+

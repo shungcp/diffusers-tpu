@@ -205,7 +205,7 @@ def parse_args():
   p.add_argument("--scoped-vmem-kib", type=int, default=65536)
   p.add_argument("--warmup", action="store_true", default=True)
   p.add_argument("--runs", type=int, default=2)
-  p.add_argument("--out", default="out")
+  p.add_argument("--out", "--output", dest="out", default="out")
   p.add_argument("--tag", default="h3_image_torchax")
   args = p.parse_args()
   if args.size:
@@ -354,6 +354,7 @@ def main():
     qg_vae, qs_vae = nnx.split(quant_conv)
     enc_w = (es_vae, qs_vae)
 
+    @functools.partial(jax.jit, out_shardings=replicated)
     def _enc_one_tile(w, tile):
       with jax.default_matmul_precision("highest"):
         e_mod = nnx.merge(eg_vae, w[0])

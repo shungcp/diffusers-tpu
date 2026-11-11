@@ -80,15 +80,16 @@ def parse_args():
                       "so it stays on chip beside a bf16 DiT on 4 v6e chips")
   p.add_argument("--bf16-weights", action="store_true",
                  help="Round float32 input/output projections to bfloat16 on load")
-  p.add_argument("--full-lane-rope", action="store_true",
+  p.add_argument("--full-lane-rope", action="store_true", default=True,
                  help="Use 128-lane matrix multiply for RoPE")
-  p.add_argument("--pad-sequence-to", type=int, default=0,
+  p.add_argument("--pad-sequence-to", type=int,
+                 default=0 if os.environ.get("DT_STREAM_SHARD", "whole") == "whole" else 128,
                  help="Pad packed sequence length up to a multiple of this")
   p.add_argument("--block-q", type=int, default=2048)
   p.add_argument("--block-kv", type=int, default=4096)
   p.add_argument("--block-kv-compute", type=int, default=0)
   p.add_argument("--dense-attention", action="store_true")
-  p.add_argument("--segments", action="store_true",
+  p.add_argument("--segments", action="store_true", default=True,
                  help="Use segment-wise AdaLN modulation in JAX DiT")
   p.add_argument("--vae-tile-batch", type=int, default=0,
                  help="Batch size for tiled 2D VAE decode when weights are TP-sharded")
@@ -100,7 +101,7 @@ def parse_args():
                  help="Number of timed generation runs")
   p.add_argument("--compile-cache", default="")
   p.add_argument("--cache-only", action="store_true")
-  p.add_argument("--out", default="out")
+  p.add_argument("--out", "--output", dest="out", default="out")
   p.add_argument("--tag", default="h3_image_jax")
   args = p.parse_args()
   if args.size:
@@ -511,6 +512,7 @@ def main():
     qg_vae, qs_vae = nnx.split(quant_conv)
     enc_w = (es_vae, qs_vae)
 
+    @functools.partial(jax.jit, out_shardings=replicated)
     def _enc_one_tile(w, tile):
       with jax.default_matmul_precision("highest"):
         e_mod = nnx.merge(eg_vae, w[0])
