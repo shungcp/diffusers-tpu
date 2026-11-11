@@ -118,6 +118,18 @@ def install(transformer, verbose=print) -> bool:
     return out.index_copy(
         1, torch.arange(head.shape[1], device=x.device), head)
 
+  def by_runs_add(residual, x, gate, runs, head_idx):
+    """Fuse `residual + gate * x` before `index_copy` to avoid materialising `gate * x`."""
+    *head_runs, (_, _, bulk) = runs
+    if not head_runs:
+      return residual + gate[bulk] * x
+    out = residual + gate[bulk] * x
+    head = torch.cat([
+        residual[:, s:e] + gate[i] * x[:, s:e]
+        for s, e, i in head_runs
+    ], dim=1)
+    return out.index_copy(1, head_idx, head)
+
   def forward(self, hidden_states, temb, adaln_indices, rotary_emb,
               attention_mask=None, **kw):
     if _RUNS is None and not torch.compiler.is_compiling():
@@ -134,6 +146,11 @@ def install(transformer, verbose=print) -> bool:
     # stream overlapping all-reduce; removing all of them on ref2va exposed
     # the all-reduce (1.2 s -> 21.7 s exclusive, net 17 s slower).
     part = os.environ.get("DT_SEGMOD_PART", "all")
+    fused_res = os.environ.get("DT_FUSED_RES_MOD", "1") == "1"
+    head_len = runs[-1][0] if len(runs) > 1 else 0
+    head_idx = (torch.arange(head_len, device=hidden_states.device)
+                if (fused_res and head_len > 0) else None)
+
     def mod(x, fn, which):
       if part == "all" or part == which:
         return by_runs(x, runs, fn)
@@ -144,16 +161,22 @@ def install(transformer, verbose=print) -> bool:
         self.norm1(hidden_states),
         lambda x, i: x * (1.0 + scale_msa[i]) + shift_msa[i], "msa")
     attn_output = self.attn(norm_hidden_states, rotary_emb, attention_mask)
-    hidden_states = residual + mod(
-        attn_output, lambda x, i: gate_msa[i] * x, "msa")
+    if fused_res and (part == "all" or part == "msa") and head_idx is not None:
+      hidden_states = by_runs_add(residual, attn_output, gate_msa, runs, head_idx)
+    else:
+      hidden_states = residual + mod(
+          attn_output, lambda x, i: gate_msa[i] * x, "msa")
 
     residual = hidden_states
     norm_hidden_states = mod(
         self.norm2(hidden_states),
         lambda x, i: x * (1.0 + scale_mlp[i]) + shift_mlp[i], "mlp")
     ff_output = self.ff(norm_hidden_states)
-    hidden_states = residual + mod(
-        ff_output, lambda x, i: gate_mlp[i] * x, "mlp")
+    if fused_res and (part == "all" or part == "mlp") and head_idx is not None:
+      hidden_states = by_runs_add(residual, ff_output, gate_mlp, runs, head_idx)
+    else:
+      hidden_states = residual + mod(
+          ff_output, lambda x, i: gate_mlp[i] * x, "mlp")
     return hidden_states
 
   cls.forward = forward
