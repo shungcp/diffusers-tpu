@@ -87,6 +87,49 @@ class TorchaxImageTransformer(torch.nn.Module):
         name: jax.device_put(_to_jax(tensor), self._device[name])
         for name, tensor in list(model.named_parameters()) + list(model.named_buffers())
     }
+    if os.environ.get("DT_SWIGLU_INTERLEAVE", "1") == "1":
+      self._interleave_swiglu()
+
+  def _interleave_swiglu(self):
+    """Give every chip matching (value, gate) rows of each `ff.net.0.proj`.
+
+    The projection is split on its output rows (`P("tp", None)`), so with
+    diffusers' layout -- all value rows, then all gate rows -- the first half
+    of the mesh holds only values and the second only gates, and
+    `SwiGLU.forward`'s `chunk(2)` exchanges them across the mesh every block.
+    Reordering the rows to `(tp, 2, ffn // tp)` and splitting the same way
+    keeps the arithmetic and makes the split local, as `jax_dit`'s
+    `interleave_swiglu_weights` does for the JAX backend.
+    """
+    from diffusers.models.activations import SwiGLU
+
+    tp = self._mesh.devices.size
+    if tp <= 1:
+      return
+
+    @jax.jit
+    def perm(w):
+      two_f, d = w.shape
+      return w.reshape(2, tp, two_f // (2 * tp), d).transpose(1, 0, 2, 3).reshape(two_f, d)
+
+    def forward(module, x):
+      h = module.proj(x)
+      h = h.unflatten(-1, (tp, 2, -1))
+      value, gate = h[..., 0, :], h[..., 1, :]
+      return (value * module.activation(gate)).flatten(-2)
+
+    count = 0
+    for name, module in self._model.named_modules():
+      if isinstance(module, SwiGLU) and f"{name}.proj.weight" in self._params:
+        key = f"{name}.proj.weight"
+        with self._mesh:
+          self._params[key] = jax.device_put(perm(self._params[key]), self._device[key])
+        bias = f"{name}.proj.bias"
+        if bias in self._params:
+          raise NotImplementedError("SwiGLU with a bias")
+        module.forward = functools.partial(forward, module)
+        count += 1
+    print(f"  [swiglu] {count} feed-forward projections interleaved over tp={tp}", flush=True)
 
   def forward_jax(self, inputs_jax: dict, token_tags_cpu: torch.Tensor,
                   timestep_indices_cpu: torch.Tensor, pdd_step_index: int):
@@ -155,6 +198,9 @@ def parse_args():
   p.add_argument("--block-kv", type=int, default=4096)
   p.add_argument("--fixed-m", action="store_true", default=True)
   p.add_argument("--full-lane-rope", action="store_true", default=True)
+  p.add_argument("--attention-keep-heads", action=argparse.BooleanOptionalAction, default=True,
+                 help="leave the attention output split by heads, so `to_out` ends in one all-reduce "
+                      "(see `torchax_pipeline.install_attention`)")
   p.add_argument("--qk-fp8", action="store_true")
   p.add_argument("--scoped-vmem-kib", type=int, default=65536)
   p.add_argument("--warmup", action="store_true", default=True)
@@ -246,6 +292,7 @@ def main():
       block_q=args.block_q,
       block_kv=args.block_kv,
       full_lane_rope=args.full_lane_rope,
+      keep_heads=args.attention_keep_heads,
       qk_fp8=args.qk_fp8,
   )
   tx_dit = TorchaxImageTransformer(pt_dit, mesh, scoped_vmem_kib=args.scoped_vmem_kib)
