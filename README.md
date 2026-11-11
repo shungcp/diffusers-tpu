@@ -25,8 +25,8 @@ Every model can run through three backends, so you can pick the one that fits yo
 Newest first. Each entry links a date to what changed.
 最新的在最上面。每条记录写明日期和变化。
 
-- **2026-11-11** — MiniMax-H3-Image (six-step text-to-image and editing) on all three backends; diffusers moves to `875373a`, which ships the model, for every model here (JAX, torchax and Qwen-Image outputs unchanged). On a v6e-8 the JAX backend generates a 2048x2048 image in **0.68 s** and a 4736x3552 one in **3.08 s** ([numbers](#minimax-h3-image--six-steps)). An image is a short sequence, so its JAX transformer keeps the residual stream whole, leaves the attention output split by heads and gives each chip matching SwiGLU rows: every block then needs two plain all-reduces (4736x3552 denoise 7.42 -> 2.99 s). torchax takes the same two steps for its attention output and SwiGLU rows (4736x3552 4.00 -> 3.12 s).
-  **2026-11-11** — MiniMax-H3-Image(六步文生图与图像编辑)支持三种后端;diffusers 升级到包含该模型的 `875373a`,本仓库所有模型同步升级(JAX、torchax 和 Qwen-Image 输出不变)。v6e-8 上 JAX 后端生成 2048x2048 图像 **0.68 秒**,4736x3552 **3.08 秒**([数字](#minimax-h3-image--six-steps))。图像序列短,其 JAX transformer 让残差流整份常驻、注意力输出保持按头切分、SwiGLU 行按 chip 交错:每个 block 只需两次普通 all-reduce(4736x3552 去噪 7.42 -> 2.99 秒)。torchax 的注意力输出与 SwiGLU 行做了同样两项处理(4736x3552 4.00 -> 3.12 秒)。
+- **2026-11-11** — MiniMax-H3-Image (six-step text-to-image and editing) on all three backends; diffusers moves to `875373a`, which ships the model, for every model here (JAX, torchax and Qwen-Image outputs unchanged). On a v6e-8 the JAX backend generates a 2048x2048 image in **0.68 s** and a 4736x3552 one in **3.08 s** ([numbers](#minimax-h3-image--six-steps)). An image is a short sequence, so its JAX transformer keeps the residual stream whole, leaves the attention output split by heads and gives each chip matching SwiGLU rows: every block then needs two plain all-reduces (4736x3552 denoise 7.42 -> 2.99 s). torchax takes the same two steps for its attention output and SwiGLU rows (4736x3552 4.00 -> 3.12 s). torch_tpu stitches the decoded tiles in one compiled program instead of op by op (decode 0.66 -> 0.14 s at 4736x3552).
+  **2026-11-11** — MiniMax-H3-Image(六步文生图与图像编辑)支持三种后端;diffusers 升级到包含该模型的 `875373a`,本仓库所有模型同步升级(JAX、torchax 和 Qwen-Image 输出不变)。v6e-8 上 JAX 后端生成 2048x2048 图像 **0.68 秒**,4736x3552 **3.08 秒**([数字](#minimax-h3-image--six-steps))。图像序列短,其 JAX transformer 让残差流整份常驻、注意力输出保持按头切分、SwiGLU 行按 chip 交错:每个 block 只需两次普通 all-reduce(4736x3552 去噪 7.42 -> 2.99 秒)。torchax 的注意力输出与 SwiGLU 行做了同样两项处理(4736x3552 4.00 -> 3.12 秒)。torch_tpu 把解码后的 tile 拼接编译成一个程序,不再逐算子执行(4736x3552 解码 0.66 -> 0.14 秒)。
 - **2026-11-11** — torch_tpu 2-slab post-attention pipeline (`DT_POST_ATTN_PIPE=1`): splits `to_out -> all_reduce -> norm2 -> FFN -> all_reduce` into two 4096-aligned slabs so each slab's `all_reduce` overlaps the other's `norm2 + FFN` compute; 768p Pika-H3-Flex 34.6 -> **32.0 s** on a v7x-8 (denoise 29.2 -> 26.8 s, PSNR 21.8 dB; off on v6e-8 where 32 GB HBM is full; [details](docs/tpu_v7x.md)).
   **2026-11-11** — torch_tpu 注意力后 2-slab 流水线(`DT_POST_ATTN_PIPE=1`):将 `to_out -> all_reduce -> norm2 -> FFN -> all_reduce` 切为两个 4096 对齐分块,使两块的 `all_reduce` 与对方的 `norm2 + FFN` 计算重叠;v7x-8 上 768p Pika-H3-Flex 从 34.6 秒降至 **32.0 秒**(去噪 29.2 -> 26.8 秒,PSNR 21.8 dB;v6e-8 每 chip 32 GB HBM 不足故保持关闭;[详情](docs/tpu_v7x.md))。
 - **2026-11-11** — torch_tpu DiT block: fuse `residual + gate * x` before `index_copy` in segmented modulation and transpose Q/K/V to `(B, H, S, D)` before `norm_q`/`norm_k` and RoPE. Same frames; 768p Pika-H3-Flex 35.1 -> **34.6 s** on a v7x-8, and on a v6e-8 Pika 47.6 -> **46.6 s**, lossy text-to-video 45.1 -> **43.2 s**.
@@ -125,8 +125,8 @@ v6e-8,暖请求(文本编码器、transformer 与解码器常驻),端到端,含�
 
 | | JAX | torchax | torch_tpu |
 |---|---|---|---|
-| 2048x2048 (4,149 rows / 行) | **0.68 s** | 0.74 s | 1.2–1.6 s |
-| 4736x3552 (16,481 rows / 行) | **3.08 s** | 3.12 s | 4.24 s |
+| 2048x2048 (4,149 rows / 行) | **0.68 s** | 0.74 s | 1.25 s |
+| 4736x3552 (16,481 rows / 行) | **3.08 s** | 3.12 s | 3.91 s |
 | edit 2048x2048, one reference / 编辑,一张参考图 | **1.94 s** | 2.10 s | |
 | edit 4096x4096, one reference / 编辑,一张参考图 | **4.37 s** | | |
 

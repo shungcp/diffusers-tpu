@@ -270,6 +270,8 @@ def main():
       ref_latents.append(((lat - lat_mean) / lat_std).to("cpu").numpy())
     return ref_latents
 
+  _stitch_cache = {}
+
   def sharded_decode_2d(z_4d: torch.Tensor) -> np.ndarray:
     """8-rank parallel batched 2D ViT tile decode + ICI all_gather + on-chip uint8."""
     ratio = vae.spatial_compression_ratio
@@ -308,16 +310,30 @@ def main():
         all_dec = tp_h3.init_parallel.all_gather(my_dec, dim=0)[:n_tiles]
       else:
         all_dec = my_dec[:n_tiles]
-      ncol = len(xs)
-      rows = [
-          [all_dec[i * ncol + j:i * ncol + j + 1] for j in range(ncol)]
-          for i in range(len(ys))
-      ]
-      dec = vae._stitch_tiles(rows, yo, xo)
-    rgb = (dec.float() * px_std + px_mean).clamp(0.0, 1.0)
-    u8 = (rgb * 255.0).clamp(0.0, 255.0).to(torch.uint8)[0].permute(1, 2, 0).contiguous()
+      key = (tuple(all_dec.shape), tuple(yo), tuple(xo), len(ys), len(xs))
+      fn = _stitch_cache.get(key)
+      if fn is None:
+        # Blending a few hundred tiles op by op cost 0.66 s at 4736x3552; the
+        # stitch and the uint8 conversion are one program per canvas size.
+        ncol, nrow = len(xs), len(ys)
+
+        def stitch_u8(tiles_):
+          rows = [[tiles_[i * ncol + j:i * ncol + j + 1] for j in range(ncol)]
+                  for i in range(nrow)]
+          return to_u8(vae._stitch_tiles(rows, yo, xo))
+        fn = torch.compile(stitch_u8, backend="tpu", fullgraph=True, dynamic=False)
+        _stitch_cache[key] = fn
+      with torch.no_grad():
+        u8 = fn(all_dec)
+      torch.accelerator.synchronize()
+      return u8.to("cpu").numpy()
+    u8 = to_u8(dec)
     torch.accelerator.synchronize()
     return u8.to("cpu").numpy()
+
+  def to_u8(dec):
+    rgb = (dec.float() * px_std + px_mean).clamp(0.0, 1.0)
+    return (rgb * 255.0).clamp(0.0, 255.0).to(torch.uint8)[0].permute(1, 2, 0).contiguous()
 
   # Initial prompt encode & sequence packing
   prompt_embeds, text_tags, ref_imgs, ref_grids = encode_prompt_and_refs()
