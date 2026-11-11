@@ -170,6 +170,9 @@ def install(transformer, verbose=print) -> bool:
         and torch.compiler.is_compiling()
         and hidden_states.shape[1] >= 16384):
       S = hidden_states.shape[1]
+      # Multiple of 4096 (and 256, matching the 256x256 MXU on TPU v6e/v7x);
+      # for 768p 345f (S=103989), S0=49152 (192x256) keeps all 1,173 head rows
+      # in Slab 0 so Slab 1 is 100% video rows and needs no index_copy.
       S0 = ((S // 2) // 4096) * 4096
       runs_0 = (*runs[:-1], (runs[-1][0], S0, runs[-1][2]))
       bulk = runs[-1][2]

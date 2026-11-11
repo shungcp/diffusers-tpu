@@ -168,7 +168,7 @@ def install(verbose=print, fixed_m: bool = True) -> bool:
         key = attn.to_k(hidden_states)
         value = attn.to_v(hidden_states)
       # Transpose to (B, H, S, D) immediately so norm_q, norm_k and RoPE
-      # operate on (S, D) 2D tiles matching TPU's native (8, 128) tile layout.
+      # operate on (S, D) 2D tiles matching the VPU/HBM (8, 128) sublane x lane layout.
       query = query.unflatten(-1, (attn.heads, -1)).transpose(1, 2)
       key = key.unflatten(-1, (attn.heads, -1)).transpose(1, 2)
       value = value.unflatten(-1, (attn.heads, -1)).transpose(1, 2)
