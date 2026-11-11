@@ -72,6 +72,9 @@ def parse_args():
                  help="Cast Q and K to float8_e4m3fn entering Pallas FlashAttention")
   p.add_argument("--int8-weights", action="store_true",
                  help="Quantize DiT and text encoder weights to int8 on load")
+  p.add_argument("--free-text-after", action="store_true",
+                 help="encode the prompt once, then free the text encoder before the DiT loads "
+                      "(text-to-image; small hosts such as a v5e-1); later runs reuse the embedding")
   p.add_argument("--text-int8", action="store_true",
                  help="Quantize only the text encoder to int8 (and keep its first 50 layers), "
                       "so it stays on chip beside a bf16 DiT on 4 v6e chips")
@@ -335,6 +338,48 @@ def main():
     if _tc:
       dit.cache_finish()
   print(f"  text encoder loaded ({time.perf_counter() - began:.1f}s)", flush=True)
+  # Compile text-only encoder jit
+  _text_graph, _text_state = nnx.split(encoder)
+  # With the tower in pinned host memory (`--text-offload`), copy it in
+  # inside the jit: a `pinned_host` operand makes `gather`/`dot_general`
+  # raise rather than transfer, and inside the program XLA overlaps each
+  # layer's copy with the previous layer's compute (as in `jax_pipeline`).
+  _text_dev = (jax.tree.map(lambda a: a.sharding.with_memory_kind("device"), _text_state)
+               if text_host is not None else None)
+
+  def _text_fwd(st, i, c, s):
+    if _text_dev is not None:
+      st = jax.tree.map(jax.device_put, st, _text_dev)
+    return nnx.merge(_text_graph, st)(i, c, s, stop_at_layer=TEXT_ENCODER_LAYER)
+
+  _text_jit_raw = jax.jit(_text_fwd)
+  _text_jit = lambda _m, i, c, s: _text_jit_raw(_text_state, i, c, s)
+
+  def encode_t2i_prompt():
+    token_ids = tokenizer(args.prompt, add_special_tokens=False)["input_ids"][:4096]
+    tags = np.ones((len(token_ids),), dtype=np.int64)
+    ids_np = np.asarray([token_ids], dtype=np.int32)
+    pos = np.broadcast_to(np.arange(ids_np.shape[1])[None, :], (3, ids_np.shape[1]))
+    cos, sin = qwen_text.mrope_cos_sin(
+        pos, head_dim=cfg_text["head_dim"], rope_theta=cfg_text["rope_theta"],
+        mrope_section=cfg_text["mrope_section"])
+    cos_j = jax.device_put(jnp.asarray(cos, dtype), replicated)
+    sin_j = jax.device_put(jnp.asarray(sin, dtype), replicated)
+    ids_j = jax.device_put(jnp.asarray(ids_np, jnp.int32), replicated)
+    return _text_jit(encoder, ids_j, cos_j, sin_j), tags, [], []
+
+  cached_text = None
+  if args.free_text_after and not args.reference:
+    # One prompt, then drop the tower: on a 47 GB host (v5e-1) the int8 text
+    # tower and the int8 DiT do not fit in host memory together.
+    cached_text = encode_t2i_prompt()
+    jax.block_until_ready(cached_text[0])
+    del encoder, _text_state, _text_jit_raw, _text_jit
+    encoder = None
+    jax.clear_caches()
+    from .jax_pipeline import _release_host_memory
+    _release_host_memory()
+    print("  text encoder freed after encoding the prompt", flush=True)
 
   vision_model = None
   if args.reference:
@@ -516,43 +561,11 @@ def main():
         f"(latent {latent_w}x{latent_h}, {(latent_h // 2) * (latent_w // 2)} image tokens)",
         flush=True)
 
-  # Compile text-only encoder jit
-  _text_graph, _text_state = nnx.split(encoder)
-  # With the tower in pinned host memory (`--text-offload`), copy it in
-  # inside the jit: a `pinned_host` operand makes `gather`/`dot_general`
-  # raise rather than transfer, and inside the program XLA overlaps each
-  # layer's copy with the previous layer's compute (as in `jax_pipeline`).
-  _text_dev = (jax.tree.map(lambda a: a.sharding.with_memory_kind("device"), _text_state)
-               if text_host is not None else None)
-
-  def _text_fwd(st, i, c, s):
-    if _text_dev is not None:
-      st = jax.tree.map(jax.device_put, st, _text_dev)
-    return nnx.merge(_text_graph, st)(i, c, s, stop_at_layer=TEXT_ENCODER_LAYER)
-
-  _text_jit_raw = jax.jit(_text_fwd)
-  _text_jit = lambda _m, i, c, s: _text_jit_raw(_text_state, i, c, s)
 
   def encode_prompt_and_refs():
     """Run text (+ optional vision + reference VAE) encoding."""
     if not args.reference:
-      token_ids = tokenizer(
-          args.prompt, add_special_tokens=False
-      )["input_ids"][:4096]
-      tags = np.ones((len(token_ids),), dtype=np.int64)
-      ids_np = np.asarray([token_ids], dtype=np.int32)
-      pos = np.broadcast_to(np.arange(ids_np.shape[1])[None, :], (3, ids_np.shape[1]))
-      cos, sin = qwen_text.mrope_cos_sin(
-          pos,
-          head_dim=cfg_text["head_dim"],
-          rope_theta=cfg_text["rope_theta"],
-          mrope_section=cfg_text["mrope_section"],
-      )
-      cos_j = jax.device_put(jnp.asarray(cos, dtype), replicated)
-      sin_j = jax.device_put(jnp.asarray(sin, dtype), replicated)
-      ids_j = jax.device_put(jnp.asarray(ids_np, jnp.int32), replicated)
-      p_embeds = _text_jit(encoder, ids_j, cos_j, sin_j)
-      return p_embeds, tags, [], []
+      return cached_text if cached_text is not None else encode_t2i_prompt()
 
     from PIL import Image, ImageOps
     raw_imgs = [
@@ -652,9 +665,18 @@ def main():
     segments = None
 
   graphdef, dit_state = nnx.split(transformer)
+  # `--offload`: the DiT sits in pinned host memory. A host operand makes
+  # `dot_general` raise rather than transfer, so the copy is asked for inside
+  # the program, where XLA overlaps each block's transfer with the previous
+  # block's compute (as `jax_pipeline` does).
+  dit_dev = (jax.tree.map(lambda v: NamedSharding(mesh, v.sharding.spec, memory_kind="device"),
+                          dit_state)
+             if dit_host is not None else None)
 
   @jax.jit
   def denoise_step(state, img_rows, text_emb, t_vec, dt_scalar, pdd_idx, mods=None):
+    if dit_dev is not None:
+      state = jax.tree.map(jax.device_put, state, dit_dev)
     model = nnx.merge(graphdef, state)
     dv = model(
         img_rows, None, text_emb, t_vec, row_step, token_tags, position_ids,
