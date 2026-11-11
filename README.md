@@ -133,6 +133,9 @@ v6e-8,暖请求(文本编码器、transformer 与解码器常驻),端到端,含�
 On 4 chips (a v6e-4) add `--chips 4 --text-int8`: the text encoder is kept on chip in int8 (first 50 layers) beside the bf16 transformer. 2048x2048 in 0.93 s, 4736x3552 in 4.38 s. `--text-offload` keeps it in host memory instead and streams it each request (+0.5 s).
 4 个 chip(v6e-4)上加 `--chips 4 --text-int8`:文本编码器以 int8(前 50 层)常驻 chip,与 bf16 transformer 并存。2048x2048 0.93 秒,4736x3552 4.38 秒。`--text-offload` 则把它放在主机内存、每次请求流式送入(多 0.5 秒)。
 
+On one TPU v5e chip (16 GB HBM, 47 GB host memory) add `--chips 1 --offload --int8-weights --free-text-after`: the prompt is encoded, the text encoder freed, and the int8 DiT streamed from host memory each step. 2048x2048 in 11.4 s, 4736x3552 in 43.7 s; `--int8-weights` changes the output a little.
+单个 TPU v5e chip(16 GB HBM、47 GB 主机内存)上加 `--chips 1 --offload --int8-weights --free-text-after`:先编码提示词并释放文本编码器,int8 DiT 每步从主机内存流式送入。2048x2048 11.4 秒,4736x3552 43.7 秒;`--int8-weights` 会让结果略有变化。
+
 Six steps make the images chaotic in bfloat16: changing only an attention block size moves the latents to a cosine of 0.85 by the fifth step, so backends agree on scene and quality, not on pixels (the diffusers documentation says the same).
 六步采样在 bfloat16 下对微小差异很敏感:只改注意力分块大小,第五步的 latents 余弦相似度就降到 0.85,因此各后端的画面内容与质量一致,但像素不同(diffusers 文档也这样说明)。
 
