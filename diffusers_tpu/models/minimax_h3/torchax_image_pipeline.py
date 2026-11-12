@@ -135,7 +135,12 @@ class TorchaxImageTransformer(torch.nn.Module):
                   timestep_indices_cpu: torch.Tensor, pdd_step_index: int):
     runs = segment_runs(token_tags_cpu, timestep_indices_cpu)
     if runs != self._runs:
-      install_segmented_modulation(self._model, runs, reassoc=False)
+      # Images select every head run in place (the text, and an edit's
+      # reference rows): 2048x2048 denoise 0.70 -> 0.61 s, edit 1.45 ->
+      # 0.97 s. Video keeps its threshold (a t2va head is cheaper sliced).
+      install_segmented_modulation(
+          self._model, runs, reassoc=False,
+          select_min=int(os.environ.get("DT_SEGMOD_SELECT_MIN", "1")))
       self._runs = runs
       print(f"  [segments] {runs}", flush=True)
 

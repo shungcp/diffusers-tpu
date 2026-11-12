@@ -25,6 +25,8 @@ Every model can run through three backends, so you can pick the one that fits yo
 Newest first. Each entry links a date to what changed.
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-12** — MiniMax-H3-Image on torchax and torch_tpu: the segmented modulation selects each head run (text, and an edit's reference rows) with a mask over the whole sequence instead of slicing it out and `index_copy`ing it back, as the JAX backend now does. v6e-8, torchax: 2048x2048 0.74 -> **0.64 s**, 4736x3552 3.12 -> **2.80 s**, edit 1.72 -> 1.24 s; torch_tpu: 4736x3552 3.36 -> 3.19 s, edit 1.74 -> 1.44 s. Video keeps slicing.
+  **2026-11-12** — torchax 与 torch_tpu 上的 MiniMax-H3-Image:分段调制改为在整条序列上用掩码选出各头部段(文本,以及编辑的参考图行),不再切出来再 `index_copy` 写回,与 JAX 后端现在的做法一致。v6e-8 上 torchax:2048x2048 0.74 -> **0.64 秒**,4736x3552 3.12 -> **2.80 秒**,编辑 1.72 -> 1.24 秒;torch_tpu:4736x3552 3.36 -> 3.19 秒,编辑 1.74 -> 1.44 秒。视频仍用切片。
 - **2026-11-12** — MiniMax-H3-Image editing: the tiled reference encode runs as one compiled program on every backend instead of op by op (1024x1024 reference: JAX 0.57 -> 0.13 s, torch_tpu 0.67 -> 0.09 s), and torch_tpu compiles the text tower after the vision merge. Edit 2048x2048: JAX 1.96 -> 1.52 s (**1.22 s** with the v7x segment-modulation change), torchax 2.14 -> 1.72 s, torch_tpu 2.39 -> 1.74 s on a v6e-8 ([numbers](#minimax-h3-image--six-steps)).
   **2026-11-12** — MiniMax-H3-Image 编辑:三种后端的参考图分块编码都改为一个编译好的程序,不再逐个算子执行(1024x1024 参考图:JAX 0.57 -> 0.13 秒,torch_tpu 0.67 -> 0.09 秒);torch_tpu 在视觉特征合并之后编译文本塔。v6e-8 上编辑 2048x2048:JAX 1.96 -> 1.52 秒(加上 v7x 的分段调制改动为 **1.22 秒**),torchax 2.14 -> 1.72 秒,torch_tpu 2.39 -> 1.74 秒。
 - **2026-11-11** — MiniMax-H3-Image (six-step text-to-image and editing) on all three backends; diffusers moves to `875373a`, which ships the model, for every model here (JAX, torchax and Qwen-Image outputs unchanged). On a v6e-8 the JAX backend generates a 2048x2048 image in **0.68 s** and a 4736x3552 one in **3.08 s** ([numbers](#minimax-h3-image--six-steps)). An image is a short sequence, so its JAX transformer keeps the residual stream whole, leaves the attention output split by heads and gives each chip matching SwiGLU rows: every block then needs two plain all-reduces (4736x3552 denoise 7.42 -> 2.99 s). torchax takes the same two steps for its attention output and SwiGLU rows (4736x3552 4.00 -> 3.12 s). torch_tpu stitches the decoded tiles in one compiled program instead of op by op (decode 0.66 -> 0.14 s at 4736x3552) and compiles the text tower with the ids padded to a bucket of 256 (text 0.4-0.7 -> 0.03 s, cosine 0.999999 to op by op).
@@ -129,9 +131,9 @@ v6e-8,暖请求(文本编码器、transformer 与解码器常驻),端到端,含�
 
 | | JAX | torchax | torch_tpu |
 |---|---|---|---|
-| 2048x2048 (4,149 rows / 行) | **0.68 s** | 0.74 s | 0.75 s |
-| 4736x3552 (16,481 rows / 行) | **3.08 s** | 3.12 s | 3.36 s |
-| edit 2048x2048, one reference / 编辑,一张参考图 | **1.22 s** | 1.72 s | 1.74 s |
+| 2048x2048 (4,149 rows / 行) | 0.67 s | **0.64 s** | 0.74 s |
+| 4736x3552 (16,481 rows / 行) | 3.05 s | **2.80 s** | 3.19 s |
+| edit 2048x2048, one reference / 编辑,一张参考图 | **1.22 s** | 1.24 s | 1.44 s |
 | edit 4096x4096, one reference / 编辑,一张参考图 | **3.46 s** | | |
 
 On 4 chips (a v6e-4) add `--chips 4 --text-int8`: the text encoder is kept on chip in int8 (first 50 layers) beside the bf16 transformer. 2048x2048 in 0.93 s, 4736x3552 in 4.38 s. `--text-offload` keeps it in host memory instead and streams it each request (+0.5 s).

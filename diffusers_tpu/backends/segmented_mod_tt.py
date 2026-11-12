@@ -89,6 +89,14 @@ def install(transformer, verbose=print) -> bool:
     verbose(f"  [segmod] could not install AOT pre-trace hook: {type(exc).__name__}",
             flush=True)
 
+  def _use_where(runs):
+    """`DT_SEGMOD_WHERE=1`: select each head run with a mask over the whole
+    sequence instead of slicing, concatenating and `index_copy`ing it back.
+    On for images (torchtpu_h3_image), off for video: a 2,079-row edit head
+    denoises 1.43 -> 1.14 s; a 1,173-row Pika t2va head gains nothing (44.9 s
+    a request either way) and compiles 24 s longer."""
+    return os.environ.get("DT_SEGMOD_WHERE", "0") == "1"
+
   def by_runs(x, runs, fn):
     """Apply `fn` to `x` run by run; equivalent to a per-row parameter gather.
 
@@ -102,6 +110,12 @@ def install(transformer, verbose=print) -> bool:
     # The default recomputes the head and writes it back; cheap for t2va
     # (head ~1% of rows, 146.4 -> ~143 s) but slower than the gather for
     # ref2va (head ~13%, ~188 -> ~205 s).
+    if _use_where(runs):
+      pos = torch.arange(x.shape[1], device=x.device)[None, :, None]
+      out = fn(x, bulk)
+      for s, e, i in head_runs:
+        out = torch.where((pos >= s) & (pos < e), fn(x, i), out)
+      return out
     if os.environ.get("DT_SEGMOD_CAT") == "1":
       return torch.cat([fn(x[:, s:e], i) for s, e, i in runs], dim=1)
     # `DT_SEGMOD_HEAD=1`: gather per row only over the H head rows; the last
@@ -124,6 +138,11 @@ def install(transformer, verbose=print) -> bool:
     if not head_runs:
       return residual + gate[bulk] * x
     out = residual + gate[bulk] * x
+    if _use_where(runs):
+      pos = torch.arange(x.shape[1], device=x.device)[None, :, None]
+      for s, e, i in head_runs:
+        out = torch.where((pos >= s) & (pos < e), residual + gate[i] * x, out)
+      return out
     head = torch.cat([
         residual[:, s:e] + gate[i] * x[:, s:e]
         for s, e, i in head_runs

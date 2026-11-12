@@ -807,6 +807,7 @@ def install_segmented_modulation(
     model: torch.nn.Module,
     runs: tuple[tuple[int, int, int], ...],
     reassoc: bool = False,
+    select_min: int | None = None,
 ) -> None:
   """Modulates by run rather than by row.
 
@@ -818,6 +819,7 @@ def install_segmented_modulation(
   """
   *head_runs, (bulk_start, _, bulk_index) = runs
   head_width = sum(end - start for start, end, _ in head_runs)
+  select_min = SEGMOD_SELECT_MIN if select_min is None else select_min
   mod_fn = (
       (lambda h, scale, shift: h + h * scale + shift)
       if reassoc
@@ -828,7 +830,7 @@ def install_segmented_modulation(
     out = combine(hidden, bulk_index)
     if not head_runs:
       return out
-    if head_width >= SEGMOD_SELECT_MIN:
+    if head_width >= select_min:
       # Long heads (ref2va: 15.5k text + reference + audio rows): each run
       # selected in place over the full tensor, elementwise, so a sharded
       # sequence stays where it is. Concatenating the head and

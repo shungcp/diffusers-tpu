@@ -20,6 +20,11 @@ import time
 
 
 def _setup_env():
+  # Select the head runs of the segmented modulation with a mask instead of
+  # slicing and `index_copy`ing them back: edit 2048x2048 denoise 1.43 ->
+  # 1.14 s (a 2,079-row head). Video t2va stays sliced: no faster there (Pika
+  # 768p 44.9 s either way) and its first request compiles 24 s longer.
+  os.environ.setdefault("DT_SEGMOD_WHERE", "1")
   from .torchtpu_h3 import _auto_env
   _auto_env()
   _ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
