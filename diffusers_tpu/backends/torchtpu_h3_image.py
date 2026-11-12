@@ -29,6 +29,11 @@ def _setup_env():
   # signed permutation matmul) instead of slicing 96 channels in halves:
   # 4736x3552 3.19 -> 3.11 s, edit 1.44 -> 1.39 s.
   os.environ.setdefault("DT_BHSD_ROPE", "full")
+  # The masked modulation in float32 with one rounding at the end: torch's
+  # per-op bfloat16 rounding put a reduce-precision after every multiply and
+  # add of both branches, inside the FF projection's prologue. 4736x3552
+  # denoise 2.94 -> 2.88 s.
+  os.environ.setdefault("DT_SEGMOD_F32", "1")
   from .torchtpu_h3 import _auto_env
   _auto_env()
   _ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")

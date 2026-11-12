@@ -94,7 +94,8 @@ def install(transformer, verbose=print) -> bool:
     sequence instead of slicing, concatenating and `index_copy`ing it back.
     On for images (torchtpu_h3_image), off for video: a 2,079-row edit head
     denoises 1.43 -> 1.14 s; a 1,173-row Pika t2va head gains nothing (44.9 s
-    a request either way) and compiles 24 s longer."""
+    a request either way) and compiles 24 s longer. `DT_SEGMOD_F32=1` does
+    the masked arithmetic in float32 and rounds once (images default to it)."""
     return os.environ.get("DT_SEGMOD_WHERE", "0") == "1"
 
   def by_runs(x, runs, fn):
@@ -112,10 +113,11 @@ def install(transformer, verbose=print) -> bool:
     # ref2va (head ~13%, ~188 -> ~205 s).
     if _use_where(runs):
       pos = torch.arange(x.shape[1], device=x.device)[None, :, None]
-      out = fn(x, bulk)
+      xc = x.float() if os.environ.get("DT_SEGMOD_F32") == "1" else x
+      out = fn(xc, bulk)
       for s, e, i in head_runs:
-        out = torch.where((pos >= s) & (pos < e), fn(x, i), out)
-      return out
+        out = torch.where((pos >= s) & (pos < e), fn(xc, i), out)
+      return out.to(x.dtype)
     if os.environ.get("DT_SEGMOD_CAT") == "1":
       return torch.cat([fn(x[:, s:e], i) for s, e, i in runs], dim=1)
     # `DT_SEGMOD_HEAD=1`: gather per row only over the H head rows; the last
@@ -137,12 +139,16 @@ def install(transformer, verbose=print) -> bool:
     *head_runs, (_, _, bulk) = runs
     if not head_runs:
       return residual + gate[bulk] * x
-    out = residual + gate[bulk] * x
     if _use_where(runs):
+      dt = x.dtype
+      if os.environ.get("DT_SEGMOD_F32") == "1":
+        residual, x = residual.float(), x.float()
+      out = residual + gate[bulk] * x
       pos = torch.arange(x.shape[1], device=x.device)[None, :, None]
       for s, e, i in head_runs:
         out = torch.where((pos >= s) & (pos < e), residual + gate[i] * x, out)
-      return out
+      return out.to(dt)
+    out = residual + gate[bulk] * x
     head = torch.cat([
         residual[:, s:e] + gate[i] * x[:, s:e]
         for s, e, i in head_runs

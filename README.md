@@ -25,8 +25,8 @@ Every model can run through three backends, so you can pick the one that fits yo
 Newest first. Each entry links a date to what changed.
 最新的在最上面。每条记录写明日期和变化。
 
-- **2026-11-12** — MiniMax-H3-Image JAX: the 53-row text head is also selected in place rather than written back with a dynamic-update-slice, which had split the gated residual and the norm into three full-sequence passes a block. v6e-8: 4736x3552 3.05 -> **2.77 s**, 2048x2048 0.67 -> **0.63 s**. torch_tpu images default to the 128-lane RoPE (`DT_BHSD_ROPE=full`): 4736x3552 3.19 -> 3.11 s, edit 1.44 -> 1.38 s.
-  **2026-11-12** — MiniMax-H3-Image JAX:53 行的文本头部也改为原地选择,不再用 dynamic-update-slice 写回(它把门控残差与 norm 拆成每个 block 三次整序列遍历)。v6e-8:4736x3552 3.05 -> **2.77 秒**,2048x2048 0.67 -> **0.63 秒**。torch_tpu 的图像默认改用 128 通道 RoPE(`DT_BHSD_ROPE=full`):4736x3552 3.19 -> 3.11 秒,编辑 1.44 -> 1.38 秒。
+- **2026-11-12** — MiniMax-H3-Image JAX: the 53-row text head is also selected in place rather than written back with a dynamic-update-slice, which had split the gated residual and the norm into three full-sequence passes a block. v6e-8: 4736x3552 3.05 -> **2.77 s**, 2048x2048 0.67 -> **0.63 s**. torch_tpu images default to the 128-lane RoPE (`DT_BHSD_ROPE=full`) and do the masked modulation in float32 with one rounding (`DT_SEGMOD_F32=1`; torch's per-op bfloat16 rounding sat inside the FF projection's prologue): 4736x3552 3.19 -> 3.05 s, edit 1.44 -> 1.36 s.
+  **2026-11-12** — MiniMax-H3-Image JAX:53 行的文本头部也改为原地选择,不再用 dynamic-update-slice 写回(它把门控残差与 norm 拆成每个 block 三次整序列遍历)。v6e-8:4736x3552 3.05 -> **2.77 秒**,2048x2048 0.67 -> **0.63 秒**。torch_tpu 的图像默认改用 128 通道 RoPE(`DT_BHSD_ROPE=full`),掩码调制改在 float32 里算、最后舍入一次(`DT_SEGMOD_F32=1`;torch 逐算子的 bfloat16 舍入落在 FF 投影的前序里):4736x3552 3.19 -> 3.05 秒,编辑 1.44 -> 1.36 秒。
 - **2026-11-12** — MiniMax-H3-Image on torchax and torch_tpu: the segmented modulation selects each head run (text, and an edit's reference rows) with a mask over the whole sequence instead of slicing it out and `index_copy`ing it back, as the JAX backend now does. v6e-8, torchax: 2048x2048 0.74 -> **0.64 s**, 4736x3552 3.12 -> **2.80 s**, edit 1.72 -> 1.24 s; torch_tpu: 4736x3552 3.36 -> 3.19 s, edit 1.74 -> 1.44 s. Video keeps slicing.
   **2026-11-12** — torchax 与 torch_tpu 上的 MiniMax-H3-Image:分段调制改为在整条序列上用掩码选出各头部段(文本,以及编辑的参考图行),不再切出来再 `index_copy` 写回,与 JAX 后端现在的做法一致。v6e-8 上 torchax:2048x2048 0.74 -> **0.64 秒**,4736x3552 3.12 -> **2.80 秒**,编辑 1.72 -> 1.24 秒;torch_tpu:4736x3552 3.36 -> 3.19 秒,编辑 1.74 -> 1.44 秒。视频仍用切片。
 - **2026-11-12** — MiniMax-H3-Image editing: the tiled reference encode runs as one compiled program on every backend instead of op by op (1024x1024 reference: JAX 0.57 -> 0.13 s, torch_tpu 0.67 -> 0.09 s), and torch_tpu compiles the text tower after the vision merge. Edit 2048x2048: JAX 1.96 -> 1.52 s (**1.22 s** with the v7x segment-modulation change), torchax 2.14 -> 1.72 s, torch_tpu 2.39 -> 1.74 s on a v6e-8 ([numbers](#minimax-h3-image--six-steps)).
@@ -133,9 +133,9 @@ v6e-8,暖请求(文本编码器、transformer 与解码器常驻),端到端,含�
 
 | | JAX | torchax | torch_tpu |
 |---|---|---|---|
-| 2048x2048 (4,149 rows / 行) | **0.63 s** | 0.64 s | 0.73 s |
-| 4736x3552 (16,481 rows / 行) | **2.77 s** | 2.80 s | 3.11 s |
-| edit 2048x2048, one reference / 编辑,一张参考图 | **1.22 s** | 1.24 s | 1.38 s |
+| 2048x2048 (4,149 rows / 行) | **0.63 s** | 0.64 s | 0.72 s |
+| 4736x3552 (16,481 rows / 行) | **2.77 s** | 2.80 s | 3.05 s |
+| edit 2048x2048, one reference / 编辑,一张参考图 | **1.22 s** | 1.24 s | 1.36 s |
 | edit 4096x4096, one reference / 编辑,一张参考图 | **3.45 s** | | |
 
 On 4 chips (a v6e-4) add `--chips 4 --text-int8`: the text encoder is kept on chip in int8 (first 50 layers) beside the bf16 transformer. 2048x2048 in 0.89 s, 4736x3552 in 4.20 s, a one-reference 2048x2048 edit in 1.57 s. `--text-offload` keeps it in host memory instead and streams it each request (+0.5 s).
