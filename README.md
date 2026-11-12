@@ -25,6 +25,8 @@ Every model can run through three backends, so you can pick the one that fits yo
 Newest first. Each entry links a date to what changed.
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-12** — The tiled reference encode, once compiled, had every chip encode all the tiles (a `device_put` does not split a batch inside `jit`); it is now split by a sharding constraint: H3-Image edit on a v6e-8 JAX 1.22 -> **1.15 s**, torchax 1.24 -> 1.17 s (Pika ref2va unchanged, bit-identical). torch_tpu uses the 128-lane RoPE for video too: Pika 768p 43.1 -> 42.3 s (mean of three warm requests), ref2va 169.4 -> 166.4 s.
+  **2026-11-12** — 参考图分块编码在编译后让每个 chip 都编了全部 tile(`jit` 里 `device_put` 不会切分批次),改用 sharding constraint 切分:v6e-8 上 H3-Image 编辑 JAX 1.22 -> **1.15 秒**,torchax 1.24 -> 1.17 秒(Pika ref2va 不变,逐位一致)。torch_tpu 视频也改用 128 通道 RoPE:Pika 768p 43.1 -> 42.3 秒(三次暖请求平均),ref2va 169.4 -> 166.4 秒。
 - **2026-11-12** — MiniMax-H3-Image serving and torch_tpu. `run_h3_image_jax.sh --requests reqs.jsonl` keeps the models resident and serves text-to-image and edit requests, the text padded to 64-token buckets (masked) so prompts in a bucket share one compiled program: 2048x2048 **0.67 s** a request, an edit with a known reference size 1.35 s ([usage](#run-minimax-h3-image--运行-minimax-h3-image)). torch_tpu moves to libtpu 0.0.52 (the same attention kernel 5% faster; Pika 768p 45.1 -> 43.6 s, ref2va 181.8 -> 170.1 s), its image decoder writes attention as two matmuls and a softmax and keeps the FF 2-D (a 261-row tile made every 3-D view a copy; 4736x3552 decode 0.131 -> 0.076 s), and the ranks meet after each request so the first request after warm-up no longer waits for the slowest rank's compile (edit 1.7–2.1 -> 1.31 s). torch_tpu images on a v6e-8: 2048x2048 0.68 s, 4736x3552 2.95 s, edit 1.32 s.
   **2026-11-12** — MiniMax-H3-Image 服务与 torch_tpu。`run_h3_image_jax.sh --requests reqs.jsonl` 让模型常驻,处理文生图与编辑请求;文本按 64 token 分桶补齐(补齐部分被屏蔽),同一桶的提示词共用一个编译程序:2048x2048 每条 **0.67 秒**,参考图尺寸已编译过的编辑 1.35 秒。torch_tpu 升级到 libtpu 0.0.52(同一注意力 kernel 快 5%;Pika 768p 45.1 -> 43.6 秒,ref2va 181.8 -> 170.1 秒);图像解码器的注意力改写成两次矩阵乘加 softmax、FF 保持二维(261 行的 tile 让每个三维视图都是一次拷贝;4736x3552 解码 0.131 -> 0.076 秒);每条请求结束各 rank 汇合一次,warm-up 后的第一条请求不再等最慢 rank 的编译(编辑 1.7–2.1 -> 1.31 秒)。v6e-8 上 torch_tpu 图像:2048x2048 0.68 秒,4736x3552 2.95 秒,编辑 1.32 秒。
 - **2026-11-12** — MiniMax-H3-Image JAX: the 53-row text head is also selected in place rather than written back with a dynamic-update-slice, which had split the gated residual and the norm into three full-sequence passes a block. v6e-8: 4736x3552 3.05 -> **2.77 s**, 2048x2048 0.67 -> **0.63 s**. torch_tpu images default to the 128-lane RoPE (`DT_BHSD_ROPE=full`) and do the masked modulation in float32 with one rounding (`DT_SEGMOD_F32=1`; torch's per-op bfloat16 rounding sat inside the FF projection's prologue): 4736x3552 3.19 -> 3.05 s, edit 1.44 -> 1.36 s.
@@ -137,8 +139,8 @@ v6e-8,暖请求(文本编码器、transformer 与解码器常驻),端到端,含�
 |---|---|---|---|
 | 2048x2048 (4,149 rows / 行) | **0.63 s** | 0.64 s | 0.68 s |
 | 4736x3552 (16,481 rows / 行) | **2.77 s** | 2.80 s | 2.95 s |
-| edit 2048x2048, one reference / 编辑,一张参考图 | **1.22 s** | 1.24 s | 1.32 s |
-| edit 4096x4096, one reference / 编辑,一张参考图 | **3.45 s** | | |
+| edit 2048x2048, one reference / 编辑,一张参考图 | **1.15 s** | 1.17 s | 1.32 s |
+| edit 4096x4096, one reference / 编辑,一张参考图 | **3.38 s** | | |
 
 On 4 chips (a v6e-4) add `--chips 4 --text-int8`: the text encoder is kept on chip in int8 (first 50 layers) beside the bf16 transformer. 2048x2048 in 0.89 s, 4736x3552 in 4.20 s, a one-reference 2048x2048 edit in 1.57 s. `--text-offload` keeps it in host memory instead and streams it each request (+0.5 s).
 4 个 chip(v6e-4)上加 `--chips 4 --text-int8`:文本编码器以 int8(前 50 层)常驻 chip,与 bf16 transformer 并存。2048x2048 0.89 秒,4736x3552 4.20 秒,一张参考图的 2048x2048 编辑 1.57 秒。`--text-offload` 则把它放在主机内存、每次请求流式送入(多 0.5 秒)。
