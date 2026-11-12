@@ -5,7 +5,7 @@ torch==2.14.1+cpu
 torch_tpu==0.2.0
 jax==0.12.0.1
 jaxlib==0.12.0.1
-libtpu==0.0.51
+libtpu==0.0.52
 transformers==5.20.2
 safetensors==0.8.0
 accelerate==1.15.0

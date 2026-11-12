@@ -34,6 +34,10 @@ def _setup_env():
   # add of both branches, inside the FF projection's prologue. 4736x3552
   # denoise 2.94 -> 2.88 s.
   os.environ.setdefault("DT_SEGMOD_F32", "1")
+  # VAE decoder: attention as two matmuls and a softmax, FF kept 2-D (see
+  # where they are applied). 4736x3552 decode 0.131 -> 0.075 s.
+  os.environ.setdefault("DT_VAE_MATH_ATTN", "1")
+  os.environ.setdefault("DT_VAE_FF_2D", "1")
   from .torchtpu_h3 import _auto_env
   _auto_env()
   _ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
@@ -195,6 +199,19 @@ def main():
   ).install()
   say(f"  DiT loaded & sharded on TPU ({time.perf_counter() - t0:.1f}s)", flush=True)
 
+  if os.environ.get("DT_VAE_MATH_ATTN") == "1":
+    # The decoder's attention (16 heads x 64, 512 rows a tile) written out as
+    # two matmuls and a softmax for XLA to fuse, instead of the SDPA kernel.
+    import diffusers.models.autoencoders.autoencoder_kl_minimax_h3_image as vae_mod
+
+    def _math_attn(query, key, value, attn_mask=None, **_):
+      q, k, v = (t.transpose(1, 2) for t in (query, key, value))
+      s = (q @ k.transpose(-1, -2)).float() * (q.shape[-1] ** -0.5)
+      p = torch.softmax(s, dim=-1).to(v.dtype)
+      return (p @ v).transpose(1, 2)
+
+    vae_mod.dispatch_attention_fn = _math_attn
+
   # -- 3. Load 2D Image VAE & Compile 24-layer ViT Decoder -------------------
   t0 = time.perf_counter()
   vae = AutoencoderKLMiniMaxH3Image.from_pretrained(
@@ -202,6 +219,14 @@ def main():
   ).eval()
   vae.requires_grad_(False)
   vae.to(device)
+  if os.environ.get("DT_VAE_FF_2D") == "1":
+    # A decoder tile is 261 rows, not a multiple of 8, so every 3-D view of
+    # a (16 * 261, n) matmul result is a relayout copy; the SwiGLU between
+    # the two FF matmuls stays 2-D and only the FF output is reshaped back.
+    for block in vae.decoder.transformer_blocks:
+      def _ff_2d(x, _ff=block.ff, _fwd=block.ff.forward):
+        return _fwd(x.reshape(-1, x.shape[-1])).reshape(*x.shape[:-1], -1)
+      block.ff.forward = _ff_2d
   vae_aot = aot_dit.AotBlocks(
       vae.decoder.transformer_blocks, dynamic=False, group=args.aot_vae_group, verbose=say
   ).install()
@@ -552,6 +577,9 @@ def main():
     prompt_embeds, _, _, _ = encode_prompt_and_refs()
     torch.accelerator.synchronize()
     t_te = time.perf_counter() - t_te0
+    if os.environ.get("DT_RANK_TIMES") == "1":
+      print(f"  [rank-times] run {run_idx} rank {rank} text start {time.time() - t_te:.4f} end {time.time():.4f}",
+            flush=True)
 
     t_pipe0 = time.perf_counter()
     rows = prepare_initial_rows()
@@ -596,6 +624,14 @@ def main():
     )
     if prof_ctx is not None:
       prof_ctx.__exit__(None, None, None)
+    if world > 1 and os.environ.get("DT_RUN_BARRIER", "1") == "1":
+      # The ranks finish a request at different times when one of them is
+      # still compiling (the first request): rank 3 entered the next one
+      # 0.84 s after rank 6, and the first collective made every rank wait
+      # for it, which showed up as the next request's text encoding. Meet
+      # here so each request starts together.
+      all_reduce(torch.zeros(1, device=device))
+      torch.accelerator.synchronize()
 
   if rank == 0 and u8_host is not None:
     os.makedirs(args.out, exist_ok=True)
