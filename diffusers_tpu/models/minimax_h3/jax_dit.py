@@ -498,7 +498,8 @@ def _build_modules():
         if not head_runs:
           return out
         head_width = sum(stop - start for start, stop, _ in head_runs)
-        if head_width >= 512:
+        # `DT_SEGMOD_SELECT_MIN`: the image pipeline sets 1 (every head).
+        if head_width >= int(os.environ.get("DT_SEGMOD_SELECT_MIN", "512")):
           pos = jnp.arange(h.shape[1])[None, :, None]
           for start, stop, index in head_runs:
             out = jnp.where((pos >= start) & (pos < stop), combine(h, index), out)

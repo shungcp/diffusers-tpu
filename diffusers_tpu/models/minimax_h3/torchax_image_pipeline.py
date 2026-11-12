@@ -576,6 +576,9 @@ def main():
       t_pipe0 = time.perf_counter()
       rows = prepare_initial_rows()
       jax.block_until_ready(rows)
+      prof = os.environ.get("H3_IMAGE_PROFILE_DIR") if run_idx == args.runs - 1 else None
+      if prof:
+        jax.profiler.start_trace(prof)
       t_den0 = time.perf_counter()
       for i in range(args.steps):
         dv = tx_dit.forward_jax(
@@ -597,6 +600,9 @@ def main():
       z_4d = unpatchify_and_denorm(rows)
       jax.block_until_ready(z_4d)
       t_den = time.perf_counter() - t_den0
+      if prof:
+        jax.profiler.stop_trace()
+        print(f"  [profile] denoise of the last request -> {prof}", flush=True)
 
       t_dec0 = time.perf_counter()
       u8_dev = decode_image_2d(z_4d)

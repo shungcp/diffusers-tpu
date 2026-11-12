@@ -241,6 +241,11 @@ def patchify_2d(latents: np.ndarray) -> np.ndarray:
 
 def main():
   args = parse_args()
+  # Modulate every head run (the text, an edit's reference rows) by selecting
+  # it in place: the 53-row text head written back with a dynamic-update-slice
+  # split the gated residual and norm into three full-sequence passes a block
+  # (4736x3552 denoise 2.95 -> 2.68 s). jax_dit's default (512) is for video.
+  os.environ.setdefault("DT_SEGMOD_SELECT_MIN", "1")
   os.environ.setdefault(
       "LIBTPU_INIT_ARGS",
       "--xla_tpu_dvfs_p_state=7 "
