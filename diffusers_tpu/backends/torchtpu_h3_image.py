@@ -25,6 +25,10 @@ def _setup_env():
   # 1.14 s (a 2,079-row head). Video t2va stays sliced: no faster there (Pika
   # 768p 44.9 s either way) and its first request compiles 24 s longer.
   os.environ.setdefault("DT_SEGMOD_WHERE", "1")
+  # RoPE over all 128 lanes (cos padded with 1, sin with 0, rotate-half as a
+  # signed permutation matmul) instead of slicing 96 channels in halves:
+  # 4736x3552 3.19 -> 3.11 s, edit 1.44 -> 1.39 s.
+  os.environ.setdefault("DT_BHSD_ROPE", "full")
   from .torchtpu_h3 import _auto_env
   _auto_env()
   _ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
