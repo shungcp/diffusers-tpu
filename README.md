@@ -25,6 +25,8 @@ Every model can run through three backends, so you can pick the one that fits yo
 Newest first. Each entry links a date to what changed.
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-12** — MiniMax-H3-Image serving and torch_tpu. `run_h3_image_jax.sh --requests reqs.jsonl` keeps the models resident and serves text-to-image and edit requests, the text padded to 64-token buckets (masked) so prompts in a bucket share one compiled program: 2048x2048 **0.67 s** a request, an edit with a known reference size 1.35 s ([usage](#run-minimax-h3-image--运行-minimax-h3-image)). torch_tpu moves to libtpu 0.0.52 (the same attention kernel 5% faster; Pika 768p 45.1 -> 43.6 s, ref2va 181.8 -> 170.1 s), its image decoder writes attention as two matmuls and a softmax and keeps the FF 2-D (a 261-row tile made every 3-D view a copy; 4736x3552 decode 0.131 -> 0.076 s), and the ranks meet after each request so the first request after warm-up no longer waits for the slowest rank's compile (edit 1.7–2.1 -> 1.31 s). torch_tpu images on a v6e-8: 2048x2048 0.68 s, 4736x3552 2.95 s, edit 1.32 s.
+  **2026-11-12** — MiniMax-H3-Image 服务与 torch_tpu。`run_h3_image_jax.sh --requests reqs.jsonl` 让模型常驻,处理文生图与编辑请求;文本按 64 token 分桶补齐(补齐部分被屏蔽),同一桶的提示词共用一个编译程序:2048x2048 每条 **0.67 秒**,参考图尺寸已编译过的编辑 1.35 秒。torch_tpu 升级到 libtpu 0.0.52(同一注意力 kernel 快 5%;Pika 768p 45.1 -> 43.6 秒,ref2va 181.8 -> 170.1 秒);图像解码器的注意力改写成两次矩阵乘加 softmax、FF 保持二维(261 行的 tile 让每个三维视图都是一次拷贝;4736x3552 解码 0.131 -> 0.076 秒);每条请求结束各 rank 汇合一次,warm-up 后的第一条请求不再等最慢 rank 的编译(编辑 1.7–2.1 -> 1.31 秒)。v6e-8 上 torch_tpu 图像:2048x2048 0.68 秒,4736x3552 2.95 秒,编辑 1.32 秒。
 - **2026-11-12** — MiniMax-H3-Image JAX: the 53-row text head is also selected in place rather than written back with a dynamic-update-slice, which had split the gated residual and the norm into three full-sequence passes a block. v6e-8: 4736x3552 3.05 -> **2.77 s**, 2048x2048 0.67 -> **0.63 s**. torch_tpu images default to the 128-lane RoPE (`DT_BHSD_ROPE=full`) and do the masked modulation in float32 with one rounding (`DT_SEGMOD_F32=1`; torch's per-op bfloat16 rounding sat inside the FF projection's prologue): 4736x3552 3.19 -> 3.05 s, edit 1.44 -> 1.36 s.
   **2026-11-12** — MiniMax-H3-Image JAX:53 行的文本头部也改为原地选择,不再用 dynamic-update-slice 写回(它把门控残差与 norm 拆成每个 block 三次整序列遍历)。v6e-8:4736x3552 3.05 -> **2.77 秒**,2048x2048 0.67 -> **0.63 秒**。torch_tpu 的图像默认改用 128 通道 RoPE(`DT_BHSD_ROPE=full`),掩码调制改在 float32 里算、最后舍入一次(`DT_SEGMOD_F32=1`;torch 逐算子的 bfloat16 舍入落在 FF 投影的前序里):4736x3552 3.19 -> 3.05 秒,编辑 1.44 -> 1.36 秒。
 - **2026-11-12** — MiniMax-H3-Image on torchax and torch_tpu: the segmented modulation selects each head run (text, and an edit's reference rows) with a mask over the whole sequence instead of slicing it out and `index_copy`ing it back, as the JAX backend now does. v6e-8, torchax: 2048x2048 0.74 -> **0.64 s**, 4736x3552 3.12 -> **2.80 s**, edit 1.72 -> 1.24 s; torch_tpu: 4736x3552 3.36 -> 3.19 s, edit 1.74 -> 1.44 s. Video keeps slicing.
@@ -92,8 +94,8 @@ Hardware-specific architecture notes, optimization ledgers, and XLA flag guides 
 Measured 2026-11-02 to 2026-11-04 on a TPU v6e-8 (8 chips); warm requests, with the model already loaded and compiled.
 测于 2026-11-02 至 2026-11-04,TPU v6e-8(8 个 chip);均为热请求时间,模型已加载并编译完成。
 
-Software: jax 0.12.0.1, libtpu 0.0.52 (0.0.51 for torch_tpu; JAX numbers re-measured on 0.0.52, 2026-11-07), torch_tpu 0.2.0, diffusers `875373a` (see `requirements/`).
-软件版本:jax 0.12.0.1、libtpu 0.0.52(torch_tpu 用 0.0.51;JAX 数字已于 2026-11-07 在 0.0.52 上重测)、torch_tpu 0.2.0、diffusers `875373a`(见 `requirements/`)。
+Software: jax 0.12.0.1, libtpu 0.0.52 (torch_tpu moved from 0.0.51 on 2026-11-12: same attention kernel 5% faster), torch_tpu 0.2.0, diffusers `875373a` (see `requirements/`).
+软件版本:jax 0.12.0.1、libtpu 0.0.52(torch_tpu 于 2026-11-12 从 0.0.51 升级:同一注意力 kernel 快 5%)、torch_tpu 0.2.0、diffusers `875373a`(见 `requirements/`)。
 
 ### MiniMax-H3 — 768x1344, 345 frames (14.4 s), 20 steps
 
@@ -133,9 +135,9 @@ v6e-8,暖请求(文本编码器、transformer 与解码器常驻),端到端,含�
 
 | | JAX | torchax | torch_tpu |
 |---|---|---|---|
-| 2048x2048 (4,149 rows / 行) | **0.63 s** | 0.64 s | 0.72 s |
-| 4736x3552 (16,481 rows / 行) | **2.77 s** | 2.80 s | 3.05 s |
-| edit 2048x2048, one reference / 编辑,一张参考图 | **1.22 s** | 1.24 s | 1.36 s |
+| 2048x2048 (4,149 rows / 行) | **0.63 s** | 0.64 s | 0.68 s |
+| 4736x3552 (16,481 rows / 行) | **2.77 s** | 2.80 s | 2.95 s |
+| edit 2048x2048, one reference / 编辑,一张参考图 | **1.22 s** | 1.24 s | 1.32 s |
 | edit 4096x4096, one reference / 编辑,一张参考图 | **3.45 s** | | |
 
 On 4 chips (a v6e-4) add `--chips 4 --text-int8`: the text encoder is kept on chip in int8 (first 50 layers) beside the bf16 transformer. 2048x2048 in 0.89 s, 4736x3552 in 4.20 s, a one-reference 2048x2048 edit in 1.57 s. `--text-offload` keeps it in host memory instead and streams it each request (+0.5 s).
@@ -402,6 +404,14 @@ bash scripts/run_h3_image_jax.sh --size 4736x3552 --prompt "..."
 bash scripts/run_h3_image_jax.sh --size 4096x4096 --reference ref.png --prompt "Keep everything in <Picture 1> ..."
 bash scripts/run_h3_image_torchax.sh --size 2048x2048 --prompt "..."
 bash scripts/run_h3_image_torchtpu.sh --size 2048x2048 --prompt "..."     # torch_tpu environment
+```
+
+Many prompts with the models resident (JAX): one JSON object per line, `{"prompt": ..., "seed": ..., "reference": ["ref.png"]}` (`reference` for edits, which need the process started with `--reference`). Prompts are padded to 64-token buckets, so only a new bucket (or a new reference size) compiles.
+模型常驻、处理多条提示词(JAX):每行一个 JSON,`{"prompt": ..., "seed": ..., "reference": ["ref.png"]}`(`reference` 表示编辑请求,需要进程以 `--reference` 启动)。提示词按 64 token 分桶补齐,只有新的桶(或新的参考图尺寸)才会编译。
+
+```bash
+bash scripts/run_h3_image_jax.sh --size 2048x2048 --prompt "..." --requests reqs.jsonl
+bash scripts/run_h3_image_jax.sh --size 2048x2048 --reference ref.png --prompt "..." --requests reqs.jsonl
 ```
 
 The text encoder is the same file as MiniMax-H3's (the Hub deduplicates it), and the prompt is used verbatim.

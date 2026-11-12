@@ -497,9 +497,12 @@ def _build_modules():
         out = combine(h, bulk)
         if not head_runs:
           return out
-        head_width = sum(stop - start for start, stop, _ in head_runs)
+        # Run bounds may be traced (bucketed prompts in the image server):
+        # then only the masked selection works.
+        traced = any(isinstance(b, jax.Array) for r in head_runs for b in r[:2])
+        head_width = 0 if traced else sum(stop - start for start, stop, _ in head_runs)
         # `DT_SEGMOD_SELECT_MIN`: the image pipeline sets 1 (every head).
-        if head_width >= int(os.environ.get("DT_SEGMOD_SELECT_MIN", "512")):
+        if traced or head_width >= int(os.environ.get("DT_SEGMOD_SELECT_MIN", "512")):
           pos = jnp.arange(h.shape[1])[None, :, None]
           for start, stop, index in head_runs:
             out = jnp.where((pos >= start) & (pos < stop), combine(h, index), out)

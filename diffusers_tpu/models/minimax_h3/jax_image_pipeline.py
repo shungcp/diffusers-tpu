@@ -99,6 +99,12 @@ def parse_args():
                  help="Run one warmup pass before timed runs")
   p.add_argument("--runs", type=int, default=2,
                  help="Number of timed generation runs")
+  p.add_argument("--requests", default="",
+                 help="JSONL of text-to-image requests ({\"prompt\": ..., \"seed\": ...}) served "
+                      "after the timed runs with the models resident, on the same canvas")
+  p.add_argument("--text-bucket", type=int, default=64,
+                 help="with --requests: pad the prompt to a multiple of this many tokens so "
+                      "prompts in one bucket share one compiled program (attention masks the pads)")
   p.add_argument("--compile-cache", default="")
   p.add_argument("--cache-only", action="store_true")
   p.add_argument("--out", "--output", dest="out", default="out")
@@ -552,13 +558,20 @@ def main():
     keep_heads = os.environ.get("DT_STREAM_SHARD") == "whole" and os.environ.get(
         "DT_ATTN_KEEP_HEADS", "1") == "1"
 
-    def sdpa(q, k, v):
+    def sdpa(q, k, v, kv_len=None):
       k = k - jnp.mean(k, axis=2, keepdims=True)
       with jax.default_matmul_precision("default"):
         if keep_heads and q.shape[1] % mesh.size == 0:
           qs, kvs, _ = mesh_attention._partition_specs(mesh, q.shape, True)
+          if kv_len is not None:
+            # Bucketed prompts (`--requests`): keys past the true length masked.
+            return jax.shard_map(lambda a, b, c, n: local_attn(a, b, c, kv_len=n), mesh=mesh,
+                                 in_specs=(qs, kvs, kvs, P()), out_specs=qs,
+                                 check_vma=False)(q, k, v, kv_len)
           return jax.shard_map(local_attn, mesh=mesh, in_specs=(qs, kvs, kvs),
                                out_specs=qs, check_vma=False)(q, k, v)
+        if kv_len is not None:
+          raise NotImplementedError("--requests needs DT_STREAM_SHARD=whole (keep-heads attention)")
         return mesh_attention._on_mesh(local_attn, mesh, q, k, v, True)
 
   out_w, out_h, gen_w, gen_h, latent_h, latent_w = prepare_canvas(
@@ -569,8 +582,11 @@ def main():
         flush=True)
 
 
-  def encode_prompt_and_refs():
-    """Run text (+ optional vision + reference VAE) encoding."""
+  def encode_prompt_and_refs(pad_to=0):
+    """Run text (+ optional vision + reference VAE) encoding.
+
+    `pad_to` (`--requests`): append pad tokens up to that many; the tower is
+    causal, so the real rows are unchanged and the shape is the bucket's."""
     if not args.reference:
       return cached_text if cached_text is not None else encode_t2i_prompt()
 
@@ -598,6 +614,11 @@ def main():
     p_ids = tokenizer(args.prompt, add_special_tokens=False)["input_ids"][:4096]
     token_ids.extend(p_ids)
     token_tags.extend([TEXT_TAG] * len(p_ids))
+    real_tags = np.asarray(token_tags, dtype=np.int64)
+    if pad_to > len(token_ids):
+      pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+      token_tags.extend([TEXT_TAG] * (pad_to - len(token_ids)))
+      token_ids.extend([pad_id] * (pad_to - len(token_ids)))
     mm_ids = np.asarray(processor.create_mm_token_type_ids([token_ids]), dtype=np.int64)
     pres = dict(
         ids=np.asarray(token_ids, dtype=np.int32),
@@ -614,7 +635,7 @@ def main():
         encoder, vision_model, pres, pos3, cfg_text, dtype,
         stop_at_layer=TEXT_ENCODER_LAYER, jit=True,
     )
-    return p_embeds, pres["tags"], ref_imgs, [(im.height // 16 // 2 * 2, im.width // 16 // 2 * 2) for im in ref_imgs]
+    return p_embeds, real_tags, ref_imgs, [(im.height // 16 // 2 * 2, im.width // 16 // 2 * 2) for im in ref_imgs]
 
   # The tiled encode as one program. Op by op it dispatched ~1,300 small
   # programs (0.57 s for a 1024x1024 reference, ~0.18 s of it on the chip).
@@ -829,6 +850,9 @@ def main():
           flush=True,
       )
 
+  if args.requests:
+    serve_requests(args, locals())
+
   if u8_host is not None:
     from PIL import Image
     from diffusers.image_processor import VaeImageProcessor
@@ -841,6 +865,166 @@ def main():
     pil_img.save(out_path)
     np.save(os.path.join(args.out, f"{args.tag}.npy"), np.asarray(pil_img))
     print(f"wrote {out_path} ({pil_img.size[0]}x{pil_img.size[1]})", flush=True)
+
+
+def serve_requests(args, env):
+  """Requests with the models resident (`--requests`).
+
+  Each JSONL line is `{"prompt": ..., "seed": ..., "reference": [paths]}`
+  (`reference` optional; edit requests need the vision tower, i.e. the
+  process started with `--reference`). Every per-request array (positions,
+  tags, row indices, run bounds, true lengths) is an argument of one jitted
+  step, and the text is padded to `--text-bucket` tokens: prompts of any
+  length in a bucket reuse one compiled program (an edit also keys on its
+  reference sizes). The padded text rows sit after the image rows; the text
+  tower is causal, the token refiner masks them by `text_len` and the
+  transformer's attention by `seq_len`, so a real row never sees them.
+  """
+  import json
+  from concurrent.futures import ThreadPoolExecutor
+  import torch
+  from PIL import Image
+  from diffusers.image_processor import VaeImageProcessor
+  from diffusers.utils.torch_utils import randn_tensor
+  import jax
+  import jax.numpy as jnp
+
+  e = env
+  dit, nnx, mesh, replicated = e["dit"], e["nnx"], e["mesh"], e["replicated"]
+  graphdef, dit_state, sdpa = e["graphdef"], e["dit_state"], e["sdpa"]
+  tokenizer, encoder, _text_jit = e["tokenizer"], e["encoder"], e["_text_jit"]
+  latent_h, latent_w = e["latent_h"], e["latent_w"]
+  adaln_mods, steps = e["adaln_mods"], args.steps
+  if encoder is None:
+    raise SystemExit("--requests needs the text encoder resident (no --free-text-after)")
+  bucket = max(1, args.text_bucket)
+  text_val = int(TEXT_TAG)            # timestep index 0: MODALITY_NUM * 0 + tag
+
+  @functools.partial(jax.jit, static_argnames=("run_vals", "n_ref"))
+  def step(state, img_rows, text_emb, t_vec, dt_scalar, pdd_idx, mods, position_ids, token_tags,
+           image_idx, text_idx, row_step, n_txt, seq_real, bounds, run_vals, n_ref):
+    seg = tuple((bounds[2 * r], bounds[2 * r + 1], v) for r, v in enumerate(run_vals))
+    model = nnx.merge(graphdef, state)
+    dv = model(img_rows, None, text_emb, t_vec, row_step, token_tags, position_ids,
+               image_idx, None, text_idx, sdpa=sdpa, segments=seg,
+               seq_len=seq_real, text_len=n_txt, adaln_mods=mods, pdd_step=pdd_idx)
+    gen = img_rows[:, n_ref:].astype(jnp.float32) + dt_scalar * dv[:, n_ref:].astype(jnp.float32)
+    return jnp.concatenate([img_rows[:, :n_ref], gen], axis=1) if n_ref else gen
+
+  put = lambda a, dt=None: jax.device_put(jnp.asarray(a, dt), replicated)
+  lat_mean, lat_std, dtype = e["lat_mean_jnp"], e["lat_std_jnp"], e["dtype"]
+
+  @functools.partial(jax.jit, out_shardings=replicated)
+  def unpatch(rows):
+    # `unpatchify_and_denorm` without the main request's reference count.
+    x = rows.reshape(1, latent_h // 2, latent_w // 2, 24, 2, 2)
+    x = jnp.transpose(x, (0, 3, 1, 4, 2, 5)).reshape(1, 24, latent_h, latent_w)
+    return (x.astype(jnp.float32) * lat_std + lat_mean).astype(dtype)
+
+  def encode_t2i(prompt):
+    ids = tokenizer(prompt, add_special_tokens=False)["input_ids"][:4096]
+    n = len(ids)
+    tb = -(-n // bucket) * bucket
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    ids_np = np.asarray([ids + [pad_id] * (tb - n)], dtype=np.int32)
+    pos = np.broadcast_to(np.arange(tb)[None, :], (3, tb))
+    cos, sin = e["qwen_text"].mrope_cos_sin(
+        pos, head_dim=e["cfg_text"]["head_dim"], rope_theta=e["cfg_text"]["rope_theta"],
+        mrope_section=e["cfg_text"]["mrope_section"])
+    emb = _text_jit(encoder, put(ids_np, jnp.int32), put(cos, e["dtype"]), put(sin, e["dtype"]))
+    return emb, np.ones((n,), np.int64), [], []
+
+  def encode_edit(prompt, refs):
+    # The pipeline's own presentation, padded: measure the real length, then
+    # encode once at the bucket's length.
+    args.prompt, args.reference = prompt, refs
+    from PIL import ImageOps
+    vis = [bound_short_edge(ImageOps.exif_transpose(Image.open(r)).convert("RGB"), 1024, 1024)
+           for r in refs]
+    grid = e["processor"].image_processor(images=vis, return_tensors="pt")["image_grid_thw"]
+    merge = e["processor"].image_processor.merge_size ** 2
+    n = len(tokenizer(prompt, add_special_tokens=False)["input_ids"][:4096])
+    for idx, g in enumerate(grid):
+      n += len(tokenizer(f"Picture {idx + 1}: ", add_special_tokens=False)["input_ids"]) + 2
+      n += int(g.prod().item()) // merge
+    return e["encode_prompt_and_refs"](pad_to=-(-n // bucket) * bucket)
+
+  saver = ThreadPoolExecutor(max_workers=2)   # a 2048x2048 PNG is ~1.2 s of host time
+  pending, seen = [], set()
+  reqs = [json.loads(l) for l in open(args.requests) if l.strip()]
+  for k, req in enumerate(reqs):
+    t0 = time.perf_counter()
+    refs = req.get("reference") or []
+    if isinstance(refs, str):
+      refs = [refs]
+    with jax.set_mesh(mesh):
+      emb, tags_real, ref_imgs, ref_grids = (encode_edit(req["prompt"], refs) if refs
+                                             else encode_t2i(req["prompt"]))
+      jax.block_until_ready(emb)
+    t_text = time.perf_counter() - t0
+    n, tb = len(tags_real), int(emb.shape[1])
+
+    pos_np, tags_np, img_idx_np, txt_idx_np, n_ref, _ = build_image_packed_sequence(
+        tags_real, ref_grids, latent_h, latent_w)
+    seq_real = int(pos_np.shape[0])
+    seq, extra = seq_real + tb - n, tb - n
+    row_np = np.zeros((seq,), np.int32)
+    if n_ref:
+      row_np[img_idx_np[:n_ref]] = 1
+    idx = (row_np[:seq_real] * dit.MODALITY_NUM + tags_np).astype(np.int64)
+    edges = [0, *(np.flatnonzero(idx[1:] != idx[:-1]) + 1).tolist(), seq_real]
+    runs = [(a, b, int(idx[a])) for a, b in zip(edges, edges[1:])] + [(seq_real, seq, text_val)]
+    pos_np = np.concatenate([pos_np, np.repeat(pos_np[-1:], extra, axis=0)])
+    tags_np = np.concatenate([tags_np, np.full((extra,), TEXT_TAG, np.int32)])
+    txt_idx_np = np.concatenate([txt_idx_np, np.arange(seq_real, seq, dtype=np.int32)])
+    lay = (put(pos_np), put(tags_np), put(img_idx_np), put(txt_idx_np), put(row_np),
+           put(n, jnp.int32), put(seq_real, jnp.int32),
+           put(np.asarray([b for r in runs for b in r[:2]], np.int32)))
+    run_vals = tuple(v for _, _, v in runs)
+
+    tgen = torch.Generator().manual_seed(int(req.get("seed", args.seed)))
+    with jax.set_mesh(mesh):
+      ref_lat = e["encode_ref_latents"](ref_imgs, tgen) if n_ref else []
+    noise = randn_tensor((1, 24, 1, latent_h, latent_w), generator=tgen,
+                         dtype=torch.float32).numpy()[:, :, 0]
+    parts = []
+    for rl in ref_lat:
+      c = randn_tensor(tuple(rl.shape), generator=tgen, dtype=torch.float32).numpy()
+      parts.append(patchify_2d(np.float32(0.999) * rl + (np.float32(1.0) - np.float32(0.999)) * c))
+    rows = put(np.concatenate(parts + [patchify_2d(noise)], axis=1), jnp.float32)
+    t_vecs = [put([e["timesteps_np"][i], 0.999] if n_ref else [e["timesteps_np"][i]], jnp.float32)
+              for i in range(steps)]
+    jax.block_until_ready(rows)
+    t1 = time.perf_counter()
+    t_prep = t1 - t0 - t_text
+    with jax.set_mesh(mesh):
+      for i in range(steps):
+        rows = step(dit_state, rows, emb, t_vecs[i], e["dt_scalars"][i], e["pdd_indices"][i],
+                    None if adaln_mods is None else adaln_mods[i], *lay,
+                    run_vals=run_vals, n_ref=int(n_ref))
+      z = unpatch(rows[:, n_ref:] if n_ref else rows)
+      jax.block_until_ready(z)
+      t_den = time.perf_counter() - t1
+      t2 = time.perf_counter()
+      u8 = np.asarray(e["decode_image_2d"](z))
+    t_dec = time.perf_counter() - t2
+    key = (tb, tuple(ref_grids))
+    first = key not in seen
+    seen.add(key)
+    img = Image.fromarray(u8)
+    if (e["out_w"], e["out_h"]) != (e["gen_w"], e["gen_h"]):
+      img = VaeImageProcessor().resize(img, height=e["out_h"], width=e["out_w"])
+    t_gen = time.perf_counter() - t0
+    os.makedirs(args.out, exist_ok=True)
+    path = os.path.join(args.out, f"{args.tag}_req{k}.png")
+    pending.append(saver.submit(img.save, path))
+    kind = f"edit, {len(refs)} ref" if refs else "t2i"
+    print(f"[req {k}] {kind}, text {n}->{tb} tokens{' (new shape)' if first else ''}: "
+          f"{t_gen:.3f}s = text {t_text:.3f} + prepare {t_prep:.3f} + denoise {t_den:.3f} "
+          f"+ decode {t_dec:.3f}  -> {path}", flush=True)
+  for f in pending:
+    f.result()
+  saver.shutdown()
 
 
 _ENC_ONE = [None]
