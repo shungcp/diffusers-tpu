@@ -52,10 +52,10 @@ Warm requests, end to end (text encoding, six DiT steps, decode). / 暖请求,�
 
 | Size / 尺寸 | JAX | `torchax` | `torch_tpu` |
 | :--- | :---: | :---: | :---: |
-| 2048x2048 t2i | **0.68 s** | 0.74 s | 0.75 s |
-| 4736x3552 t2i | **3.08 s** | 3.12 s | 3.36 s |
-| 2048x2048 edit, 1 reference / 编辑 | **1.94 s** | 2.10 s | 3.22 s |
-| 4096x4096 edit, 1 reference / 编辑 | **4.37 s** | — | — |
+| 2048x2048 t2i | **0.63 s** | 0.64 s | 0.69 s |
+| 4736x3552 t2i | **2.77 s** | 2.80 s | 2.95 s |
+| 2048x2048 edit, 1 reference / 编辑 | **1.15 s** | 1.18 s | 1.32 s |
+| 4096x4096 edit, 1 reference / 编辑 | **3.38 s** | — | — |
 
 An image is a 4k-16k-row sequence, so eight-way tensor parallelism is communication-bound. What made the JAX transformer 2.4x faster at 4736x3552 (denoise 7.42 -> 2.99 s), in order:
 图像是 4k-16k 行的短序列,8 路张量并行受通信限制。JAX transformer 在 4736x3552 上快 2.4 倍(去噪 7.42 -> 2.99 秒)依次来自:
@@ -71,5 +71,16 @@ An image is a 4k-16k-row sequence, so eight-way tensor parallelism is communicat
 Each block then holds two plain all-reduces and nothing else crosses the mesh; on v6e those do not overlap compute (about 40% of a step). Tried and dropped: sequence-parallel stream with the same fixes (4.54 s), Pallas SwiGLU FFN (3.22 s), hand-written collective matmul and XLA flag variants (no change).
 此后每个 block 只有两次普通 all-reduce,再无其他跨 chip 交换;v6e 上 all-reduce 不与计算重叠(约占一步的 40%)。试过但放弃:同样修正下的序列并行残差流(4.54 秒)、Pallas SwiGLU FFN(3.22 秒)、手写 collective matmul 与 XLA 标志组合(无变化)。
 
-Fewer chips / 更少的 chip: 4 chips with `--text-int8` 0.93 s / 4.38 s; one v5e chip with `--offload --int8-weights --free-text-after` 11.4 s / 43.7 s (2048x2048 / 4736x3552).
-4 个 chip 加 `--text-int8`:0.93 / 4.38 秒;单个 v5e chip 加 `--offload --int8-weights --free-text-after`:11.4 / 43.7 秒(2048x2048 / 4736x3552)。
+Later fixes (2026-11-12), each found in a profile / 之后的修正(2026-11-12),每项都由剖面定位:
+
+| Fix / 修正 | Effect (v6e-8) / 效果 |
+| :--- | :--- |
+| The head runs of the segmented modulation (text; an edit's reference rows) selected with a mask instead of written back: a `dynamic-update-slice` or `index_copy` broke the gated residual and the norm into three full-sequence passes a block / 分段调制的头部段用掩码选择,不再写回:`dynamic-update-slice` / `index_copy` 把门控残差与 norm 拆成每个 block 三次整序列遍历 | JAX 4736 3.05 -> 2.77 s; torchax 3.12 -> 2.80 s; edit denoise 1.24 -> 0.94 s |
+| The tiled reference encode compiled, and split over the chips by a sharding constraint (a `device_put` inside `jit` left every chip encoding all tiles) / 参考图分块编码编译成一个程序,并用 sharding constraint 按 chip 切分(`jit` 里的 `device_put` 让每个 chip 编全部 tile) | edit 1.96 -> 1.15 s |
+| torch_tpu: masked modulation in float32 (torch's per-op bfloat16 rounding sat in the FF projection's prologue), 128-lane RoPE, libtpu 0.0.52 (same attention kernel 5% faster), decoder attention as two matmuls and FF kept 2-D (261-row tiles made every 3-D view a copy) / torch_tpu:掩码调制用 float32、128 通道 RoPE、libtpu 0.0.52、解码器注意力改两次矩阵乘且 FF 保持二维 | 4736 3.36 -> 2.95 s; decode 0.131 -> 0.076 s |
+
+What is left: about 1.05 s of the 2.77 s at 4736x3552 is the two all-reduces a block, measured at the link's rate (16,481 rows: 1.78 ms each, 174 GB/s bus); a reduce-scatter + all-gather of the same bytes is 2.3x slower, so a sequence-parallel stream does not pay on v6e.
+剩下的:4736x3552 的 2.77 秒里约 1.05 秒是每个 block 的两次 all-reduce,实测已跑在链路带宽上(16,481 行每次 1.78 ms,总线 174 GB/s);同字节的 reduce-scatter + all-gather 慢 2.3 倍,所以 v6e 上序列并行残差流不划算。
+
+Fewer chips / 更少的 chip: 4 chips with `--text-int8` 0.89 s / 4.20 s (edit 1.57 s); one v5e chip with `--offload --int8-weights --free-text-after` 11.4 s / 43.7 s (2048x2048 / 4736x3552).
+4 个 chip 加 `--text-int8`:0.89 / 4.20 秒(编辑 1.57 秒);单个 v5e chip 加 `--offload --int8-weights --free-text-after`:11.4 / 43.7 秒(2048x2048 / 4736x3552)。
