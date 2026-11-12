@@ -138,8 +138,8 @@ v6e-8,暖请求(文本编码器、transformer 与解码器常驻),端到端,含�
 | edit 2048x2048, one reference / 编辑,一张参考图 | **1.22 s** | 1.24 s | 1.38 s |
 | edit 4096x4096, one reference / 编辑,一张参考图 | **3.45 s** | | |
 
-On 4 chips (a v6e-4) add `--chips 4 --text-int8`: the text encoder is kept on chip in int8 (first 50 layers) beside the bf16 transformer. 2048x2048 in 0.93 s, 4736x3552 in 4.38 s. `--text-offload` keeps it in host memory instead and streams it each request (+0.5 s).
-4 个 chip(v6e-4)上加 `--chips 4 --text-int8`:文本编码器以 int8(前 50 层)常驻 chip,与 bf16 transformer 并存。2048x2048 0.93 秒,4736x3552 4.38 秒。`--text-offload` 则把它放在主机内存、每次请求流式送入(多 0.5 秒)。
+On 4 chips (a v6e-4) add `--chips 4 --text-int8`: the text encoder is kept on chip in int8 (first 50 layers) beside the bf16 transformer. 2048x2048 in 0.89 s, 4736x3552 in 4.20 s, a one-reference 2048x2048 edit in 1.57 s. `--text-offload` keeps it in host memory instead and streams it each request (+0.5 s).
+4 个 chip(v6e-4)上加 `--chips 4 --text-int8`:文本编码器以 int8(前 50 层)常驻 chip,与 bf16 transformer 并存。2048x2048 0.89 秒,4736x3552 4.20 秒,一张参考图的 2048x2048 编辑 1.57 秒。`--text-offload` 则把它放在主机内存、每次请求流式送入(多 0.5 秒)。
 
 On one TPU v5e chip (16 GB HBM, 47 GB host memory) add `--chips 1 --offload --int8-weights --free-text-after`: the prompt is encoded, the text encoder freed, and the int8 DiT streamed from host memory each step. 2048x2048 in 11.4 s, 4736x3552 in 43.7 s; `--int8-weights` changes the output a little.
 单个 TPU v5e chip(16 GB HBM、47 GB 主机内存)上加 `--chips 1 --offload --int8-weights --free-text-after`:先编码提示词并释放文本编码器,int8 DiT 每步从主机内存流式送入。2048x2048 11.4 秒,4736x3552 43.7 秒;`--int8-weights` 会让结果略有变化。
