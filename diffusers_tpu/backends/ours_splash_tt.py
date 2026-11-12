@@ -154,7 +154,12 @@ def install(verbose=print, fixed_m: bool = True) -> bool:
   except ImportError:
     h3_img = None
 
-  bhsd_mode = os.environ.get("DT_BHSD_ROPE", "1")
+  # "full": RoPE over all 128 lanes (cos padded with 1, sin with 0, rotate-half
+  # as a signed permutation matmul) instead of slicing the 96 rotated channels
+  # in halves. v6e-8: Pika 768p 43.1 -> 42.3 s (mean of three warm requests,
+  # same compile time), ref2va 169.4 -> 166.4 s, H3-Image 4736x3552 3.19 ->
+  # 3.11 s. "1" keeps the sliced form.
+  bhsd_mode = os.environ.get("DT_BHSD_ROPE", "full")
   if bhsd_mode in ("1", "full") and hasattr(h3, "MiniMaxH3AttnProcessor"):
     orig_call = h3.MiniMaxH3AttnProcessor.__call__
     half = 48

@@ -674,7 +674,9 @@ def main():
     return
 
   prof_ctx = None
-  if args.profile:
+  # Every rank writing one hostname-named file into the same directory left
+  # a corrupt trace; rank 0 only.
+  if args.profile and int(os.environ.get("RANK", 0)) == 0:
     from torch_tpu._internal import profiler as tt_prof
 
     prof_ctx = tt_prof.profile(
