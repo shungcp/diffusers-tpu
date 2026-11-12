@@ -879,8 +879,15 @@ def tiled_encode(encode_one, x, tile_px=256, overlap_px=64,
       flat = out.reshape((-1,) + out.shape[2:])[:n]
     else:
       stacked = jnp.stack(tiles + [tiles[-1]] * ((-n) % ndev))
-      stacked = jax.device_put(stacked, NamedSharding(mesh, P(mesh.axis_names[0])))
-      flat = jax.vmap(encode_one)(stacked)[:n]
+      sh = NamedSharding(mesh, P(mesh.axis_names[0]))
+      if isinstance(stacked, jax.core.Tracer):
+        # Under `jit` a `device_put` did not split the batch: every chip
+        # encoded all the tiles. Constrain the input and the output instead.
+        stacked = jax.lax.with_sharding_constraint(stacked, sh)
+        flat = jax.lax.with_sharding_constraint(jax.vmap(encode_one)(stacked), sh)[:n]
+      else:
+        stacked = jax.device_put(stacked, sh)
+        flat = jax.vmap(encode_one)(stacked)[:n]
     rows = [[flat[i * ncol + j] for j in range(ncol)] for i in range(len(ys))]
   elif batch:
     stacked = jnp.stack(tiles)
