@@ -611,6 +611,13 @@ def main():
     )
     return p_embeds, pres["tags"], ref_imgs, [(im.height // 16 // 2 * 2, im.width // 16 // 2 * 2) for im in ref_imgs]
 
+  # The tiled encode as one program. Op by op it dispatched ~1,300 small
+  # programs (0.57 s for a 1024x1024 reference, ~0.18 s of it on the chip).
+  def _eager_tiled_encode(w, x):
+    return jvae.tiled_encode(lambda t_: _ENC_ONE[0](w, t_), x, mesh=mesh)
+
+  _jit_tiled_encode = jax.jit(_eager_tiled_encode)
+
   def encode_ref_latents(ref_imgs, tgen):
     """Encode reference PIL images through the 3D VAE encoder using `tgen`."""
     import torch
@@ -625,9 +632,15 @@ def main():
       px = np.asarray(im, np.float32)[:hc, :wc].transpose(2, 0, 1)[None, :, None] / 255.0
       px = (px - mean5) / std5
       x_j = jnp.asarray(px, dtype)
-      moments = jvae.tiled_encode(
-          lambda t_: _ENC_ONE[0](enc_w, t_), x_j, mesh=mesh
-      )
+      if os.environ.get("DT_ENC_JIT", "1") == "1":
+        moments = _jit_tiled_encode(enc_w, x_j)
+        if os.environ.get("DT_ENC_CHECK") == "1":
+          ref = np.asarray(_eager_tiled_encode(enc_w, x_j)[:, :, -1], np.float32).ravel()
+          got = np.asarray(moments[:, :, -1], np.float32).ravel()
+          print(f"  [enc-check] jit vs eager cos {float(got @ ref / np.linalg.norm(got) / np.linalg.norm(ref)):.6f} "
+                f"max|d| {float(np.abs(got - ref).max()):.3g}", flush=True)
+      else:
+        moments = _eager_tiled_encode(enc_w, x_j)
       moments_4d = np.asarray(moments[:, :, -1], np.float32)
       mu, logvar = np.split(moments_4d, 2, axis=1)
       sd = np.exp(0.5 * np.clip(logvar, -30.0, 20.0))
@@ -766,7 +779,11 @@ def main():
       del v0, z0, u0
 
     u8_host = None
+    whole = os.environ.get("H3_IMAGE_PROFILE_WHOLE") == "1"
     for run_idx in range(args.runs):
+      prof = os.environ.get("H3_IMAGE_PROFILE_DIR") if run_idx == args.runs - 1 else None
+      if prof and whole:
+        jax.profiler.start_trace(prof)
       t_run = time.perf_counter()
       t_te0 = time.perf_counter()
       prompt_embeds, _, _, _ = encode_prompt_and_refs()
@@ -776,8 +793,8 @@ def main():
       t_pipe0 = time.perf_counter()
       rows = prepare_initial_rows()
       jax.block_until_ready(rows)
-      prof = os.environ.get("H3_IMAGE_PROFILE_DIR") if run_idx == args.runs - 1 else None
-      if prof:
+      t_prep = time.perf_counter() - t_pipe0
+      if prof and not whole:
         jax.profiler.start_trace(prof)
       t_den0 = time.perf_counter()
       for i in range(args.steps):
@@ -788,7 +805,7 @@ def main():
       z_4d = unpatchify_and_denorm(rows)
       jax.block_until_ready(z_4d)
       t_den = time.perf_counter() - t_den0
-      if prof:
+      if prof and not whole:
         jax.profiler.stop_trace()
         print(f"  [profile] denoise of the last request -> {prof}", flush=True)
 
@@ -798,9 +815,12 @@ def main():
       t_dec = time.perf_counter() - t_dec0
       t_pipe = time.perf_counter() - t_pipe0
       t_total = time.perf_counter() - t_run
+      if prof and whole:
+        jax.profiler.stop_trace()
+        print(f"  [profile] the whole last request -> {prof}", flush=True)
       print(
           f"run {run_idx}: e2e {t_total:.3f}s | pipeline (warm cond) {t_pipe:.3f}s "
-          f"[text_encoder {t_te:.3f}s  denoise {t_den:.3f}s  vae_decode {t_dec:.3f}s]",
+          f"[text_encoder {t_te:.3f}s  prepare {t_prep:.3f}s  denoise {t_den:.3f}s  vae_decode {t_dec:.3f}s]",
           flush=True,
       )
 

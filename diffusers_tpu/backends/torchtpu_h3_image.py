@@ -81,6 +81,9 @@ def parse_args():
   p.add_argument("--aot-vae-group", type=int, default=12)
   p.add_argument("--vae-tile-batch", type=int, default=16)
   p.add_argument("--runs", type=int, default=2)
+  p.add_argument("--profile", default="",
+                 help="xprof directory: one trace per run after the first, to <dir>/run<N>/rank<R> "
+                      "(rank 0 only unless DT_PROFILE_ALL_RANKS=1)")
   p.add_argument("--out", "--output", dest="out", default="out")
   p.add_argument("--tag", default="h3_image_torchtpu")
   args = p.parse_args()
@@ -231,6 +234,61 @@ def main():
       _text_fns[bucket] = fn
     return fn(ids, mm)[:, :n].to(dtype)
 
+  # Edit requests: the vision tower and the merge of its features into the
+  # sequence scatter through boolean masks, which torch_tpu cannot trace, so
+  # those run op by op. The 64-layer language model after them is compiled:
+  # the deepstack features are scattered into dense (1, S, D) tensors here and
+  # added inside the program instead of indexed in.
+  _lm_fns = {}
+
+  def _dense_deepstack(self_, hidden_states, visual_pos_masks, visual_embeds):
+    if visual_embeds.shape == hidden_states.shape:
+      return hidden_states + visual_embeds
+    return _orig_deepstack(self_, hidden_states, visual_pos_masks, visual_embeds)
+
+  lm = text_encoder.model.language_model
+  _orig_deepstack = type(lm)._deepstack_process
+  type(lm)._deepstack_process = _dense_deepstack
+
+  def compiled_text_vision(token_ids, vision_kwargs, mark=lambda: None):
+    m = text_encoder.model
+    n = len(token_ids)
+    bucket = -(-n // 256) * 256
+    ids = torch.tensor([token_ids], dtype=torch.long, device=device)
+    mm = torch.tensor(processor.create_mm_token_type_ids([token_ids]), dtype=torch.long, device=device)
+    pv = vision_kwargs["pixel_values"].to(device, text_encoder.dtype)
+    grid = vision_kwargs["image_grid_thw"].to(device)
+    embeds = m.get_input_embeddings()(ids)
+    feats = m.get_image_features(pv, grid, return_dict=True)
+    img = torch.cat(feats.pooler_output, dim=0).to(embeds.device, embeds.dtype)
+    mark()
+    mask, _ = m.get_placeholder_mask(ids, inputs_embeds=embeds, image_features=img)
+    embeds = embeds.masked_scatter(mask, img)
+    pos = m.compute_3d_position_ids(input_ids=ids, image_grid_thw=grid, inputs_embeds=embeds,
+                                    attention_mask=torch.ones_like(ids), mm_token_type_ids=mm)
+    mask2 = mask[..., 0]
+    deep = []
+    for f in feats.deepstack_features:
+      d = torch.zeros_like(embeds)
+      d[mask2] = torch.cat(f, dim=0).to(d.dtype) if isinstance(f, (list, tuple)) else f.to(d.dtype)
+      deep.append(d)
+    pad = bucket - n
+    if pad:
+      embeds = torch.nn.functional.pad(embeds, (0, 0, 0, pad))
+      deep = [torch.nn.functional.pad(d, (0, 0, 0, pad)) for d in deep]
+      pos = torch.cat([pos, pos[..., -1:].expand(*pos.shape[:-1], pad)], dim=-1)
+    mark()
+    fn = _lm_fns.get((bucket, len(deep)))
+    if fn is None:
+      def lm_fwd(e_, p_, *d_):
+        out = lm(input_ids=None, position_ids=p_, attention_mask=None, inputs_embeds=e_,
+                 visual_pos_masks=None, deepstack_visual_embeds=list(d_),
+                 use_cache=False, output_hidden_states=True)
+        return out.hidden_states[50]
+      fn = torch.compile(lm_fwd, backend="tpu", dynamic=False)
+      _lm_fns[(bucket, len(deep))] = fn
+    return fn(embeds, pos, *deep)[:, :n].to(dtype)
+
   def encode_prompt_and_refs():
     if not args.reference:
       token_ids = tokenizer(args.prompt, add_special_tokens=False)["input_ids"][:4096]
@@ -254,6 +312,11 @@ def main():
           )
       return p_embeds, tags, [], []
 
+    _tt = [time.perf_counter()]
+    def _mark():
+      if os.environ.get("DT_TEXT_TIMING") == "1":
+        torch.accelerator.synchronize()
+      _tt.append(time.perf_counter())
     raw_imgs = [ImageOps.exif_transpose(Image.open(p)).convert("RGB") for p in args.reference]
     ref_imgs = [bound_short_edge(im, 1024, 2048) for im in raw_imgs]
     vis_imgs = [bound_short_edge(im, 1024, 1024) for im in raw_imgs]
@@ -272,21 +335,54 @@ def main():
     p_ids = tokenizer(args.prompt, add_special_tokens=False)["input_ids"][:4096]
     token_ids.extend(p_ids)
     token_tags.extend([TEXT_TAG] * len(p_ids))
+    _mark()
+    vkw = {
+        "pixel_values": vision["pixel_values"].to(device=device, dtype=dtype),
+        "image_grid_thw": vision["image_grid_thw"].to(device=device),
+    }
     with torch.no_grad():
-      p_embeds = get_qwen3vl_prompt_embeds(
-          text_encoder,
-          processor,
-          token_ids,
-          {
-              "pixel_values": vision["pixel_values"].to(device=device, dtype=dtype),
-              "image_grid_thw": vision["image_grid_thw"].to(device=device),
-          },
-          text_encoder_layer=50,
-          device=device,
-          dtype=dtype,
-      )
+      if os.environ.get("DT_TEXT_COMPILE", "1") == "1":
+        p_embeds = compiled_text_vision(token_ids, vkw, _mark)
+        if os.environ.get("DT_TEXT_CHECK") == "1":
+          ref = get_qwen3vl_prompt_embeds(
+              text_encoder, processor, token_ids, vkw, text_encoder_layer=50, device=device, dtype=dtype)
+          a_, b_ = p_embeds.float().flatten(), ref.float().flatten()
+          say(f"  [text-check] cos {float((a_ @ b_) / (a_.norm() * b_.norm())):.6f}", flush=True)
+      else:
+        p_embeds = get_qwen3vl_prompt_embeds(
+            text_encoder, processor, token_ids, vkw, text_encoder_layer=50, device=device, dtype=dtype)
+    _mark()
+    if os.environ.get("DT_TEXT_TIMING") == "1":
+      say("  [text-timing] " + " ".join(f"{b - a:.3f}" for a, b in zip(_tt, _tt[1:])), flush=True)
     ref_grids = [(im.height // 16 // 2 * 2, im.width // 16 // 2 * 2) for im in ref_imgs]
     return p_embeds, np.asarray(token_tags, dtype=np.int64), ref_imgs, ref_grids
+
+  # The tiled reference encode, compiled: all tiles (same size) as one batch
+  # through one program instead of ~8,000 eager ops. GroupNorm and the
+  # single-frame causal convs work per sample, so batching changes nothing.
+  _enc_fns = {}
+
+  def encode_moments(x):
+    from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+    x = x.to(next(vae.encoder.parameters()).dtype)
+    h, w = x.shape[-2:]
+    ys, yl, yo = vae._split_tiles(h, vae.tile_sample_min_height, vae.tile_sample_min_overlap_height)
+    xs, xl, xo = vae._split_tiles(w, vae.tile_sample_min_width, vae.tile_sample_min_overlap_width)
+    if not vae.use_tiling or os.environ.get("DT_ENC_COMPILE", "1") != "1":
+      return vae.encode(x, return_dict=False)[0]
+    tiles = torch.cat([x[..., i:i + li, j:j + lj] for i, li in zip(ys, yl) for j, lj in zip(xs, xl)])
+    key = tuple(tiles.shape)
+    fn = _enc_fns.get(key)
+    if fn is None:
+      fn = torch.compile(lambda t: vae.quant_conv(vae.encoder(t[:, :, None]))[:, :, -1],
+                         backend="tpu", dynamic=False)
+      _enc_fns[key] = fn
+    out = fn(tiles)
+    ncol = len(xs)
+    rows = [[out[r * ncol + c:r * ncol + c + 1] for c in range(ncol)] for r in range(len(ys))]
+    ratio = vae.spatial_compression_ratio
+    moments = vae._stitch_tiles(rows, [o // ratio for o in yo], [o // ratio for o in xo])
+    return DiagonalGaussianDistribution(moments)
 
   def encode_ref_latents(ref_imgs, tgen):
     ref_latents = []
@@ -296,7 +392,12 @@ def main():
       px = torch.from_numpy(np.asarray(im, np.float32)[:hc, :wc]).to(device).permute(2, 0, 1)[None]
       px = (px.div(255.0) - px_mean) / px_std
       with torch.no_grad():
-        posterior = vae.encode(px.to(dtype), return_dict=False)[0]
+        posterior = encode_moments(px.to(dtype))
+        if os.environ.get("DT_ENC_CHECK") == "1":
+          ref_m = vae.encode(px.to(dtype), return_dict=False)[0].mean.float().flatten()
+          got_m = posterior.mean.float().flatten()
+          say(f"  [enc-check] compiled vs eager mean cos {float(got_m @ ref_m / got_m.norm() / ref_m.norm()):.6f} "
+              f"max|d| {float((got_m - ref_m).abs().max()):.3g} |ref| {float(ref_m.abs().mean()):.3g}", flush=True)
       moments = posterior. parameters if hasattr(posterior, "parameters") else None
       # Draw eps on CPU generator for deterministic cross-rank noise
       mu = posterior.mean.detach().to("cpu", torch.float32)
@@ -422,6 +523,14 @@ def main():
 
   u8_host = None
   for run_idx in range(args.runs):
+    prof_ctx = None
+    if args.profile and (rank == 0 or os.environ.get("DT_PROFILE_ALL_RANKS") == "1") and run_idx >= 1:
+      from torch_tpu._internal import profiler as tt_prof
+      prof_ctx = tt_prof.profile(
+          activities=[tt_prof.ProfilerActivity.CPU, tt_prof.ProfilerActivity.TPU],
+          on_trace_ready=tt_prof.xprof_trace_handler(dir_name=f"{args.profile}/run{run_idx}/rank{rank}"),
+      )
+      prof_ctx.__enter__()
     torch.accelerator.synchronize()
     t_run = time.perf_counter()
 
@@ -433,6 +542,7 @@ def main():
     t_pipe0 = time.perf_counter()
     rows = prepare_initial_rows()
     torch.accelerator.synchronize()
+    t_prep = time.perf_counter() - t_pipe0
 
     t_den0 = time.perf_counter()
     with torch.no_grad():
@@ -467,9 +577,11 @@ def main():
     t_total = time.perf_counter() - t_run
     say(
         f"run {run_idx}: e2e {t_total:.3f}s | pipeline (warm cond) {t_pipe:.3f}s "
-        f"[text_encoder {t_te:.3f}s  denoise {t_den:.3f}s  vae_decode {t_dec:.3f}s]",
+        f"[text_encoder {t_te:.3f}s  prepare {t_prep:.3f}s  denoise {t_den:.3f}s  vae_decode {t_dec:.3f}s]",
         flush=True,
     )
+    if prof_ctx is not None:
+      prof_ctx.__exit__(None, None, None)
 
   if rank == 0 and u8_host is not None:
     os.makedirs(args.out, exist_ok=True)
