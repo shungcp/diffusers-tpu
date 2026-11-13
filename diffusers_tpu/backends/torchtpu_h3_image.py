@@ -269,12 +269,96 @@ def main():
       _text_fns[bucket] = fn
     return fn(ids, mm)[:, :n].to(dtype)
 
-  # Edit requests: the vision tower and the merge of its features into the
-  # sequence scatter through boolean masks, which torch_tpu cannot trace, so
-  # those run op by op. The 64-layer language model after them is compiled:
-  # the deepstack features are scattered into dense (1, S, D) tensors here and
-  # added inside the program instead of indexed in.
+  # Edit requests: the merge of visual features into the sequence scatters
+  # through boolean masks, which torch_tpu cannot trace, so that merge runs op
+  # by op. Both the 27-layer vision tower (with its grid-dependent prologue
+  # cached by `image_grid_thw` and `Qwen3VLVisionAttention` patched to avoid
+  # `cu_seqlens.tolist()`) and the 64-layer language model after the merge are
+  # compiled into single TPU programs.
   _lm_fns = {}
+  _vis_fns = {}
+  _vis_meta_cache = {}
+
+  if os.environ.get("DT_VIS_COMPILE", "1") == "1":
+    from transformers.models.qwen3_vl import modeling_qwen3_vl as _m_qwen
+    if not getattr(_m_qwen.Qwen3VLVisionAttention, "_tpu_fused_patched", False):
+      def _vis_attn_fwd(self_, hidden_states, cu_seqlens=None,
+                        position_embeddings=None, max_seqlen=None, **kwargs):
+        del max_seqlen, kwargs
+        seq_length = hidden_states.shape[0]
+        q, k, v = (self_.qkv(hidden_states)
+                   .reshape(seq_length, 3, self_.num_heads, -1)
+                   .permute(1, 0, 2, 3).unbind(0))
+        cos, sin = position_embeddings
+        q, k = _m_qwen.apply_rotary_pos_emb_vision(q, k, cos, sin)
+        q = q.transpose(0, 1).unsqueeze(0)
+        k = k.transpose(0, 1).unsqueeze(0)
+        v = v.transpose(0, 1).unsqueeze(0)
+        lengths = getattr(self_, "_static_lengths", None)
+        if lengths is None and cu_seqlens is not None and cu_seqlens.shape[0] > 2:
+          lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+        if not lengths or len(lengths) == 1:
+          out = torch.nn.functional.scaled_dot_product_attention(
+              q, k, v, scale=self_.scaling)
+        else:
+          out = torch.cat([
+              torch.nn.functional.scaled_dot_product_attention(
+                  qc, kc, vc, scale=self_.scaling)
+              for qc, kc, vc in zip(
+                  q.split(lengths, dim=2),
+                  k.split(lengths, dim=2),
+                  v.split(lengths, dim=2))
+          ], dim=2)
+        return self_.proj(out.transpose(1, 2).reshape(seq_length, -1))
+      _m_qwen.Qwen3VLVisionAttention.forward = _vis_attn_fwd
+      _m_qwen.Qwen3VLVisionAttention._tpu_fused_patched = True
+
+  class _VisPrologueDone(Exception):
+    pass
+
+  def _run_compiled_vision(vis, pv, grid):
+    key = tuple(int(x) for x in grid.detach().cpu().flatten().tolist())
+    hit = _vis_meta_cache.get(key)
+    if hit is None:
+      captured = {}
+      blk0 = vis.blocks[0]
+      orig_b0 = blk0.forward
+      def _trap(hidden_states, cu_seqlens=None, max_seqlen=None,
+                position_embeddings=None, **kw):
+        captured["h0"] = hidden_states
+        captured["pe"] = position_embeddings
+        raise _VisPrologueDone()
+      blk0.forward = _trap
+      try:
+        vis(pv, grid)
+      except _VisPrologueDone:
+        pass
+      finally:
+        blk0.forward = orig_b0
+      pos_e = (captured["h0"] - vis.patch_embed(pv)).detach()
+      cos, sin = captured["pe"]
+      g_cpu = grid.detach().cpu().view(-1, 3)
+      lengths = tuple(int(t * h * w) for t, h, w in g_cpu.tolist())
+      hit = (pos_e, cos.detach(), sin.detach(), lengths)
+      _vis_meta_cache[key] = hit
+    pos_e, cos, sin, lengths = hit
+    vis_fn = _vis_fns.get(lengths)
+    if vis_fn is None:
+      deep_idxs = list(vis.deepstack_visual_indexes)
+      def _vis_fwd(pv_, pos_e_, cos_, sin_):
+        for b in vis.blocks:
+          b.attn._static_lengths = lengths
+        h = vis.patch_embed(pv_) + pos_e_
+        pe = (cos_, sin_)
+        deep = []
+        for i, blk in enumerate(vis.blocks):
+          h = blk(h, cu_seqlens=None, position_embeddings=pe)
+          if i in deep_idxs:
+            deep.append(vis.deepstack_merger_list[deep_idxs.index(i)](h))
+        return vis.merger(h), tuple(deep)
+      vis_fn = torch.compile(_vis_fwd, backend="tpu", dynamic=False)
+      _vis_fns[lengths] = vis_fn
+    return vis_fn(pv, pos_e, cos, sin)
 
   def _dense_deepstack(self_, hidden_states, visual_pos_masks, visual_embeds):
     if visual_embeds.shape == hidden_states.shape:
@@ -294,8 +378,13 @@ def main():
     pv = vision_kwargs["pixel_values"].to(device, text_encoder.dtype)
     grid = vision_kwargs["image_grid_thw"].to(device)
     embeds = m.get_input_embeddings()(ids)
-    feats = m.get_image_features(pv, grid, return_dict=True)
-    img = torch.cat(feats.pooler_output, dim=0).to(embeds.device, embeds.dtype)
+    if os.environ.get("DT_VIS_COMPILE", "1") == "1":
+      img, deep_feats = _run_compiled_vision(m.visual, pv, grid)
+      img = img.to(embeds.device, embeds.dtype)
+    else:
+      feats = m.get_image_features(pv, grid, return_dict=True)
+      img = torch.cat(feats.pooler_output, dim=0).to(embeds.device, embeds.dtype)
+      deep_feats = feats.deepstack_features
     mark()
     mask, _ = m.get_placeholder_mask(ids, inputs_embeds=embeds, image_features=img)
     embeds = embeds.masked_scatter(mask, img)
@@ -303,7 +392,7 @@ def main():
                                     attention_mask=torch.ones_like(ids), mm_token_type_ids=mm)
     mask2 = mask[..., 0]
     deep = []
-    for f in feats.deepstack_features:
+    for f in deep_feats:
       d = torch.zeros_like(embeds)
       d[mask2] = torch.cat(f, dim=0).to(d.dtype) if isinstance(f, (list, tuple)) else f.to(d.dtype)
       deep.append(d)
@@ -354,7 +443,7 @@ def main():
       _tt.append(time.perf_counter())
     raw_imgs = [ImageOps.exif_transpose(Image.open(p)).convert("RGB") for p in args.reference]
     ref_imgs = [bound_short_edge(im, 1024, 2048) for im in raw_imgs]
-    vis_imgs = [bound_short_edge(im, 1024, 1024) for im in raw_imgs]
+    vis_imgs = [bound_short_edge(im, 1024, 1024) for im in ref_imgs]
     vision = processor.image_processor(images=vis_imgs, return_tensors="pt")
     merge_size = processor.image_processor.merge_size ** 2
     v_start = tokenizer.convert_tokens_to_ids("<|vision_start|>")

@@ -404,7 +404,7 @@ def main():
 
     raw_imgs = [ImageOps.exif_transpose(Image.open(p)).convert("RGB") for p in args.reference]
     ref_imgs = [bound_short_edge(im, 1024, 2048) for im in raw_imgs]
-    vis_imgs = [bound_short_edge(im, 1024, 1024) for im in raw_imgs]
+    vis_imgs = [bound_short_edge(im, 1024, 1024) for im in ref_imgs]
     with torchax.disable_temporarily():
       vision = processor.image_processor(images=vis_imgs, return_tensors="pt")
       merge_size = processor.image_processor.merge_size ** 2

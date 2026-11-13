@@ -596,7 +596,7 @@ def main():
         for p in args.reference
     ]
     ref_imgs = [bound_short_edge(im, 1024, 2048) for im in raw_imgs]
-    vis_imgs = [bound_short_edge(im, 1024, 1024) for im in raw_imgs]
+    vis_imgs = [bound_short_edge(im, 1024, 1024) for im in ref_imgs]
     vision = processor.image_processor(images=vis_imgs, return_tensors="pt")
     merge_size = processor.image_processor.merge_size ** 2
     v_start = tokenizer.convert_tokens_to_ids("<|vision_start|>")
@@ -615,6 +615,8 @@ def main():
     token_ids.extend(p_ids)
     token_tags.extend([TEXT_TAG] * len(p_ids))
     real_tags = np.asarray(token_tags, dtype=np.int64)
+    if pad_to < 0:
+      pad_to = -(-len(token_ids) // (-pad_to)) * (-pad_to)
     if pad_to > len(token_ids):
       pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
       token_tags.extend([TEXT_TAG] * (pad_to - len(token_ids)))
@@ -935,19 +937,9 @@ def serve_requests(args, env):
     return emb, np.ones((n,), np.int64), [], []
 
   def encode_edit(prompt, refs):
-    # The pipeline's own presentation, padded: measure the real length, then
-    # encode once at the bucket's length.
+    # The pipeline's own presentation, padded to the next `bucket` multiple.
     args.prompt, args.reference = prompt, refs
-    from PIL import ImageOps
-    vis = [bound_short_edge(ImageOps.exif_transpose(Image.open(r)).convert("RGB"), 1024, 1024)
-           for r in refs]
-    grid = e["processor"].image_processor(images=vis, return_tensors="pt")["image_grid_thw"]
-    merge = e["processor"].image_processor.merge_size ** 2
-    n = len(tokenizer(prompt, add_special_tokens=False)["input_ids"][:4096])
-    for idx, g in enumerate(grid):
-      n += len(tokenizer(f"Picture {idx + 1}: ", add_special_tokens=False)["input_ids"]) + 2
-      n += int(g.prod().item()) // merge
-    return e["encode_prompt_and_refs"](pad_to=-(-n // bucket) * bucket)
+    return e["encode_prompt_and_refs"](pad_to=-bucket)
 
   saver = ThreadPoolExecutor(max_workers=2)   # a 2048x2048 PNG is ~1.2 s of host time
   pending, seen = [], set()
