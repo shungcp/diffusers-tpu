@@ -582,6 +582,11 @@ def main():
         flush=True)
 
 
+  # `--requests`: a reference reused across requests is decoded, resized and
+  # preprocessed once, and its VAE moments encoded once (the noise is still
+  # drawn per request). Off for the timed runs, which measure a request.
+  _ref_cache = {}
+
   def encode_prompt_and_refs(pad_to=0):
     """Run text (+ optional vision + reference VAE) encoding.
 
@@ -591,13 +596,20 @@ def main():
       return cached_text if cached_text is not None else encode_t2i_prompt()
 
     from PIL import Image, ImageOps
-    raw_imgs = [
-        ImageOps.exif_transpose(Image.open(p)).convert("RGB")
-        for p in args.reference
-    ]
-    ref_imgs = [bound_short_edge(im, 1024, 2048) for im in raw_imgs]
-    vis_imgs = [bound_short_edge(im, 1024, 1024) for im in ref_imgs]
-    vision = processor.image_processor(images=vis_imgs, return_tensors="pt")
+    key = tuple((p, os.path.getmtime(p)) for p in args.reference)
+    hit = _ref_cache.get(("pre", key)) if _ref_cache.get("on") else None
+    if hit is None:
+      raw_imgs = [
+          ImageOps.exif_transpose(Image.open(p)).convert("RGB")
+          for p in args.reference
+      ]
+      ref_imgs = [bound_short_edge(im, 1024, 2048) for im in raw_imgs]
+      vis_imgs = [bound_short_edge(im, 1024, 1024) for im in ref_imgs]
+      vision = processor.image_processor(images=vis_imgs, return_tensors="pt")
+      hit = (ref_imgs, vision)
+      if _ref_cache.get("on"):
+        _ref_cache[("pre", key)] = hit
+    ref_imgs, vision = hit
     merge_size = processor.image_processor.merge_size ** 2
     v_start = tokenizer.convert_tokens_to_ids("<|vision_start|>")
     v_end = tokenizer.convert_tokens_to_ids("<|vision_end|>")
@@ -660,7 +672,10 @@ def main():
       px = np.asarray(im, np.float32)[:hc, :wc].transpose(2, 0, 1)[None, :, None] / 255.0
       px = (px - mean5) / std5
       x_j = jnp.asarray(px, dtype)
-      if os.environ.get("DT_ENC_JIT", "1") == "1":
+      mkey = ("moments", im.size, hash(im.tobytes())) if _ref_cache.get("on") else None
+      if mkey is not None and mkey in _ref_cache:
+        moments = _ref_cache[mkey]
+      elif os.environ.get("DT_ENC_JIT", "1") == "1":
         moments = _jit_tiled_encode(enc_w, x_j)
         if os.environ.get("DT_ENC_CHECK") == "1":
           ref = np.asarray(_eager_tiled_encode(enc_w, x_j)[:, :, -1], np.float32).ravel()
@@ -669,6 +684,8 @@ def main():
                 f"max|d| {float(np.abs(got - ref).max()):.3g}", flush=True)
       else:
         moments = _eager_tiled_encode(enc_w, x_j)
+      if mkey is not None:
+        _ref_cache[mkey] = moments
       moments_4d = np.asarray(moments[:, :, -1], np.float32)
       mu, logvar = np.split(moments_4d, 2, axis=1)
       sd = np.exp(0.5 * np.clip(logvar, -30.0, 20.0))
@@ -941,6 +958,7 @@ def serve_requests(args, env):
     args.prompt, args.reference = prompt, refs
     return e["encode_prompt_and_refs"](pad_to=-bucket)
 
+  e["_ref_cache"]["on"] = True
   saver = ThreadPoolExecutor(max_workers=2)   # a 2048x2048 PNG is ~1.2 s of host time
   pending, seen = [], set()
   reqs = [json.loads(l) for l in open(args.requests) if l.strip()]
