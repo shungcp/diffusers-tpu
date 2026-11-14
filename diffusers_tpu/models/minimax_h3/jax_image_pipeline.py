@@ -108,6 +108,16 @@ def parse_args():
   p.add_argument("--enc-tile-bucket", type=int, default=32,
                  help="with --requests: encode a reference's 256-pixel tiles in batches padded to a "
                       "multiple of this, one program per batch size instead of per image size (0: off)")
+  p.add_argument("--scan-layers", type=int, default=1,
+                 help="with --requests: run the transformer, text and vision layers as scans over "
+                      "stacked weights, so a new shape compiles in ~25 s instead of ~70 s "
+                      "(an extra copy of those weights in HBM, ~1-2%% slower a request; 0: off)")
+  p.add_argument("--parallel-compile", type=int, default=1,
+                 help="with --requests: compile a new shape's transformer step and reference "
+                      "encode in threads while the text encode compiles (0: one after another)")
+  p.add_argument("--vision-bucket", type=int, default=0,
+                 help="with --requests: pad a reference's vision patches to a multiple of this "
+                      "(masked), so reference shapes share the text+vision program (0: off)")
   p.add_argument("--text-bucket-edit", type=int, default=64,
                  help="with --requests: text bucket for edits, whose text includes the reference's "
                       "vision tokens (their count changes with the reference's shape)")
@@ -930,14 +940,30 @@ def serve_requests(args, env):
   bucket = max(1, args.text_bucket)
   text_val = int(TEXT_TAG)            # timestep index 0: MODALITY_NUM * 0 + tag
 
+  # `--scan-layers`: the transformer's 50 blocks, the text tower's layers
+  # 3..50 and the vision tower's 27 blocks each run as one `scan` over
+  # stacked weights, so a new shape compiles one layer of each instead of all
+  # of them (a second copy of those weights in HBM; ~1-2% slower a request).
+  # The stacked copy needs room: off below 8 chips (the 4-chip layout keeps
+  # twice the DiT per chip) and with host-offloaded weights.
+  use_scan = bool(args.scan_layers) and mesh.devices.size >= 8 and e.get("dit_host") is None
+  scan = None
+  if use_scan:
+    blocks = nnx.merge(graphdef, dit_state).transformer_blocks
+    block_graph = nnx.split(blocks[0])[0]
+    stacked_blocks = jax.tree.map(lambda *xs: jnp.stack(xs), *[nnx.state(b) for b in blocks])
+    scan = block_graph
+    print("  [scan] transformer blocks stacked for a scanned step", flush=True)
+
   @functools.partial(jax.jit, static_argnames=("run_vals", "n_ref"))
   def step(state, img_rows, text_emb, t_vec, dt_scalar, pdd_idx, mods, position_ids, token_tags,
-           image_idx, text_idx, row_step, n_txt, seq_real, bounds, run_vals, n_ref):
+           image_idx, text_idx, row_step, n_txt, seq_real, bounds, run_vals, n_ref, stacked=None):
     seg = tuple((bounds[2 * r], bounds[2 * r + 1], v) for r, v in enumerate(run_vals))
     model = nnx.merge(graphdef, state)
     dv = model(img_rows, None, text_emb, t_vec, row_step, token_tags, position_ids,
                image_idx, None, text_idx, sdpa=sdpa, segments=seg,
-               seq_len=seq_real, text_len=n_txt, adaln_mods=mods, pdd_step=pdd_idx)
+               seq_len=seq_real, text_len=n_txt, adaln_mods=mods, pdd_step=pdd_idx,
+               scan_blocks=None if stacked is None else (scan, stacked))
     gen = img_rows[:, n_ref:].astype(jnp.float32) + dt_scalar * dv[:, n_ref:].astype(jnp.float32)
     return jnp.concatenate([img_rows[:, :n_ref], gen], axis=1) if n_ref else gen
 
@@ -951,6 +977,20 @@ def serve_requests(args, env):
     x = jnp.transpose(x, (0, 3, 1, 4, 2, 5)).reshape(1, 24, latent_h, latent_w)
     return (x.astype(jnp.float32) * lat_std + lat_mean).astype(dtype)
 
+  text_scan = None
+  if use_scan:
+    tlayers = list(encoder.layers)[3:TEXT_ENCODER_LAYER]
+    text_scan = (nnx.split(tlayers[0])[0],
+                 jax.tree.map(lambda *xs: jnp.stack(xs), *[nnx.state(l) for l in tlayers]))
+    _ge, _se = nnx.split(encoder)
+
+    @jax.jit
+    def _t2i_scan(se_, stacked, ids_, c_, s_):
+      return nnx.merge(_ge, se_)(ids_, c_, s_, stop_at_layer=TEXT_ENCODER_LAYER,
+                                 scan_layers=(text_scan[0], stacked, 3))
+    print("  [scan] text layers 3..50 stacked; HBM in use on chip 0: "
+          f"{jax.devices()[0].memory_stats().get('bytes_in_use', 0) / 2**30:.1f} GiB", flush=True)
+
   def encode_t2i(prompt):
     ids = tokenizer(prompt, add_special_tokens=False)["input_ids"][:4096]
     n = len(ids)
@@ -961,7 +1001,11 @@ def serve_requests(args, env):
     cos, sin = e["qwen_text"].mrope_cos_sin(
         pos, head_dim=e["cfg_text"]["head_dim"], rope_theta=e["cfg_text"]["rope_theta"],
         mrope_section=e["cfg_text"]["mrope_section"])
-    emb = _text_jit(encoder, put(ids_np, jnp.int32), put(cos, e["dtype"]), put(sin, e["dtype"]))
+    if text_scan is not None:
+      emb = _t2i_scan(_se, text_scan[1], put(ids_np, jnp.int32), put(cos, e["dtype"]),
+                      put(sin, e["dtype"]))
+    else:
+      emb = _text_jit(encoder, put(ids_np, jnp.int32), put(cos, e["dtype"]), put(sin, e["dtype"]))
     return emb, np.ones((n,), np.int64), [], []
 
   def encode_edit(prompt, refs):
@@ -1004,21 +1048,107 @@ def serve_requests(args, env):
 
   if args.enc_tile_bucket and enc_w is not None and len(mesh.devices.flatten()) > 1:
     e["_ref_cache"]["encode"] = encode_bucketed
+  # `--vision-bucket`: the reference's patches padded too, so references of
+  # different shapes share one text+vision program (with coarse text, ref
+  # and enc buckets, a new shape compiles nothing). Pad patches are masked as
+  # keys in the vision tower; their merged tokens land on a text pad row.
+  _tv_fns = {}
+
+  def encode_edit_bucketed(prompt, refs):
+    from ..qwen3_vl import jax_vision as qv
+    args.prompt, args.reference = prompt, refs
+    key = tuple((r, os.path.getmtime(r)) for r in refs)
+    hit = e["_ref_cache"].get(("pre", key))
+    if hit is None:
+      from PIL import ImageOps
+      raw = [ImageOps.exif_transpose(Image.open(r)).convert("RGB") for r in refs]
+      ref_imgs = [bound_short_edge(im, 1024, 2048) for im in raw]
+      vis = [bound_short_edge(im, 1024, 1024) for im in ref_imgs]
+      vision = e["processor"].image_processor(images=vis, return_tensors="pt")
+      hit = (ref_imgs, vision)
+      e["_ref_cache"][("pre", key)] = hit
+    ref_imgs, vision = hit
+    merge = e["processor"].image_processor.merge_size ** 2
+    v_start = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    v_end = tokenizer.convert_tokens_to_ids("<|vision_end|>")
+    img_pad = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+    ids, tags = [], []
+    for k_, g in enumerate(vision["image_grid_thw"]):
+      lab = tokenizer(f"Picture {k_ + 1}: ", add_special_tokens=False)["input_ids"][:4096]
+      vl = int(g.prod().item()) // merge
+      ids += lab + [v_start] + [img_pad] * vl + [v_end]
+      tags += [TEXT_TAG] * len(lab) + [IMAGE_TAG] * (vl + 2)
+    p_ids = tokenizer(prompt, add_special_tokens=False)["input_ids"][:4096]
+    ids += p_ids
+    tags += [TEXT_TAG] * len(p_ids)
+    n = len(ids)
+    tb_ = max(bucket, args.text_bucket_edit)
+    # With padded patches, at least one pad row takes their merged tokens.
+    tb = -(-(n + 1) // tb_) * tb_ if args.vision_bucket else -(-n // tb_) * tb_
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    grid = vision["image_grid_thw"].numpy()
+    mm = np.asarray(e["processor"].create_mm_token_type_ids([ids]), np.int64)
+    pos3 = e["r2v"].text_positions(e["img_snap"], np.asarray(ids, np.int32), grid, mm)
+    pos3 = np.concatenate([pos3, np.repeat(pos3[:, -1:], tb - n, axis=1)], axis=1)
+    ids_p = np.asarray(ids + [pad_id] * (tb - n), np.int32)
+    vmeta = qv.vision_metadata(grid)
+    vcos, vsin = qv.vision_rope(vmeta["position_ids"])
+    pix = vision["pixel_values"].float().numpy()
+    npatch = pix.shape[0]
+    pb = -(-npatch // args.vision_bucket) * args.vision_bucket if args.vision_bucket else npatch
+    vpad = pb - npatch
+    ii, iw = vmeta["interp_indices"], vmeta["interp_weights"]
+    pix = np.concatenate([pix, np.zeros((vpad, pix.shape[1]), pix.dtype)])
+    ii = np.concatenate([ii, np.repeat(ii[-1:], vpad, axis=0)])
+    iw = np.concatenate([iw, np.zeros((vpad,) + iw.shape[1:], iw.dtype)])
+    vcos = np.concatenate([vcos, np.ones((vpad, vcos.shape[1]), vcos.dtype)])
+    vsin = np.concatenate([vsin, np.zeros((vpad, vsin.shape[1]), vsin.dtype)])
+    vpos = np.flatnonzero(ids_p == img_pad)
+    vpos = np.concatenate([vpos, np.full((pb // merge - vpos.shape[0],), tb - 1, vpos.dtype)])
+    cos, sin = e["qwen_text"].mrope_cos_sin(
+        pos3, head_dim=e["cfg_text"]["head_dim"], rope_theta=e["cfg_text"]["rope_theta"],
+        mrope_section=e["cfg_text"]["mrope_section"])
+    dt = e["dtype"]
+    from flax import nnx
+    fkey = (id(encoder), id(e["vision_model"]))
+    if fkey not in _tv_fns:
+      ge, se = nnx.split(encoder)
+      gv, sv = nnx.split(e["vision_model"])
+      vblocks = list(e["vision_model"].blocks)
+      vis_scan = ((nnx.split(vblocks[0])[0],
+                   jax.tree.map(lambda *xs: jnp.stack(xs), *[nnx.state(b) for b in vblocks]))
+                  if text_scan is not None else None)
+
+      @jax.jit
+      def tv(se_, sv_, pix_, ii_, iw_, vc_, vs_, ids_, c_, s_, vpos_, kv_len, stacked=None,
+             vstacked=None):
+        enc, vm = nnx.merge(ge, se_), nnx.merge(gv, sv_)
+        merged, deep = vm(pix_, {"interp_indices": ii_, "interp_weights": iw_}, vc_, vs_,
+                          kv_len=kv_len,
+                          scan_blocks=None if vstacked is None else (vis_scan[0], vstacked))
+        emb0 = enc.embed_tokens[...][ids_]
+        emb0 = emb0.at[:, vpos_].set(merged.astype(emb0.dtype))
+        return enc(ids_, c_, s_, inputs_embeds=emb0, deepstack=deep, visual_positions=vpos_,
+                   stop_at_layer=TEXT_ENCODER_LAYER,
+                   scan_layers=None if stacked is None else (text_scan[0], stacked, 3))
+      _tv_fns[fkey] = (tv, se, sv, vis_scan)
+    tv, se, sv, vis_scan = _tv_fns[fkey]
+    emb = tv(se, sv, put(pix, dt), put(ii), put(iw), put(vcos, dt), put(vsin, dt),
+             put(ids_p[None]), put(cos, dt), put(sin, dt), put(vpos), put(npatch, jnp.int32),
+             stacked=None if text_scan is None else text_scan[1],
+             vstacked=None if vis_scan is None else vis_scan[1])
+    grids = [(im.height // 16 // 2 * 2, im.width // 16 // 2 * 2) for im in ref_imgs]
+    return emb, np.asarray(tags, np.int64), ref_imgs, grids
+
+  if (args.vision_bucket or text_scan is not None) and e.get("vision_model") is not None:
+    encode_edit = encode_edit_bucketed
+
   saver = ThreadPoolExecutor(max_workers=2)   # a 2048x2048 PNG is ~1.2 s of host time
   pending, seen = [], set()
   reqs = [json.loads(l) for l in open(args.requests) if l.strip()]
-  for k, req in enumerate(reqs):
-    t0 = time.perf_counter()
-    refs = req.get("reference") or []
-    if isinstance(refs, str):
-      refs = [refs]
-    with jax.set_mesh(mesh):
-      emb, tags_real, ref_imgs, ref_grids = (encode_edit(req["prompt"], refs) if refs
-                                             else encode_t2i(req["prompt"]))
-      jax.block_until_ready(emb)
-    t_text = time.perf_counter() - t0
-    n, tb = len(tags_real), int(emb.shape[1])
-
+  def make_layout(tags_real, ref_grids, tb):
+    """Host arrays and run structure of one request's packed sequence."""
+    n = len(tags_real)
     pos_np, tags_np, img_idx_np, txt_idx_np, n_ref, _ = build_image_packed_sequence(
         tags_real, ref_grids, latent_h, latent_w)
     seq_real = int(pos_np.shape[0])
@@ -1044,10 +1174,103 @@ def serve_requests(args, env):
     tags_np = np.concatenate([tags_np, np.full((extra,), TEXT_TAG, np.int32),
                               np.full((rpad,), IMAGE_TAG, np.int32)])
     txt_idx_np = np.concatenate([txt_idx_np, np.arange(seq_real, seq_real + extra, dtype=np.int32)])
-    lay = (put(pos_np), put(tags_np), put(img_idx_np), put(txt_idx_np), put(row_np),
-           put(n, jnp.int32), put(seq_real, jnp.int32),
-           put(np.asarray([b for r in runs for b in r[:2]], np.int32)))
-    run_vals = tuple(v for _, _, v in runs)
+    lay = (pos_np, tags_np, img_idx_np, txt_idx_np, row_np, np.int32(n), np.int32(seq_real),
+           np.asarray([b for r in runs for b in r[:2]], np.int32))
+    return lay, tuple(v for _, _, v in runs), n_ref, rb
+
+  def put_lay(lay):
+    return tuple(put(a, jnp.int32) if np.ndim(a) == 0 else put(a) for a in lay)
+
+  def plan(prompt, refs):
+    """The request's shapes from tokens and image sizes alone (no device
+    work): text length and bucket, reference grids, encoder tile count."""
+    if not refs:
+      n = len(tokenizer(prompt, add_special_tokens=False)["input_ids"][:4096])
+      return np.ones((n,), np.int64), [], -(-n // bucket) * bucket, 0
+    from PIL import ImageOps
+    key = tuple((r, os.path.getmtime(r)) for r in refs)
+    hit = e["_ref_cache"].get(("pre", key))
+    if hit is None:
+      raw = [ImageOps.exif_transpose(Image.open(r)).convert("RGB") for r in refs]
+      ref_imgs = [bound_short_edge(im, 1024, 2048) for im in raw]
+      vis = [bound_short_edge(im, 1024, 1024) for im in ref_imgs]
+      hit = (ref_imgs, e["processor"].image_processor(images=vis, return_tensors="pt"))
+      e["_ref_cache"][("pre", key)] = hit
+    ref_imgs, vision = hit
+    merge = e["processor"].image_processor.merge_size ** 2
+    tags = []
+    for k_, g in enumerate(vision["image_grid_thw"]):
+      lab = len(tokenizer(f"Picture {k_ + 1}: ", add_special_tokens=False)["input_ids"][:4096])
+      tags += [TEXT_TAG] * lab + [IMAGE_TAG] * (int(g.prod().item()) // merge + 2)
+    tags += [TEXT_TAG] * len(tokenizer(prompt, add_special_tokens=False)["input_ids"][:4096])
+    n = len(tags)
+    b = max(bucket, args.text_bucket_edit)
+    tb = -(-(n + 1) // b) * b if args.vision_bucket else -(-n // b) * b
+    grids = [(im.height // 16 // 2 * 2, im.width // 16 // 2 * 2) for im in ref_imgs]
+    tiles = 0
+    for im in ref_imgs:
+      ny = len(e["jvae"].split_tiles(im.height // 16 * 16, 256, 64)[0])
+      nx = len(e["jvae"].split_tiles(im.width // 16 * 16, 256, 64)[0])
+      tiles = max(tiles, ny * nx)
+    return np.asarray(tags, np.int64), grids, tb, tiles
+
+  def warm(tags_real, grids, tb, tiles, n_ref_rows):
+    """Compile a new shape's step and reference encode on zeros in threads,
+    while the caller runs (and compiles) the text encode: XLA compiles in
+    parallel and the request waits for the longest program, not the sum."""
+    import threading
+    lay, run_vals, n_ref, rb = make_layout(tags_real, grids, tb)
+    t_len = (latent_h // 2) * (latent_w // 2)
+    jobs = []
+
+    def step_job():
+      with jax.set_mesh(mesh):
+        rows0 = put(np.zeros((1, rb + t_len, 96), np.float32), jnp.float32)
+        emb0 = put(np.zeros((1, tb, e["cfg_text"]["hidden_size"]), np.float32), e["dtype"])
+        tv0 = put([0.5, 0.999] if n_ref else [0.5], jnp.float32)
+        jax.block_until_ready(step(dit_state, rows0, emb0, tv0, e["dt_scalars"][0], e["pdd_indices"][0],
+                                   None if adaln_mods is None else adaln_mods[0], *put_lay(lay),
+                                   run_vals=run_vals, n_ref=int(rb),
+                                   stacked=stacked_blocks if scan is not None else None))
+    jobs.append(step_job)
+    if tiles and e["_ref_cache"].get("encode") is not None:
+      nb = -(-tiles // args.enc_tile_bucket) * args.enc_tile_bucket
+
+      def enc_job():
+        with jax.set_mesh(mesh):
+          jax.block_until_ready(enc_batch(enc_w, jnp.zeros((nb, 1, 3, 1, 256, 256), e["dtype"])))
+      jobs.append(enc_job)
+    threads = [threading.Thread(target=f) for f in jobs]
+    for t in threads:
+      t.start()
+    return threads
+
+  warmed = set()
+  for k, req in enumerate(reqs):
+    t0 = time.perf_counter()
+    refs = req.get("reference") or []
+    if isinstance(refs, str):
+      refs = [refs]
+    threads = []
+    if args.parallel_compile:
+      p_tags, p_grids, p_tb, p_tiles = plan(req["prompt"], refs)
+      wkey = (p_tb, len(p_grids), make_layout(p_tags, p_grids, p_tb)[3], p_tiles and
+              -(-p_tiles // max(1, args.enc_tile_bucket)))
+      if wkey not in warmed:
+        warmed.add(wkey)
+        threads = warm(p_tags, p_grids, p_tb, p_tiles, None)
+    with jax.set_mesh(mesh):
+      emb, tags_real, ref_imgs, ref_grids = (encode_edit(req["prompt"], refs) if refs
+                                             else encode_t2i(req["prompt"]))
+      emb = jax.device_put(emb, replicated)
+      jax.block_until_ready(emb)
+    for t in threads:
+      t.join()
+    t_text = time.perf_counter() - t0
+    n, tb = len(tags_real), int(emb.shape[1])
+    lay, run_vals, n_ref, rb = make_layout(tags_real, ref_grids, tb)
+    rpad = rb - n_ref
+    lay = put_lay(lay)
 
     tgen = torch.Generator().manual_seed(int(req.get("seed", args.seed)))
     with jax.set_mesh(mesh):
@@ -1070,7 +1293,8 @@ def serve_requests(args, env):
       for i in range(steps):
         rows = step(dit_state, rows, emb, t_vecs[i], e["dt_scalars"][i], e["pdd_indices"][i],
                     None if adaln_mods is None else adaln_mods[i], *lay,
-                    run_vals=run_vals, n_ref=int(rb))
+                    run_vals=run_vals, n_ref=int(rb),
+                    stacked=stacked_blocks if scan is not None else None)
       z = unpatch(rows[:, rb:] if rb else rows)
       jax.block_until_ready(z)
       t_den = time.perf_counter() - t1

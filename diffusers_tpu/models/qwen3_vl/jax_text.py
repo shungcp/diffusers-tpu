@@ -265,7 +265,8 @@ def _build_modules():
       self.norm = RMSNorm(hidden_size, rms_norm_eps)
 
     def __call__(self, input_ids, cos, sin, mask=None, inputs_embeds=None,
-                 deepstack=None, visual_positions=None, stop_at_layer=None):
+                 deepstack=None, visual_positions=None, stop_at_layer=None,
+                 scan_layers=None):
       """`visual_positions` is an int index array, not a boolean mask:
       boolean indexing needs a concrete count, which a traced function
       does not have.
@@ -278,8 +279,18 @@ def _build_modules():
       """
       x = self.embed_tokens[...][input_ids] if inputs_embeds is None \
           else inputs_embeds
+      # `scan_layers=(layer_graph, stacked_states, start)`: layers from
+      # `start` up to `stop_at_layer` run as one `scan` over their stacked
+      # weights (one layer to compile instead of ~48; the H3-Image server).
+      start = scan_layers[2] if scan_layers is not None else None
       for index, layer in enumerate(self.layers):
         if stop_at_layer is not None and index >= stop_at_layer:
+          break
+        if start is not None and index >= start:
+          from flax import nnx as _nnx
+          graph, stacked = scan_layers[0], scan_layers[1]
+          x, _ = jax.lax.scan(
+              lambda h, st: (_nnx.merge(graph, st)(h, cos, sin, mask), None), x, stacked)
           break
         x = layer(x, cos, sin, mask)
         if deepstack is not None and index < len(deepstack):

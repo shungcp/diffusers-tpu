@@ -697,7 +697,7 @@ def _build_modules():
     def __call__(self, video, audio, text, timestep, timestep_indices,
                  token_tags, position_ids, video_indices, audio_indices,
                  text_indices, sdpa=None, segments=None, seq_len=None,
-                 text_len=None, adaln_mods=None, pdd_step=None):
+                 text_len=None, adaln_mods=None, pdd_step=None, scan_blocks=None):
       """`seq_len` / `text_len` (optional, traced scalars): true lengths of
       the packed sequence / text. When given, inputs use bucketed shapes and
       attention masks by the true length (`jax_server`)."""
@@ -746,7 +746,18 @@ def _build_modules():
         jax.debug.callback(functools.partial(_blk_save, "temb"), temb)
       _barrier = (_tp_size() <= 2
                   or os.environ.get("DT_BLOCK_BARRIER") == "1")
-      for _i, block in enumerate(self.transformer_blocks):
+      if scan_blocks is not None:
+        # `(block_graph, stacked_states)`: the 50 blocks as one `scan` body,
+        # so XLA compiles one block instead of fifty (image server).
+        block_graph, stacked = scan_blocks
+        true_len = seq if seq_len is None else seq_len
+
+        def body(h, xs):
+          st, m = xs
+          blk = nnx.merge(block_graph, st)
+          return blk(h, temb, adaln_indices, rope, sdpa, segments, true_len, m), None
+        x, _ = jax.lax.scan(body, x, (stacked, adaln_mods))
+      for _i, block in enumerate(self.transformer_blocks if scan_blocks is None else ()):
         if _barrier and _i > 0:
           x, temb, adaln_indices = jax.lax.optimization_barrier(
               (x, temb, adaln_indices))

@@ -231,7 +231,7 @@ def _build_modules():
                                                   scale=scale)[0], qc)
     return out.reshape(n * ATTN_CHUNK, *q.shape[1:])[:seq][None]
 
-  def _splash_local(q, k, v, scale):
+  def _splash_local(q, k, v, scale, kv_len=None):
     """Device-local unmasked attention through the splash kernel.
 
     q, k, v: `(seq, heads, head_dim)`. head_dim 72 is padded to 128 with
@@ -248,7 +248,7 @@ def _build_modules():
                   for t in (q, k, v))
     out = csa.attention(qh, kh, vh, scale=scale, block_q=blk, block_kv=blk,
                         block_kv_compute=min(blk, 512), use_fixed_m=False,
-                        kv_len=jnp.int32(seq) if sp else None)
+                        kv_len=kv_len if kv_len is not None else (jnp.int32(seq) if sp else None))
     return out[0].transpose(1, 0, 2)[:seq, :, :d]
 
   def rotate_half(x):
@@ -263,7 +263,9 @@ def _build_modules():
       self.qkv = Linear(dim, dim * 3, dtype=dtype, rngs=rngs)
       self.proj = Linear(dim, dim, dtype=dtype, rngs=rngs)
 
-    def __call__(self, x, cos, sin, mask=None):
+    def __call__(self, x, cos, sin, mask=None, kv_len=None):
+      """`kv_len` (traced): patches at or past it are padding (a bucketed
+      image in the H3-Image server); they are masked as keys."""
       seq, dim = x.shape
       qkv = self.qkv(x).reshape(seq, 3, self.heads, self.head_dim)
       q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
@@ -272,12 +274,19 @@ def _build_modules():
            + rotate_half(q.astype(jnp.float32)) * sin32).astype(v.dtype)
       k = (k.astype(jnp.float32) * cos32
            + rotate_half(k.astype(jnp.float32)) * sin32).astype(v.dtype)
+      if kv_len is not None and not (seq > ATTN_CHUNK and HEAD_SHARD_AXIS and VISION_SPLASH):
+        mask = (jnp.arange(seq) < kv_len)[None, None, None, :]
       if mask is None and seq > ATTN_CHUNK and HEAD_SHARD_AXIS:
         # Shard heads over `HEAD_SHARD_AXIS`, each chip running chunked
         # attention for its own heads. Replicated, the chunk loop took 3.9 s
         # of the 4.5 s text-encoding stage for a 28,672-patch image.
         from jax.sharding import PartitionSpec as P
         spec = P(None, HEAD_SHARD_AXIS, None)
+        if VISION_SPLASH and kv_len is not None:
+          out = jax.shard_map(lambda a, b, c, n: _splash_local(a, b, c, self.scale, n),
+                              in_specs=(spec, spec, spec, P()), out_specs=spec,
+                              check_vma=False)(q, k, v, kv_len)[None]
+          return self.proj(out.reshape(seq, dim))
         if VISION_SPLASH:
           local = lambda a, b, c: _splash_local(a, b, c, self.scale)
         else:
@@ -307,8 +316,8 @@ def _build_modules():
       self.norm2 = LayerNorm(dim)
       self.mlp = MLP(dim, intermediate, dtype=dtype, rngs=rngs)
 
-    def __call__(self, x, cos, sin, mask=None):
-      x = x + self.attn(self.norm1(x), cos, sin, mask)
+    def __call__(self, x, cos, sin, mask=None, kv_len=None):
+      x = x + self.attn(self.norm1(x), cos, sin, mask, kv_len)
       return x + self.mlp(self.norm2(x))
 
   class PatchMerger(nnx.Module):
@@ -354,7 +363,8 @@ def _build_modules():
           for _ in deepstack_indexes])
       self.deepstack_indexes = tuple(deepstack_indexes)
 
-    def __call__(self, pixel_values, meta, cos, sin, mask=None):
+    def __call__(self, pixel_values, meta, cos, sin, mask=None, kv_len=None,
+                 scan_blocks=None):
       """`pixel_values` is `(tokens, patch)`; returns merged tokens and deepstack."""
       x = self.patch_embed(pixel_values)
       taps = self.pos_embed[...][meta["interp_indices"]]
@@ -362,8 +372,21 @@ def _build_modules():
                       axis=1).astype(x.dtype)
 
       deepstack = []
+      if scan_blocks is not None:
+        # `(block_graph, stacked_states)`: the 27 blocks as one `scan` (one
+        # block to compile); every block's output is kept, ~10 MB each at
+        # 4096 patches, and the deepstack mergers read theirs from it.
+        graph, stacked = scan_blocks
+
+        def body(h, st):
+          h = nnx.merge(graph, st)(h, cos, sin, mask, kv_len)
+          return h, h
+        x, ys = jax.lax.scan(body, x, stacked)
+        for j, index in enumerate(self.deepstack_indexes):
+          deepstack.append(self.deepstack_merger_list[j](ys[index]))
+        return self.merger(x), deepstack
       for index, block in enumerate(self.blocks):
-        x = block(x, cos, sin, mask)
+        x = block(x, cos, sin, mask, kv_len)
         if index in self.deepstack_indexes:
           deepstack.append(
               self.deepstack_merger_list[self.deepstack_indexes.index(index)](x))
