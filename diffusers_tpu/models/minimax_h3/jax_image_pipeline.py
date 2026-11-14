@@ -955,10 +955,15 @@ def serve_requests(args, env):
     block_graph = nnx.split(blocks[0])[0]
     stacked_blocks = jax.tree.map(lambda *xs: jnp.stack(xs), *[nnx.state(b) for b in blocks])
     scan = block_graph
+    # The step then takes the model without its blocks: passing the per-block
+    # weights too (unused under the scan) gives XLA ~1,000 more parameters to
+    # partition on every compile.
+    slim = nnx.merge(graphdef, dit_state)
+    slim.transformer_blocks = nnx.List([])
+    graphdef, dit_state = nnx.split(slim)
     print("  [scan] transformer blocks stacked for a scanned step", flush=True)
 
-  @functools.partial(jax.jit, static_argnames=("run_vals", "n_ref"))
-  def step(state, img_rows, text_emb, t_vec, dt_scalar, pdd_idx, mods, position_ids, token_tags,
+  def step_impl(state, img_rows, text_emb, t_vec, dt_scalar, pdd_idx, mods, position_ids, token_tags,
            image_idx, text_idx, row_step, n_txt, seq_real, bounds, run_vals, n_ref, stacked=None):
     seg = tuple((bounds[2 * r], bounds[2 * r + 1], v) for r, v in enumerate(run_vals))
     model = nnx.merge(graphdef, state)
@@ -968,6 +973,49 @@ def serve_requests(args, env):
                scan_blocks=None if stacked is None else (scan, stacked))
     gen = img_rows[:, n_ref:].astype(jnp.float32) + dt_scalar * dv[:, n_ref:].astype(jnp.float32)
     return jnp.concatenate([img_rows[:, :n_ref], gen], axis=1) if n_ref else gen
+
+  # Scoped-VMEM ceiling per step program. When the (rows, hidden) bf16
+  # activation fits under the ceiling with a few MiB to spare, XLA keeps it
+  # whole in VMEM and emits fully unrolled fusions (the output projection
+  # grows from 0.5M to 1.5M LLO instructions at 2048x2048), and the compile
+  # goes from ~7 s to ~28 s. Setting the ceiling just under the activation
+  # keeps the tiled code; at 2048x2048 it also runs faster (0.632 -> 0.600 s
+  # per request). Edits (6208 rows, ~64 MiB) compile in 12 s instead of
+  # 15 s and run 2% faster at 54 MiB. Activations past 64 MiB keep the
+  # script's 64 MiB (4736x3552: 2.75 s vs 2.86 s at 32 MiB).
+  # `DT_STEP_VMEM_KIB` fixes the value instead.
+  _snap = _resolve_snapshots(args.model_id, args.text_model_id)[0]
+  hidden = None
+  for _sub in ("transformer_diffusers", "transformer"):
+    _cfgp = os.path.join(_snap, _sub, "config.json")
+    if os.path.isfile(_cfgp):
+      with open(_cfgp) as f:
+        _c = json.load(f)
+      hidden = _c.get("hidden_size") or (
+          _c.get("num_attention_heads", 0) * _c.get("attention_head_dim", 0) or None)
+      break
+  _step_jits = {}
+
+  def step_vmem_kib(n_rows):
+    fixed = os.environ.get("DT_STEP_VMEM_KIB")
+    if fixed:
+      return int(fixed)
+    if not hidden:
+      return None
+    act_kib = n_rows * hidden * 2 // 1024
+    if act_kib - 512 >= 65536:
+      return None
+    return int(min(55296, max(32768, act_kib - 512)))
+
+  def step(*a, **kw):
+    kib = step_vmem_kib(a[1].shape[1] + a[2].shape[1])
+    if kib not in _step_jits:
+      print(f"  [step] {a[1].shape[1] + a[2].shape[1]} rows -> scoped VMEM "
+            f"{'default' if kib is None else f'{kib} KiB'}", flush=True)
+      _step_jits[kib] = jax.jit(
+          step_impl, static_argnames=("run_vals", "n_ref"),
+          compiler_options=None if kib is None else {"xla_tpu_scoped_vmem_limit_kib": kib})
+    return _step_jits[kib](*a, **kw)
 
   put = lambda a, dt=None: jax.device_put(jnp.asarray(a, dt), replicated)
   lat_mean, lat_std, dtype = e["lat_mean_jnp"], e["lat_std_jnp"], e["dtype"]
