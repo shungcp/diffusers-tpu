@@ -996,6 +996,14 @@ def serve_requests(args, env):
       break
   _step_jits = {}
 
+  def _vmem_opts(env_name, default_kib):
+    # The text+vision tower and the tile encoder hit the same cliff harder:
+    # at the script's 64 MiB they compile in 19 s and 24 s, at 16 MiB in 6 s
+    # and 8 s, with the same per-request time (c576). `<env>=0` keeps the
+    # global value.
+    kib = int(os.environ.get(env_name, default_kib))
+    return {"xla_tpu_scoped_vmem_limit_kib": kib} if kib else None
+
   def step_vmem_kib(n_rows):
     fixed = os.environ.get("DT_STEP_VMEM_KIB")
     if fixed:
@@ -1074,7 +1082,7 @@ def serve_requests(args, env):
   enc_w, enc_one = e.get("enc_w"), _ENC_ONE[0]
   tile_sh = NamedSharding(mesh, P(mesh.axis_names[0]))
 
-  @jax.jit
+  @functools.partial(jax.jit, compiler_options=_vmem_opts("DT_ENC_VMEM_KIB", 16384))
   def enc_batch(w, tiles):
     tiles = jax.lax.with_sharding_constraint(tiles, tile_sh)
     return jax.lax.with_sharding_constraint(jax.vmap(lambda t: enc_one(w, t))(tiles), tile_sh)
@@ -1179,7 +1187,7 @@ def serve_requests(args, env):
                    jax.tree.map(lambda *xs: jnp.stack(xs), *[nnx.state(b) for b in vblocks]))
                   if text_scan is not None else None)
 
-      @jax.jit
+      @functools.partial(jax.jit, compiler_options=_vmem_opts("DT_TV_VMEM_KIB", 16384))
       def tv(se_, sv_, pix_, ii_, iw_, vc_, vs_, ids_, c_, s_, vpos_, kv_len, stacked=None,
              vstacked=None):
         enc, vm = nnx.merge(ge, se_), nnx.merge(gv, sv_)
