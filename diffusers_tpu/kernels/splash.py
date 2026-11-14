@@ -47,6 +47,12 @@ NUM_SUBLANES = 8
 NT_DIM_NUMBERS = (((1,), (1,)), ((), ()))
 
 
+# `DT_SPLASH_UNROLL=0`: keep the kv sub-block loops as loops instead of
+# unrolling them (smaller kernel to compile; see `explorations/h3_image/compile`).
+import os as _os_unroll
+UNROLL = _os_unroll.environ.get("DT_SPLASH_UNROLL", "1") == "1"
+
+
 @functools.cache
 def _splash_vmem_limit_bytes() -> int:
   """Mosaic scoped-VMEM ceiling per pallas_call, adapted to the device.
@@ -121,6 +127,7 @@ def _flash_attention_kernel(
     use_fixed_m: bool,
     emit_residuals: bool,
     dynamic_kv: bool = False,
+    unroll: bool | None = None,
 ) -> None:
   """Hybrid fixed-m / online-softmax flash attention over one (h, i) tile.
 
@@ -139,6 +146,7 @@ def _flash_attention_kernel(
   m-invariant (LSE space). Matmuls: bf16 x bf16, f32 accumulate.
   """
   float32 = jnp.float32
+  unroll = UNROLL if unroll is None else unroll
   # Pallas passes inputs then outputs positionally. The first three
   # "outputs" are the cross-j (m, l, o) scratch, declared as outputs with
   # constant index maps so they persist across the j sweep; the rest are
@@ -279,21 +287,21 @@ def _flash_attention_kernel(
   assert bkv % bkv_compute == 0
 
   def _run_main(body_fn):
-    lax.fori_loop(0, bkv // bkv_compute, body_fn, None, unroll=True)
+    lax.fori_loop(0, bkv // bkv_compute, body_fn, None, unroll=unroll)
 
   def _run_last():
     # The last KV block always runs the online body (see the note below).
     body = compute_masked if dynamic_kv else compute_online
     if kv_seq_len % bkv == 0:
-      lax.fori_loop(0, bkv // bkv_compute, body, None, unroll=True)
+      lax.fori_loop(0, bkv // bkv_compute, body, None, unroll=unroll)
     else:
       # The last iter may contain padding; handle it separately.
       remain = kv_seq_len % bkv
       iters = (remain + bkv_compute - 1) // bkv_compute
       if remain % bkv_compute == 0:
-        lax.fori_loop(0, iters, body, None, unroll=True)
+        lax.fori_loop(0, iters, body, None, unroll=unroll)
       else:
-        lax.fori_loop(0, iters - 1, body, None, unroll=True)
+        lax.fori_loop(0, iters - 1, body, None, unroll=unroll)
         last_compute_body(iters - 1)
 
   # dynamic_kv: a non-last block that reaches past the runtime kv length
@@ -367,6 +375,7 @@ def _splash_attention_forward(
     use_fixed_m: bool = False,
     emit_residuals: bool = False,
     qk_fp8: bool = False,
+    unroll: bool | None = None,
 ):
   """Runs the fused splash kernel over ``(heads, seq, dim)`` q/k/v.
 
@@ -482,6 +491,7 @@ def _splash_attention_forward(
           use_fixed_m=use_fixed_m,
           emit_residuals=emit_residuals,
           dynamic_kv=dynamic_kv,
+          unroll=unroll,
       ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=1,
@@ -550,6 +560,7 @@ def attention(
     use_fixed_m: bool = False,
     qk_fp8: bool = False,
     kv_len: jax.Array | None = None,
+    unroll: bool | None = None,
 ) -> jax.Array:
   """Device-local custom splash attention, normalized.
 
@@ -610,6 +621,7 @@ def attention(
         use_fixed_m=use_fixed_m,
         qk_fp8=qk_fp8,
         dynamic_kv=kv_len is not None,
+        unroll=unroll,
     )
     # Output is (heads, dim, seq) — transpose back to (heads, seq, dim)
     out = jnp.swapaxes(out, 1, 2)

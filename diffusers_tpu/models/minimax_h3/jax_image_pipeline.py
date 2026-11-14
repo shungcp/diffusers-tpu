@@ -86,7 +86,9 @@ def parse_args():
                  default=0 if os.environ.get("DT_STREAM_SHARD") == "whole" else 128,
                  help="Pad packed sequence length up to a multiple of this")
   p.add_argument("--block-q", type=int, default=2048)
-  p.add_argument("--block-kv", type=int, default=4096)
+  # 2048 kv rows a block (one compute block, nothing to unroll): the kernel
+  # compiles in ~5 s instead of ~11 s, and runs -5% at 6k rows / +2% at 16k.
+  p.add_argument("--block-kv", type=int, default=2048)
   p.add_argument("--block-kv-compute", type=int, default=0)
   p.add_argument("--dense-attention", action="store_true")
   p.add_argument("--segments", action="store_true", default=True,
@@ -1048,6 +1050,16 @@ def serve_requests(args, env):
 
   if args.enc_tile_bucket and enc_w is not None and len(mesh.devices.flatten()) > 1:
     e["_ref_cache"]["encode"] = encode_bucketed
+    # The encoder takes ~25 s to compile per tile bucket; compile the buckets
+    # of common reference sizes (1024-1536 px: up to 64 tiles) in the
+    # background as soon as the server is up, not inside the first request.
+    import threading
+
+    def _warm_enc():
+      with jax.set_mesh(mesh):
+        for nb in sorted({args.enc_tile_bucket * k for k in (1, 2) if args.enc_tile_bucket * k <= 64}):
+          jax.block_until_ready(enc_batch(enc_w, jnp.zeros((nb, 1, 3, 1, 256, 256), e["dtype"])))
+    threading.Thread(target=_warm_enc, daemon=True).start()
   # `--vision-bucket`: the reference's patches padded too, so references of
   # different shapes share one text+vision program (with coarse text, ref
   # and enc buckets, a new shape compiles nothing). Pad patches are masked as

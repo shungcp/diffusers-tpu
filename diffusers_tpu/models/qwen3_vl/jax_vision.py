@@ -248,6 +248,7 @@ def _build_modules():
                   for t in (q, k, v))
     out = csa.attention(qh, kh, vh, scale=scale, block_q=blk, block_kv=blk,
                         block_kv_compute=min(blk, 512), use_fixed_m=False,
+                        unroll=os.environ.get("DT_VISION_SPLASH_UNROLL", "0") == "1",
                         kv_len=kv_len if kv_len is not None else (jnp.int32(seq) if sp else None))
     return out[0].transpose(1, 0, 2)[:seq, :, :d]
 
