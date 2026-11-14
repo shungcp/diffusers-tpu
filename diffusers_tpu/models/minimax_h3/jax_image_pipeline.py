@@ -105,6 +105,15 @@ def parse_args():
   p.add_argument("--text-bucket", type=int, default=64,
                  help="with --requests: pad the prompt to a multiple of this many tokens so "
                       "prompts in one bucket share one compiled program (attention masks the pads)")
+  p.add_argument("--enc-tile-bucket", type=int, default=32,
+                 help="with --requests: encode a reference's 256-pixel tiles in batches padded to a "
+                      "multiple of this, one program per batch size instead of per image size (0: off)")
+  p.add_argument("--text-bucket-edit", type=int, default=64,
+                 help="with --requests: text bucket for edits, whose text includes the reference's "
+                      "vision tokens (their count changes with the reference's shape)")
+  p.add_argument("--ref-bucket", type=int, default=512,
+                 help="with --requests: pad an edit's reference rows to a multiple of this, so "
+                      "references of different sizes share the transformer's compiled step")
   p.add_argument("--compile-cache", default="")
   p.add_argument("--cache-only", action="store_true")
   p.add_argument("--out", "--output", dest="out", default="out")
@@ -675,6 +684,8 @@ def main():
       mkey = ("moments", im.size, hash(im.tobytes())) if _ref_cache.get("on") else None
       if mkey is not None and mkey in _ref_cache:
         moments = _ref_cache[mkey]
+      elif _ref_cache.get("encode") is not None:
+        moments = _ref_cache["encode"](x_j)
       elif os.environ.get("DT_ENC_JIT", "1") == "1":
         moments = _jit_tiled_encode(enc_w, x_j)
         if os.environ.get("DT_ENC_CHECK") == "1":
@@ -956,9 +967,43 @@ def serve_requests(args, env):
   def encode_edit(prompt, refs):
     # The pipeline's own presentation, padded to the next `bucket` multiple.
     args.prompt, args.reference = prompt, refs
-    return e["encode_prompt_and_refs"](pad_to=-bucket)
+    return e["encode_prompt_and_refs"](pad_to=-max(bucket, args.text_bucket_edit))
 
   e["_ref_cache"]["on"] = True
+
+  # The reference encode by tile count rather than by image size: every tile
+  # is 256x256 pixels, so the tiles of any reference are stacked, padded to a
+  # multiple of `--enc-tile-bucket` and encoded by one program per count
+  # (split over the chips); only the small blend-and-stitch is per layout.
+  # A new reference size then skips the ~18 s encoder compile.
+  from jax.sharding import NamedSharding, PartitionSpec as P
+  enc_w, enc_one = e.get("enc_w"), _ENC_ONE[0]
+  tile_sh = NamedSharding(mesh, P(mesh.axis_names[0]))
+
+  @jax.jit
+  def enc_batch(w, tiles):
+    tiles = jax.lax.with_sharding_constraint(tiles, tile_sh)
+    return jax.lax.with_sharding_constraint(jax.vmap(lambda t: enc_one(w, t))(tiles), tile_sh)
+
+  @functools.partial(jax.jit, static_argnums=(1, 2, 3, 4))
+  def stitch(flat, ny, nx, yo, xo):
+    rows = [[flat[i * nx + j] for j in range(nx)] for i in range(ny)]
+    return e["jvae"].stitch_encoded_tiles(rows, list(yo), list(xo))
+
+  def encode_bucketed(x):
+    jvae = e["jvae"]
+    ys, yl, yo = jvae.split_tiles(x.shape[-2], 256, 64)
+    xs, xl, xo = jvae.split_tiles(x.shape[-1], 256, 64)
+    if not yo and not xo:
+      return e["_jit_tiled_encode"](enc_w, x)
+    tiles = [x[..., i:i + li, j:j + lj] for i, li in zip(ys, yl) for j, lj in zip(xs, xl)]
+    nb = -(-len(tiles) // args.enc_tile_bucket) * args.enc_tile_bucket
+    stacked = jnp.stack(tiles + [tiles[-1]] * (nb - len(tiles)))
+    flat = enc_batch(enc_w, stacked)[:len(tiles)]
+    return stitch(flat, len(ys), len(xs), tuple(yo), tuple(xo))
+
+  if args.enc_tile_bucket and enc_w is not None and len(mesh.devices.flatten()) > 1:
+    e["_ref_cache"]["encode"] = encode_bucketed
   saver = ThreadPoolExecutor(max_workers=2)   # a 2048x2048 PNG is ~1.2 s of host time
   pending, seen = [], set()
   reqs = [json.loads(l) for l in open(args.requests) if l.strip()]
@@ -977,16 +1022,28 @@ def serve_requests(args, env):
     pos_np, tags_np, img_idx_np, txt_idx_np, n_ref, _ = build_image_packed_sequence(
         tags_real, ref_grids, latent_h, latent_w)
     seq_real = int(pos_np.shape[0])
-    seq, extra = seq_real + tb - n, tb - n
+    # Reference rows padded too (`--ref-bucket`), so a new reference size in
+    # an existing bucket reuses the step program: the pad rows join the image
+    # rows right after the real reference rows (they stay as given, like the
+    # reference rows) but sit at positions past `seq_real`, masked as keys.
+    rb = -(-n_ref // args.ref_bucket) * args.ref_bucket if (n_ref and args.ref_bucket) else n_ref
+    rpad = rb - n_ref
+    extra = tb - n
+    seq = seq_real + extra + rpad
+    if rpad:
+      img_idx_np = np.concatenate([img_idx_np[:n_ref],
+                                   np.arange(seq_real + extra, seq, dtype=np.int32),
+                                   img_idx_np[n_ref:]])
     row_np = np.zeros((seq,), np.int32)
     if n_ref:
-      row_np[img_idx_np[:n_ref]] = 1
+      row_np[img_idx_np[:rb]] = 1
     idx = (row_np[:seq_real] * dit.MODALITY_NUM + tags_np).astype(np.int64)
     edges = [0, *(np.flatnonzero(idx[1:] != idx[:-1]) + 1).tolist(), seq_real]
     runs = [(a, b, int(idx[a])) for a, b in zip(edges, edges[1:])] + [(seq_real, seq, text_val)]
-    pos_np = np.concatenate([pos_np, np.repeat(pos_np[-1:], extra, axis=0)])
-    tags_np = np.concatenate([tags_np, np.full((extra,), TEXT_TAG, np.int32)])
-    txt_idx_np = np.concatenate([txt_idx_np, np.arange(seq_real, seq, dtype=np.int32)])
+    pos_np = np.concatenate([pos_np, np.repeat(pos_np[-1:], extra + rpad, axis=0)])
+    tags_np = np.concatenate([tags_np, np.full((extra,), TEXT_TAG, np.int32),
+                              np.full((rpad,), IMAGE_TAG, np.int32)])
+    txt_idx_np = np.concatenate([txt_idx_np, np.arange(seq_real, seq_real + extra, dtype=np.int32)])
     lay = (put(pos_np), put(tags_np), put(img_idx_np), put(txt_idx_np), put(row_np),
            put(n, jnp.int32), put(seq_real, jnp.int32),
            put(np.asarray([b for r in runs for b in r[:2]], np.int32)))
@@ -1001,6 +1058,8 @@ def serve_requests(args, env):
     for rl in ref_lat:
       c = randn_tensor(tuple(rl.shape), generator=tgen, dtype=torch.float32).numpy()
       parts.append(patchify_2d(np.float32(0.999) * rl + (np.float32(1.0) - np.float32(0.999)) * c))
+    if rpad:
+      parts.append(np.zeros((1, rpad, parts[0].shape[-1]), np.float32))
     rows = put(np.concatenate(parts + [patchify_2d(noise)], axis=1), jnp.float32)
     t_vecs = [put([e["timesteps_np"][i], 0.999] if n_ref else [e["timesteps_np"][i]], jnp.float32)
               for i in range(steps)]
@@ -1011,14 +1070,14 @@ def serve_requests(args, env):
       for i in range(steps):
         rows = step(dit_state, rows, emb, t_vecs[i], e["dt_scalars"][i], e["pdd_indices"][i],
                     None if adaln_mods is None else adaln_mods[i], *lay,
-                    run_vals=run_vals, n_ref=int(n_ref))
-      z = unpatch(rows[:, n_ref:] if n_ref else rows)
+                    run_vals=run_vals, n_ref=int(rb))
+      z = unpatch(rows[:, rb:] if rb else rows)
       jax.block_until_ready(z)
       t_den = time.perf_counter() - t1
       t2 = time.perf_counter()
       u8 = np.asarray(e["decode_image_2d"](z))
     t_dec = time.perf_counter() - t2
-    key = (tb, tuple(ref_grids))
+    key = (tb, rb)
     first = key not in seen
     seen.add(key)
     img = Image.fromarray(u8)

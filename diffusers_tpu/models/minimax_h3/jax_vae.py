@@ -898,6 +898,14 @@ def tiled_encode(encode_one, x, tile_px=256, overlap_px=64,
   else:
     rows = [[encode_one(t) for t in tiles[i * ncol:(i + 1) * ncol]]
             for i in range(len(ys))]
+  return stitch_encoded_tiles(rows, yo, xo, ratio)
+
+
+def stitch_encoded_tiles(rows, yo, xo, ratio=SPATIAL_RATIO):
+  """`tiled_encode`'s blend and stitch of the encoded tiles (`rows[i][j]`),
+  given the pixel overlaps from `split_tiles`."""
+  import jax.numpy as jnp
+
   lyo = [o // ratio for o in yo]
   lxo = [o // ratio for o in xo]
   out_rows = []

@@ -416,6 +416,9 @@ bash scripts/run_h3_image_jax.sh --size 2048x2048 --prompt "..." --requests reqs
 bash scripts/run_h3_image_jax.sh --size 2048x2048 --reference ref.png --prompt "..." --requests reqs.jsonl
 ```
 
+A reference reused across requests is preprocessed and VAE-encoded once (a repeated edit 1.23 -> 1.10 s on a v6e-8, same output). The reference encode compiles per tile count (`--enc-tile-bucket 32`) rather than per image size. A new reference shape still compiles the vision tower and the transformer once (~80–120 s on a v6e-8, cached on disk for later processes). To have more reference shapes share one transformer program, pad coarser at ~8% per edit request: `--text-bucket-edit 512 --ref-bucket 1024` (defaults 64 / 512 keep every request at full speed).
+同一张参考图被多个请求复用时,预处理与 VAE 编码只做一次(v6e-8 上重复编辑 1.23 -> 1.10 秒,输出不变)。参考图编码按 tile 数编译(`--enc-tile-bucket 32`),不再按图像尺寸。新的参考图形状仍要编译一次视觉塔与 transformer(v6e-8 上约 80–120 秒,磁盘缓存供之后的进程复用)。若希望更多参考图形状共用一个 transformer 程序,可用更粗的补齐,每个编辑请求约慢 8%:`--text-bucket-edit 512 --ref-bucket 1024`(默认 64 / 512,每个请求保持全速)。
+
 The text encoder is the same file as MiniMax-H3's (the Hub deduplicates it), and the prompt is used verbatim.
 文本编码器与 MiniMax-H3 是同一个文件(Hub 会去重),提示词原样使用。
 
