@@ -974,13 +974,13 @@ def serve_requests(args, env):
     gen = img_rows[:, n_ref:].astype(jnp.float32) + dt_scalar * dv[:, n_ref:].astype(jnp.float32)
     return jnp.concatenate([img_rows[:, :n_ref], gen], axis=1) if n_ref else gen
 
-  # Scoped-VMEM ceiling per step program. When the (rows, hidden) bf16
-  # activation fits under the ceiling with a few MiB to spare, XLA keeps it
-  # whole in VMEM and emits fully unrolled fusions (the output projection
-  # grows from 0.5M to 1.5M LLO instructions at 2048x2048), and the compile
-  # goes from ~7 s to ~28 s. Setting the ceiling just under the activation
-  # keeps the tiled code; at 2048x2048 it also runs faster (0.632 -> 0.600 s
-  # per request). Edits (6208 rows, ~64 MiB) compile in 12 s instead of
+  # Scoped-VMEM ceiling per step program. When the ceiling has room for a
+  # whole (rows, hidden) activation as one tile, the TPU backend also code-
+  # generates that variant of the output-layer fusion (1.5M LLO instructions
+  # instead of 0.5M at 2048x2048), then discards it for the tiled one: the
+  # compile goes from ~7 s to ~28 s for the same final code. A ceiling just
+  # under the activation skips the attempt; at 2048x2048 the step also runs
+  # faster there (0.632 -> 0.600 s per request). Edits (6208 rows, ~64 MiB) compile in 12 s instead of
   # 15 s and run 2% faster at 54 MiB. Activations past 64 MiB keep the
   # script's 64 MiB (4736x3552: 2.75 s vs 2.86 s at 32 MiB).
   # `DT_STEP_VMEM_KIB` fixes the value instead.
