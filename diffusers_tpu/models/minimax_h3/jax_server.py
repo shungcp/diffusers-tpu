@@ -92,7 +92,7 @@ def parse_args():
                   help="Cast Q and K to float8_e4m3fn inside Pallas splash attention")
   ap.add_argument("--chips", type=int, default=0,
                   help="Use this many JAX devices; 0 uses all available devices")
-  ap.add_argument("--text-bucket", type=int, default=64,
+  ap.add_argument("--text-bucket", type=int, default=256,
                   help="pad text length to a multiple of this so prompts in the same bucket "
                        "share one compilation (attention masks to the real length); 0 disables")
   return ap.parse_args()
@@ -176,6 +176,20 @@ class Server:
     self._sdpa_build()
     self._load_decoder()
     self.calls = {}           # (kind, sparse layout) -> compiled DiT call
+    # The video decoder runs on fixed-size tiles, so one program serves
+    # every request of the default size; compile it now instead of in the
+    # first request (~50 s). `DT_WARM_VIDEO_DECODE=0` skips.
+    if os.environ.get("DT_WARM_VIDEO_DECODE", "1") == "1":
+      from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
+          align_num_frames, video_latent_num_frames)
+      tw = time.perf_counter()
+      lf = video_latent_num_frames(align_num_frames(int(self.a.num_frames), 17, 5), 17, 5)
+      z0 = self.jnp.zeros((1, self.dit.CONFIG_FULL["in_channels"], lf,
+                           self.a.height // 16, self.a.width // 16), self.jnp.float32)
+      with self.jax.set_mesh(self.mesh):
+        np.asarray(self._decode_latents(z0))
+      print(f"[server] video decode warmed {time.perf_counter() - tw:.0f}s", flush=True)
+    self._audio_compiling = {}
     print(f"[server] ready {time.perf_counter() - t0:.0f}s", flush=True)
 
   # ---------------------------------------------------------------------
@@ -437,6 +451,7 @@ class Server:
       n = audio_latent_num_frames(align_num_frames(int(self.a.num_frames), 17, 5))
       if not _audio_cpu:
         self.audio_dec.decode(np.zeros((2 * n, self.audio_dec.channels), np.float32))
+        self._audio_warm_n = n
 
   # ---------------------------------------------------------------------
   def _encode_text(self, prompt, reference_image):
@@ -583,6 +598,17 @@ class Server:
     lossy = bool(req.get("lossy"))
     seed = int(req.get("seed", 42))
     num_frames = align_num_frames(int(req.get("num_frames", a.num_frames)), 17, 5)
+    # A new audio length compiles the audio decoder (~50-60 s): start that in
+    # a thread now so it overlaps the text, DiT and video decode.
+    if (self.audio_dec is not None and getattr(self.audio_dec, "_cpu", None) is None
+        and os.environ.get("DT_BG_AUDIO_COMPILE", "1") == "1"):
+      n_a = audio_latent_num_frames(num_frames)
+      if n_a not in self._audio_compiling and n_a != getattr(self, "_audio_warm_n", None):
+        import threading
+        z_ = np.zeros((2 * n_a, self.audio_dec.channels), np.float32)
+        th = threading.Thread(target=self.audio_dec.decode, args=(z_,), daemon=True)
+        th.start()
+        self._audio_compiling[n_a] = th
     self._ensure_dit(kind)     # no-op unless the workflow changes
     T["dit_swap"] = time.perf_counter() - t_all
 
@@ -845,6 +871,9 @@ class Server:
       # Decode
       t = time.perf_counter()
       # Audio first, so it queues with the video decode (saves about 0.3 s).
+      _th = self._audio_compiling.get(audio_latent_num_frames(num_frames))
+      if _th is not None:
+        _th.join()
       pending_audio = (None if self.audio_dec is None else
                        self.audio_dec.start(np.asarray(jax.device_get(audio))[0]))
       vid = video[:, n_ref:]
