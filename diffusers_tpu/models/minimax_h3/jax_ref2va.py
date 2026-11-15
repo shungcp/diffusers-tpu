@@ -276,10 +276,15 @@ def encode_condition(encode_one, image, latents_mean, latents_std, batch=0,
     import jax
     global _ENC_JIT
     if _ENC_JIT is None:
+      # 16 MiB scoped VMEM: compiles in ~16 s instead of ~44 s at the 32 MiB
+      # default, same request time (c598). `DT_ENC_VMEM_KIB=0` keeps the global value.
+      import os
+      kib = int(os.environ.get("DT_ENC_VMEM_KIB", 16384))
       _ENC_JIT = jax.jit(
           lambda w, xx, fn, b, m: jvae.tiled_encode(lambda t: fn(w, t), xx,
                                                     batch=b, mesh=m),
-          static_argnums=(2, 3, 4))
+          static_argnums=(2, 3, 4),
+          compiler_options={"xla_tpu_scoped_vmem_limit_kib": kib} if kib else None)
     moments = _ENC_JIT(weights, x, encode_one, batch, mesh)
   else:
     moments = jvae.tiled_encode(encode_one, x, batch=batch, mesh=mesh)

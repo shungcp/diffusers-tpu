@@ -761,6 +761,34 @@ class Server:
         lv.append(max(float(timesteps[i]), r2v.NOISE_AUG))
       return jnp.asarray(lv, jnp.float32)
 
+    # Step 0's latents come from the host (uncommitted, one device) and later
+    # steps' from the scheduler (replicated over the mesh): two different
+    # input shardings, so the same DiT call compiled twice (~30 s each).
+    # Commit them to the later sharding up front: one program.
+    if os.environ.get("DT_COMMIT_LATENTS", "1") == "1":
+      rep = self.NS(self.mesh, self.P())
+      video, audio = jax.device_put(video, rep), jax.device_put(audio, rep)
+    # The sparse call (lossy requests, from step `dense_steps`) compiles in a
+    # thread while the dense steps compile and run.
+    sparse_future = None
+    if (call_sparse is not None and dense_steps < len(timesteps)
+        and os.environ.get("DT_PAR_SPARSE", "1") == "1"):
+      import concurrent.futures as cf
+
+      def _compile_sparse(v0, a0, t0_):
+        with jax.set_mesh(self.mesh):
+          return call_sparse.lower(self.state, v0, a0, emb, t0_, *args_layout,
+                                   *sparse_args).compile()
+      # One compiled program per call and shapes, kept for later requests
+      # (a fresh `lower().compile()` each time would re-trace).
+      skey = (id(call_sparse), video.shape, audio.shape, emb.shape,
+              tuple(getattr(x, "shape", ()) for x in args_layout + tuple(sparse_args)))
+      store = self.__dict__.setdefault("_sparse_compiled", {})
+      if skey not in store:
+        store[skey] = cf.ThreadPoolExecutor(1).submit(
+            _compile_sparse, video, audio, levels(dense_steps))
+      sparse_future = store[skey]
+
     t = time.perf_counter()
     with jax.set_mesh(self.mesh):
       for i in range(len(timesteps)):
@@ -782,9 +810,13 @@ class Server:
           dv, da = cache["last_out"]
           cache["skipped"] += 1
         else:
+          if os.environ.get("DT_PRINT_SHARD") and i < 2:
+            for nm, v in (("video", video), ("audio", audio), ("emb", emb), ("tt", tt)):
+              print(f"  [shard] step {i} {nm} {getattr(v, 'sharding', None)} "
+                    f"committed={getattr(v, '_committed', None)}", flush=True)
           if call_sparse is not None and i >= dense_steps:
-            dv, da = call_sparse(self.state, video, audio, emb, tt, *args_layout,
-                                 *sparse_args)
+            fn = sparse_future.result() if sparse_future is not None else call_sparse
+            dv, da = fn(self.state, video, audio, emb, tt, *args_layout, *sparse_args)
           else:
             dv, da = call(self.state, video, audio, emb, tt, *args_layout)
           if cache is not None:
