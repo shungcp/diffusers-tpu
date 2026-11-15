@@ -964,13 +964,15 @@ def serve_requests(args, env):
     print("  [scan] transformer blocks stacked for a scanned step", flush=True)
 
   def step_impl(state, img_rows, text_emb, t_vec, dt_scalar, pdd_idx, mods, position_ids, token_tags,
-           image_idx, text_idx, row_step, n_txt, seq_real, bounds, run_vals, n_ref, stacked=None):
+           image_idx, text_idx, row_step, n_txt, seq_real, bounds, run_vals, n_ref, stacked=None,
+           img_contig=False):
     seg = tuple((bounds[2 * r], bounds[2 * r + 1], v) for r, v in enumerate(run_vals))
     model = nnx.merge(graphdef, state)
     dv = model(img_rows, None, text_emb, t_vec, row_step, token_tags, position_ids,
                image_idx, None, text_idx, sdpa=sdpa, segments=seg,
                seq_len=seq_real, text_len=n_txt, adaln_mods=mods, pdd_step=pdd_idx,
-               scan_blocks=None if stacked is None else (scan, stacked))
+               scan_blocks=None if stacked is None else (scan, stacked),
+               video_contiguous=img_contig)
     gen = img_rows[:, n_ref:].astype(jnp.float32) + dt_scalar * dv[:, n_ref:].astype(jnp.float32)
     return jnp.concatenate([img_rows[:, :n_ref], gen], axis=1) if n_ref else gen
 
@@ -1015,15 +1017,49 @@ def serve_requests(args, env):
       return None
     return int(min(55296, max(32768, act_kib - 512)))
 
-  def step(*a, **kw):
-    kib = step_vmem_kib(a[1].shape[1] + a[2].shape[1])
+  def step_jit(kib):
     if kib not in _step_jits:
-      print(f"  [step] {a[1].shape[1] + a[2].shape[1]} rows -> scoped VMEM "
-            f"{'default' if kib is None else f'{kib} KiB'}", flush=True)
       _step_jits[kib] = jax.jit(
-          step_impl, static_argnames=("run_vals", "n_ref"),
+          step_impl, static_argnames=("run_vals", "n_ref", "img_contig"),
           compiler_options=None if kib is None else {"xla_tpu_scoped_vmem_limit_kib": kib})
-    return _step_jits[kib](*a, **kw)
+    return _step_jits[kib]
+
+  # Activations past 64 MiB keep the script's ceiling, which runs fastest
+  # there but compiles slowest (7040-row edit: 14.5 s vs 9 s at 32 MiB, 2%
+  # slower a request). A new such shape is served by a 32 MiB program at
+  # once while the 64 MiB one compiles in a background thread; later steps
+  # switch to it when it is ready. `DT_STEP_FAST_KIB=0` turns this off.
+  import threading
+  _fast_kib = int(os.environ.get("DT_STEP_FAST_KIB", 32768))
+  _ready, _pending, _lock = set(), set(), threading.Lock()
+
+  def _bg_compile(key, a, kw):
+    t0 = time.perf_counter()
+    with jax.set_mesh(mesh):
+      jax.block_until_ready(step_jit(None)(*a, **kw))
+    with _lock:
+      _ready.add(key)
+    print(f"  [step] {key[0]} rows: 64 MiB program ready after "
+          f"{time.perf_counter() - t0:.1f} s in the background", flush=True)
+
+  def step(*a, **kw):
+    rows = a[1].shape[1] + a[2].shape[1]
+    kib = step_vmem_kib(rows)
+    key = (rows, a[2].shape[1], kw.get("run_vals"), kw.get("n_ref"), kw.get("img_contig"))
+    if kib is None and _fast_kib:
+      with _lock:
+        ready, start = key in _ready, key not in _pending
+        _pending.add(key)
+      if not ready:
+        if start:
+          print(f"  [step] {rows} rows -> scoped VMEM {_fast_kib} KiB now, "
+                "default (64 MiB) compiling in the background", flush=True)
+          threading.Thread(target=_bg_compile, args=(key, a, kw), daemon=True).start()
+        return step_jit(_fast_kib)(*a, **kw)
+    elif kib not in _step_jits:
+      print(f"  [step] {rows} rows -> scoped VMEM "
+            f"{'default' if kib is None else f'{kib} KiB'}", flush=True)
+    return step_jit(kib)(*a, **kw)
 
   put = lambda a, dt=None: jax.device_put(jnp.asarray(a, dt), replicated)
   lat_mean, lat_std, dtype = e["lat_mean_jnp"], e["lat_std_jnp"], e["dtype"]
@@ -1246,6 +1282,13 @@ def serve_requests(args, env):
            np.asarray([b for r in runs for b in r[:2]], np.int32))
     return lay, tuple(v for _, _, v in runs), n_ref, rb
 
+  def img_contig(lay):
+    # Image rows in one block (text-to-image; edits with reference padding
+    # are not): the step writes them with a dynamic-update-slice.
+    ii = lay[2]
+    return (os.environ.get("DT_IMG_DUS", "1") == "1" and ii.size > 0
+            and bool(np.all(np.diff(ii) == 1)))
+
   def put_lay(lay):
     return tuple(put(a, jnp.int32) if np.ndim(a) == 0 else put(a) for a in lay)
 
@@ -1288,6 +1331,7 @@ def serve_requests(args, env):
     parallel and the request waits for the longest program, not the sum."""
     import threading
     lay, run_vals, n_ref, rb = make_layout(tags_real, grids, tb)
+    contig = img_contig(lay)
     t_len = (latent_h // 2) * (latent_w // 2)
     jobs = []
 
@@ -1299,7 +1343,7 @@ def serve_requests(args, env):
         jax.block_until_ready(step(dit_state, rows0, emb0, tv0, e["dt_scalars"][0], e["pdd_indices"][0],
                                    None if adaln_mods is None else adaln_mods[0], *put_lay(lay),
                                    run_vals=run_vals, n_ref=int(rb),
-                                   stacked=stacked_blocks if scan is not None else None))
+                                   stacked=stacked_blocks if scan is not None else None, img_contig=contig))
     jobs.append(step_job)
     if tiles and e["_ref_cache"].get("encode") is not None:
       nb = -(-tiles // args.enc_tile_bucket) * args.enc_tile_bucket
@@ -1337,6 +1381,7 @@ def serve_requests(args, env):
     t_text = time.perf_counter() - t0
     n, tb = len(tags_real), int(emb.shape[1])
     lay, run_vals, n_ref, rb = make_layout(tags_real, ref_grids, tb)
+    contig = img_contig(lay)
     rpad = rb - n_ref
     lay = put_lay(lay)
 
@@ -1362,7 +1407,7 @@ def serve_requests(args, env):
         rows = step(dit_state, rows, emb, t_vecs[i], e["dt_scalars"][i], e["pdd_indices"][i],
                     None if adaln_mods is None else adaln_mods[i], *lay,
                     run_vals=run_vals, n_ref=int(rb),
-                    stacked=stacked_blocks if scan is not None else None)
+                    stacked=stacked_blocks if scan is not None else None, img_contig=contig)
       z = unpatch(rows[:, rb:] if rb else rows)
       jax.block_until_ready(z)
       t_den = time.perf_counter() - t1

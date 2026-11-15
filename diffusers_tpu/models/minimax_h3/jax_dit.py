@@ -697,7 +697,8 @@ def _build_modules():
     def __call__(self, video, audio, text, timestep, timestep_indices,
                  token_tags, position_ids, video_indices, audio_indices,
                  text_indices, sdpa=None, segments=None, seq_len=None,
-                 text_len=None, adaln_mods=None, pdd_step=None, scan_blocks=None):
+                 text_len=None, adaln_mods=None, pdd_step=None, scan_blocks=None,
+                 video_contiguous=False):
       """`seq_len` / `text_len` (optional, traced scalars): true lengths of
       the packed sequence / text. When given, inputs use bucketed shapes and
       attention masks by the true length (`jax_server`)."""
@@ -732,7 +733,14 @@ def _build_modules():
       x = jnp.zeros((text_embeds.shape[0], padded, text_embeds.shape[-1]),
                     dtype)
       x = x.at[:, text_indices].set(text_embeds)
-      x = x.at[:, video_indices].set(video_embeds.astype(dtype))
+      if video_contiguous:
+        # The image rows are one block starting at `video_indices[0]`: a
+        # dynamic-update-slice instead of a scatter (a much smaller program
+        # for the TPU backend to generate).
+        x = jax.lax.dynamic_update_slice(
+            x, video_embeds.astype(dtype), (0, video_indices[0], 0))
+      else:
+        x = x.at[:, video_indices].set(video_embeds.astype(dtype))
       if self.audio_proj_in is not None and audio is not None:
         audio_embeds = self.audio_proj_in(audio.astype(jnp.float32))
         x = x.at[:, audio_indices].set(audio_embeds.astype(dtype))
