@@ -626,11 +626,13 @@ class Server:
     # dense) already share the host CPUs and this one did not help (c606:
     # 95.4 -> 91.5 s and 78.8 -> 82.9 s; t2va 62.0 -> 54.4 s).
     _pd = os.environ.get("DT_PRE_DENSE", "t2va")
-    if _pd == "1" or _pd == kind:
+    _ps = os.environ.get("DT_PRE_SPARSE", "1") == "1"
+    if _pd == "1" or _pd == kind or (_ps and lossy):
       try:
         dense_th = self._precompile_dense(
             kind, req["prompt"], image, num_frames,
-            int(req.get("height", a.height)), int(req.get("width", a.width)))
+            int(req.get("height", a.height)), int(req.get("width", a.width)),
+            lossy=lossy, sparse=_ps)
       except Exception as e:   # best effort: the real call compiles anyway
         print(f"  [server] dense precompile skipped: {e!r}", flush=True)
     # ref2va: compile the reference encode (depends only on the image size)
@@ -880,7 +882,14 @@ class Server:
                     f"committed={getattr(v, '_committed', None)}", flush=True)
           if call_sparse is not None and i >= dense_steps:
             fn = sparse_future.result() if sparse_future is not None else call_sparse
-            dv, da = fn(self.state, video, audio, emb, tt, *args_layout, *sparse_args)
+            try:
+              dv, da = fn(self.state, video, audio, emb, tt, *args_layout, *sparse_args)
+            except (TypeError, ValueError) as e:   # a precompiled program whose
+              print(f"  [server] precompiled sparse call rejected ({e!s:.120}); "
+                    "using the jit", flush=True)     # inputs differ: compile normally
+              sparse_future = None
+              dv, da = call_sparse(self.state, video, audio, emb, tt, *args_layout,
+                                   *sparse_args)
           else:
             dv, da = call(self.state, video, audio, emb, tt, *args_layout)
           if cache is not None:
@@ -945,7 +954,8 @@ class Server:
     T["text_tokens"] = T_info
     return frames, T
 
-  def _precompile_dense(self, kind, prompt, image, num_frames, height, width):
+  def _precompile_dense(self, kind, prompt, image, num_frames, height, width,
+                        lossy=False, sparse=False):
     """Compile the dense DiT call for this request's shapes in a thread,
     from host-side shapes only (tokens, reference size), so it overlaps the
     text and vision towers; the real call then hits the compilation cache.
@@ -1009,6 +1019,30 @@ class Server:
     args_layout = (row_step, token_tags, position_ids, video_idx, audio_idx, text_idx,
                    seq_len_arg, text_len_arg)
     call = self._call(self.sdpa, (kind, "dense"))
+
+    # The sparse call too (lossy requests), into the same per-shape store
+    # `generate` looks in, so its compile also overlaps the text stage.
+    if sparse and lossy and a.sparse_window and bucket:
+      import concurrent.futures as cf
+      vi = np.asarray(video_idx)[n_ref:]
+      times = np.asarray(position_ids)[vi, 0]
+      vs, rpf = int(vi.min()), int((times == times[0]).sum())
+      qlen = (-(-seq // dit.PAD_SEQUENCE_TO) * dit.PAD_SEQUENCE_TO
+              if dit.PAD_SEQUENCE_TO else seq)
+      seq_real = seq - extra
+      tab, cnt, W = self._sparse_table(qlen, seq_real, vs, rpf, a.sparse_window, seq)
+      call_sparse = self._call_sparse_dyn(qlen, W)
+      sparse_args = (jnp.asarray(tab), jnp.asarray(cnt))
+      skey = (id(call_sparse), video.shape, audio.shape, emb.shape,
+              tuple(getattr(x, "shape", ()) for x in args_layout + tuple(sparse_args)))
+      store = self.__dict__.setdefault("_sparse_compiled", {})
+      if skey not in store:
+        def _compile_sparse():
+          with jax.set_mesh(self.mesh):
+            tt = jnp.asarray([0.5] * (3 if n_ref else 2), jnp.float32)
+            return call_sparse.lower(self.state, video, audio, emb, tt, *args_layout,
+                                     *sparse_args).compile()
+        store[skey] = cf.ThreadPoolExecutor(1).submit(_compile_sparse)
 
     def run():
       with jax.set_mesh(self.mesh):

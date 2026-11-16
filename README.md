@@ -369,8 +369,8 @@ Serve many requests with one loaded model; each line of the file is one request.
 bash scripts/run_h3_jax_server.sh requests.jsonl --out out
 ```
 
-A new shape (size, frame count, reference aspect) compiles once and is cached on disk; the text is padded to 256-token buckets so prompts of different lengths share programs. Off switches for the compile-time measures: `DT_COMMIT_LATENTS`, `DT_PAR_SPARSE`, `DT_PAR_ENC`, `DT_PRE_DENSE` (`t2va` by default, `1` for both), `DT_WARM_VIDEO_DECODE`, `DT_BG_AUDIO_COMPILE`, `DT_ENC_VMEM_KIB` (`0` turns each off).
-新形状(尺寸、帧数、参考图宽高比)只编译一次并缓存到磁盘;文本补齐到 256 token 的桶,不同长度的提示词共用程序。编译加速各项的开关:`DT_COMMIT_LATENTS`、`DT_PAR_SPARSE`、`DT_PAR_ENC`、`DT_PRE_DENSE`(默认 `t2va`,`1` 两者都开)、`DT_WARM_VIDEO_DECODE`、`DT_BG_AUDIO_COMPILE`、`DT_ENC_VMEM_KIB`(设 `0` 关闭)。
+A new shape (size, frame count, reference aspect) compiles once and is cached on disk; the text is padded to 256-token buckets so prompts of different lengths share programs. Off switches for the compile-time measures: `DT_COMMIT_LATENTS`, `DT_PAR_SPARSE`, `DT_PAR_ENC`, `DT_PRE_DENSE` (`t2va` by default, `1` for both), `DT_PRE_SPARSE`, `DT_WARM_VIDEO_DECODE`, `DT_BG_AUDIO_COMPILE`, `DT_ENC_VMEM_KIB` (`0` turns each off).
+新形状(尺寸、帧数、参考图宽高比)只编译一次并缓存到磁盘;文本补齐到 256 token 的桶,不同长度的提示词共用程序。编译加速各项的开关:`DT_COMMIT_LATENTS`、`DT_PAR_SPARSE`、`DT_PAR_ENC`、`DT_PRE_DENSE`(默认 `t2va`,`1` 两者都开)、`DT_PRE_SPARSE`、`DT_WARM_VIDEO_DECODE`、`DT_BG_AUDIO_COMPILE`、`DT_ENC_VMEM_KIB`(设 `0` 关闭)。
 
 The other two backends have their own scripts.
 另外两种后端有各自的脚本。
