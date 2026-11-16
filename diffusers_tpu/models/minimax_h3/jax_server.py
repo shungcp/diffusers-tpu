@@ -621,6 +621,18 @@ class Server:
     _n = getattr(self, "_req_n", 0); self._req_n = _n + 1
     if _tp and _n == 1:
       jax.profiler.start_trace(_tp)
+    dense_th = None
+    # t2va only by default: for ref2va three compiles (vision, encode,
+    # dense) already share the host CPUs and this one did not help (c606:
+    # 95.4 -> 91.5 s and 78.8 -> 82.9 s; t2va 62.0 -> 54.4 s).
+    _pd = os.environ.get("DT_PRE_DENSE", "t2va")
+    if _pd == "1" or _pd == kind:
+      try:
+        dense_th = self._precompile_dense(
+            kind, req["prompt"], image, num_frames,
+            int(req.get("height", a.height)), int(req.get("width", a.width)))
+      except Exception as e:   # best effort: the real call compiles anyway
+        print(f"  [server] dense precompile skipped: {e!r}", flush=True)
     # ref2va: compile the reference encode (depends only on the image size)
     # in a thread while the text and vision towers compile and run; the
     # encode below then loads it from the compilation cache.
@@ -752,6 +764,8 @@ class Server:
     timesteps = 1.0 - sigmas[:-1]
     a_timesteps = 1.0 - a_sigmas[:-1]
     call = self._call(self.sdpa, (kind, "dense"))
+    if dense_th is not None:
+      dense_th.join()
     call_sparse, sparse_args = None, ()
     if lossy and a.sparse_window:
       # Only generated video rows (ref2va reference frames / audio come first and
@@ -916,6 +930,80 @@ class Server:
     T["total"] = time.perf_counter() - t_all
     T["text_tokens"] = T_info
     return frames, T
+
+  def _precompile_dense(self, kind, prompt, image, num_frames, height, width):
+    """Compile the dense DiT call for this request's shapes in a thread,
+    from host-side shapes only (tokens, reference size), so it overlaps the
+    text and vision towers; the real call then hits the compilation cache.
+    Mirrors the array construction in `generate` so the cache key matches."""
+    import threading
+    import torch
+    from diffusers.modular_pipelines.minimax_h3.before_denoise import (
+        MiniMaxH3PrepareLayoutStep)
+    from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
+        MINIMAX_H3_AUDIO_CHANNELS, audio_latent_num_frames, video_latent_num_frames)
+    from . import jax_ref2va as r2v
+    jax, jnp, dit, a = self.jax, self.jnp, self.dit, self.a
+    latent_h, latent_w = height // 16, width // 16
+    latent_frames = video_latent_num_frames(num_frames, 17, 5)
+    if image is not None:
+      pres = r2v.presentation(self.snapshot, prompt, image)
+      n_txt = int(pres["ids"].shape[0])
+      layout = r2v.layout(pres["tags"], pres["references"], r2v.condition_shape(image),
+                          num_frames, height, width)
+      n_ref = int(layout[5])
+    else:
+      n_txt = int(np.asarray(self.tokenizer(prompt, return_tensors="np")["input_ids"]).shape[1])
+      layout = MiniMaxH3PrepareLayoutStep.build_packed_sequence(
+          text_token_tags=torch.as_tensor(np.ones(n_txt, np.int64)),
+          num_latent_frames=latent_frames, latent_height=latent_h, latent_width=latent_w,
+          num_audio_latents=audio_latent_num_frames(num_frames), patch_size=(1, 2, 2),
+          audio_channels=MINIMAX_H3_AUDIO_CHANNELS, audio_tag=2, video_tag=0)
+      n_ref = 0
+    position_ids = jnp.asarray(np.asarray(layout[0])).astype(jnp.float32)
+    token_tags = jnp.asarray(np.asarray(layout[1])).astype(jnp.int32)
+    video_idx, audio_idx, text_idx = (jnp.asarray(np.asarray(x)).astype(jnp.int32)
+                                      for x in layout[2:5])
+    seq = int(position_ids.shape[0])
+    bucket = a.text_bucket
+    Tb = -(-n_txt // bucket) * bucket if bucket else n_txt
+    extra = Tb - n_txt
+    seq_len_arg = text_len_arg = None
+    if bucket:
+      if extra:
+        position_ids = jnp.concatenate(
+            [position_ids, jnp.repeat(position_ids[-1:], extra, axis=0)])
+        token_tags = jnp.concatenate([token_tags, jnp.ones((extra,), jnp.int32)])
+        text_idx = jnp.concatenate(
+            [text_idx, jnp.arange(seq, seq + extra, dtype=jnp.int32)])
+      seq_len_arg, text_len_arg = jnp.int32(seq), jnp.int32(n_txt)
+    seq = seq + extra
+    key = (kind, seq, Tb, n_ref, int(video_idx.shape[0]), int(audio_idx.shape[0]))
+    done = self.__dict__.setdefault("_dense_pre", {})
+    if key in done:
+      return None
+    row_step = jnp.zeros((seq,), jnp.int32).at[audio_idx].set(1)
+    if n_ref:
+      row_step = row_step.at[video_idx[:n_ref]].set(2)
+    rep = self.NS(self.mesh, self.P())
+    C4 = 4 * dit.CONFIG_FULL["in_channels"]
+    video = jax.device_put(np.zeros((1, int(video_idx.shape[0]), C4), np.float32), rep)
+    audio = jax.device_put(np.zeros((1, int(audio_idx.shape[0]),
+                                     dit.CONFIG_FULL["audio_in_channels"]), np.float32), rep)
+    emb = jax.device_put(np.zeros((1, Tb, self.cfg_text["hidden_size"]), np.float32),
+                         rep).astype(self.dtype)
+    args_layout = (row_step, token_tags, position_ids, video_idx, audio_idx, text_idx,
+                   seq_len_arg, text_len_arg)
+    call = self._call(self.sdpa, (kind, "dense"))
+
+    def run():
+      with jax.set_mesh(self.mesh):
+        tt = jnp.asarray([0.5] * (3 if n_ref else 2), jnp.float32)
+        call.lower(self.state, video, audio, emb, tt, *args_layout).compile()
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    done[key] = th
+    return th
 
   def _decode_latents(self, latents):
     """`jax_pipeline`'s temporal chunking + tiled decode + crossfade, K chunks at a time."""
