@@ -82,5 +82,5 @@ Later fixes (2026-11-12), each found in a profile / 之后的修正(2026-11-12),
 What is left: about 1.05 s of the 2.77 s at 4736x3552 is the two all-reduces a block, measured at the link's rate (16,481 rows: 1.78 ms each, 174 GB/s bus); a reduce-scatter + all-gather of the same bytes is 2.3x slower, so a sequence-parallel stream does not pay on v6e.
 剩下的:4736x3552 的 2.77 秒里约 1.05 秒是每个 block 的两次 all-reduce,实测已跑在链路带宽上(16,481 行每次 1.78 ms,总线 174 GB/s);同字节的 reduce-scatter + all-gather 慢 2.3 倍,所以 v6e 上序列并行残差流不划算。
 
-Fewer chips / 更少的 chip: 4 chips with `--text-int8` 0.89 s / 4.20 s (edit 1.57 s); one v5e chip with `--offload --int8-weights --free-text-after` 11.4 s / 43.7 s (2048x2048 / 4736x3552).
+Fewer chips / 更少的 chip: 4 chips with `--text-int8` 0.88 s / 4.22 s (edit 1.52 s; measured on a v6e-4); one v5e chip with `--offload --int8-weights --free-text-after` 11.4 s / 43.7 s (2048x2048 / 4736x3552).
 4 个 chip 加 `--text-int8`:0.89 / 4.20 秒(编辑 1.57 秒);单个 v5e chip 加 `--offload --int8-weights --free-text-after`:11.4 / 43.7 秒(2048x2048 / 4736x3552)。
