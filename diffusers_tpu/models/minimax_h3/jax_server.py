@@ -621,6 +621,28 @@ class Server:
     _n = getattr(self, "_req_n", 0); self._req_n = _n + 1
     if _tp and _n == 1:
       jax.profiler.start_trace(_tp)
+    # ref2va: compile the reference encode (depends only on the image size)
+    # in a thread while the text and vision towers compile and run; the
+    # encode below then loads it from the compilation cache.
+    enc_th = None
+    if (image is not None and os.environ.get("DT_ENC_JIT", "1") == "1"
+        and os.environ.get("DT_PAR_ENC", "1") == "1"):
+      hw = tuple(np.asarray(image).shape[:2])
+      if hw not in self.__dict__.setdefault("_enc_precompiled", set()):
+        import threading
+        from . import jax_pipeline as jp
+        os.environ.setdefault("DT_ENC_GROUP", "5")
+        jp._ENC_ONE[0] = self._encode_one
+        rep = self.NS(self.mesh, self.P())
+        avals = jax.tree.map(lambda v: jax.ShapeDtypeStruct(v.shape, v.dtype, sharding=rep),
+                             (self._es_host, self._qs_host))
+
+        def _pre():
+          with jax.set_mesh(self.mesh):
+            r2v.precompile_condition(jp._ENC_W_FN, hw, avals, mesh=self.mesh)
+        enc_th = threading.Thread(target=_pre, daemon=True)
+        enc_th.start()
+        self._enc_precompiled.add(hw)
     emb, text_tags, pres = self._encode_text(req["prompt"], image)
     if _tp and _n == 1:
       jax.profiler.stop_trace()
@@ -638,6 +660,8 @@ class Server:
     latent_frames = video_latent_num_frames(num_frames, 17, 5)
     n_ref, cond_rows = 0, None
     if image is not None:
+      if enc_th is not None:
+        enc_th.join()
       cond = self._encode_reference(image)
       if self.pika is not None:
         # Pika's anchor noise: seed + 7919, frame-major [B, F, C, H, W].

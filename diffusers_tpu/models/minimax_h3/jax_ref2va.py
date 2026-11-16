@@ -274,7 +274,18 @@ def encode_condition(encode_one, image, latents_mean, latents_std, batch=0,
     # op-by-op dispatch takes 2.4 s, dominated by small ops. Weights are
     # passed as arguments, not closed over (closures get baked in as constants).
     import jax
-    global _ENC_JIT
+    _enc_jit()
+    moments = _ENC_JIT(weights, x, encode_one, batch, mesh)
+  else:
+    moments = jvae.tiled_encode(encode_one, x, batch=batch, mesh=mesh)
+  return _finish_condition(moments, latents_mean, latents_std)
+
+
+def _enc_jit():
+  import jax
+  from . import jax_vae as jvae
+  global _ENC_JIT
+  if True:
     if _ENC_JIT is None:
       # 16 MiB scoped VMEM: compiles in ~16 s instead of ~44 s at the 32 MiB
       # default, same request time (c598). `DT_ENC_VMEM_KIB=0` keeps the global value.
@@ -285,9 +296,21 @@ def encode_condition(encode_one, image, latents_mean, latents_std, batch=0,
                                                     batch=b, mesh=m),
           static_argnums=(2, 3, 4),
           compiler_options={"xla_tpu_scoped_vmem_limit_kib": kib} if kib else None)
-    moments = _ENC_JIT(weights, x, encode_one, batch, mesh)
-  else:
-    moments = jvae.tiled_encode(encode_one, x, batch=batch, mesh=mesh)
+  return _ENC_JIT
+
+
+def precompile_condition(encode_one, image_hw, weights_avals, batch=0, mesh=None):
+  """Compile the encode program for a (H, W) reference without running it,
+  so it can overlap other work; the later `encode_condition` call then
+  finds it in the persistent compilation cache."""
+  import jax
+  x = jax.ShapeDtypeStruct((1, 3, 1) + tuple(image_hw), np.float32)
+  _enc_jit().lower(weights_avals, x, encode_one, batch, mesh).compile()
+
+
+def _finish_condition(moments, latents_mean, latents_std):
+  import torch
+  from diffusers.utils.torch_utils import randn_tensor
   moments = np.asarray(moments, np.float32)
   mu, logvar = np.split(moments, 2, axis=1)
   logvar = np.clip(logvar, -30.0, 20.0)
