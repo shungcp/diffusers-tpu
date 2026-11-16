@@ -920,7 +920,21 @@ class Server:
       lat = jnp.transpose(lat, (0, 4, 1, 2, 5, 3, 6)).reshape(
           1, dit.CONFIG_FULL["in_channels"], latent_frames, latent_h, latent_w)
       lat = lat.astype(jnp.float32) * self.lat_std + self.lat_mean
-      frames = self._decode_latents(lat)
+      # A larger canvas can leave too little HBM beside the resident DiT for
+      # the decode program at the default chunk batch (544x960 at 480p
+      # settings: 361 MB needed, 279 MB free). Retry with fewer chunks per
+      # call instead of failing the request.
+      cap = None
+      while True:
+        try:
+          frames = self._decode_latents(lat, cap=cap)
+          break
+        except Exception as e:  # noqa: BLE001
+          if "RESOURCE_EXHAUSTED" not in str(e) or cap == 1:
+            raise
+          cap = max(1, (cap or self._last_decode_k) // 2)
+          print(f"  [server] decode out of HBM; retrying with {cap} chunk(s) per call",
+                flush=True)
     T["decode"] = time.perf_counter() - t
     T["wave"] = None
     if self.audio_dec is not None:
@@ -1005,7 +1019,7 @@ class Server:
     done[key] = th
     return th
 
-  def _decode_latents(self, latents):
+  def _decode_latents(self, latents, cap=None):
     """`jax_pipeline`'s temporal chunking + tiled decode + crossfade, K chunks at a time."""
     jax, jnp, jvae, a = self.jax, self.jnp, self.jvae, self.a
     clip_length, token_drop, ratio = 17, 3, 4
@@ -1030,10 +1044,12 @@ class Server:
     if pad_tokens:
       z = jnp.concatenate([z, jnp.repeat(z[:, :, -1:], pad_tokens, axis=2)], axis=2)
     _base_cap = 8 if latents.shape[3] * latents.shape[4] <= 30 * 52 else 4
-    K = decode_chunk_batch(frames_lat, a.decode_chunk_batch,
+    K = decode_chunk_batch(frames_lat, a.decode_chunk_batch if cap is None else 0,
+                           cap if cap is not None else
                            1 if self.mesh.devices.size == 1 else
                            a.decode_chunk_cap or
                            max(1, (_base_cap * self.mesh.devices.size) // 8))
+    self._last_decode_k = K
     decoded, pieces, carry = {}, [], None
     for i in range(num_chunks):
       if i not in decoded:
@@ -1111,8 +1127,14 @@ def main():
   with open(args.requests) as f:
     reqs = [json.loads(l) for l in f if l.strip()]
   for n, req in enumerate(reqs):
-    frames, T = server.generate(req)
     tag = req.get("tag", f"req{n}")
+    try:
+      frames, T = server.generate(req)
+    except Exception as e:  # noqa: BLE001
+      # Report and go on with the next request (the models stay loaded).
+      print(f"[req {n}] {tag}: FAILED {type(e).__name__}: {str(e).splitlines()[0][:300]}",
+            flush=True)
+      continue
     np.save(os.path.join(args.out, f"{tag}_frames.npy"), frames)
     if T["wave"] is not None:
       np.save(os.path.join(args.out, f"{tag}_audio.npy"), T["wave"])
