@@ -84,6 +84,15 @@ def parse_args():
                   help="request file used to precompile every shape at startup (3 steps, "
                        "sparse from step 1, results discarded) so the first real request "
                        "runs at steady state. Same format as --requests")
+  ap.add_argument("--ref-aspect-buckets", default="",
+                  help="center-crop each reference to the nearest of these width:height "
+                       "ratios ('default' = 13 common ones, or e.g. '16:9,9:16,1:1') so any "
+                       "reference size maps to a few compiled shapes; changes the input by "
+                       "the crop (off by default: references keep their own ratio)")
+  ap.add_argument("--warmup-ref-buckets", action="store_true",
+                  help="with --ref-aspect-buckets: at startup run one 3-step ref2va request per "
+                       "bucket (a synthetic reference, the first --warmup/--requests prompt) so "
+                       "every bucket is compiled before serving (cached on disk afterwards)")
   ap.add_argument("--fp8", action="store_true",
                   help="float8_e4m3fn weights and activations for DiT linears (native fp8 MXU "
                        "on v7x). Do not use on v6e (no fp8 MXU): lossless t2va 112.4 -> 120.7 s, "
@@ -614,7 +623,9 @@ class Server:
 
     # Text (+ vision)
     t = time.perf_counter()
-    image = r2v.load_reference(ref_path) if ref_path else None
+    image = (r2v.load_reference(ref_path,
+                                aspect_buckets=r2v.parse_aspect_buckets(a.ref_aspect_buckets))
+             if ref_path else None)
     # DT_SERVER_TEXT_PROFILE=<dir>: profile the text stage of the 2nd request
     # (the 1st includes compilation).
     _tp = os.environ.get("DT_SERVER_TEXT_PROFILE")
@@ -1160,6 +1171,25 @@ def main():
     print(f"[warmup] {len(warm)} shapes, {time.perf_counter() - t0:.0f}s", flush=True)
   with open(args.requests) as f:
     reqs = [json.loads(l) for l in f if l.strip()]
+  if args.warmup_ref_buckets and args.ref_aspect_buckets:
+    from PIL import Image
+    from . import jax_ref2va as r2v
+    base = next((r for r in reqs if r.get("reference")), reqs[0] if reqs else {})
+    wdir = os.path.join(args.out, "_bucket_refs")
+    os.makedirs(wdir, exist_ok=True)
+    t0 = time.perf_counter()
+    for b in r2v.parse_aspect_buckets(args.ref_aspect_buckets):
+      h = 1024
+      w = max(1, round(h * b))
+      pth = os.path.join(wdir, f"ref_{w}x{h}.png")
+      Image.new("RGB", (w, h), (128, 128, 128)).save(pth)
+      req = dict(base, reference=pth, steps=3, sparse_dense_steps=1, tag=f"_warm_{w}x{h}")
+      try:
+        _, T = server.generate(req)
+        print(f"[warmup] ref bucket {w}:{h}: {T['total']:.1f}s", flush=True)
+      except Exception as e:  # noqa: BLE001
+        print(f"[warmup] ref bucket {w}:{h}: FAILED {type(e).__name__}: {str(e)[:200]}", flush=True)
+    print(f"[warmup] ref buckets done, {time.perf_counter() - t0:.0f}s", flush=True)
   for n, req in enumerate(reqs):
     tag = req.get("tag", f"req{n}")
     try:

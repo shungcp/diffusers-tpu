@@ -29,17 +29,77 @@ TEXT_TAG, VIDEO_TAG, AUDIO_TAG = 1, 0, 2
 CANVAS_MULTIPLE = 32
 
 
-def load_reference(path, short_edge=REFERENCE_SHORT_EDGE):
+def parse_aspect_buckets(spec):
+  """'16:9,9:16,1:1' (or 'default') -> sorted list of width/height ratios."""
+  if not spec:
+    return None
+  if spec == "default":
+    spec = DEFAULT_ASPECT_BUCKETS
+  out = []
+  for tok in spec.split(","):
+    w, _, h = tok.strip().partition(":")
+    out.append(float(w) / float(h or 1))
+  return sorted(out)
+
+
+# Common upload ratios; neighbours are at most ~12% apart, so a reference is
+# cropped by at most ~6% of one side.
+DEFAULT_ASPECT_BUCKETS = "21:9,2:1,16:9,3:2,4:3,5:4,1:1,4:5,3:4,2:3,9:16,1:2,9:21"
+
+
+def snap_to_aspect(image, buckets):
+  """Center-crop a PIL image to the bucket ratio nearest in log space, so
+  references of any size map onto a few shapes (one compile each). Returns
+  the image unchanged when it already has that ratio."""
+  import math
+  w, h = image.size
+  r = w / h
+  b = min(buckets, key=lambda x: abs(math.log(r / x)))
+  if abs(math.log(r / b)) < 1e-6:
+    return image
+  if r > b:      # too wide: crop width
+    nw = max(1, round(h * b))
+    x0 = (w - nw) // 2
+    return image.crop((x0, 0, x0 + nw, h))
+  nh = max(1, round(w / b))
+  y0 = (h - nh) // 2
+  return image.crop((0, y0, w, y0 + nh))
+
+
+def load_reference(path, short_edge=REFERENCE_SHORT_EDGE, aspect_buckets=None):
   """Reference image -> resized PIL image, same algorithm as
   `MiniMaxH3Ref2VASetupStep`.
 
   Scales the short edge to `short_edge`, rounds both sides to
   `canvas_multiple`, and resizes with diffusers' `VaeImageProcessor.resize`
   (PIL LANCZOS). E.g. 1344x768 -> 3584x2048.
+
+  `aspect_buckets` (list of width/height ratios, off by default): center-crop
+  to the nearest ratio first. This departs from the reference algorithm (the
+  crop removes a few percent of one side) but bounds the number of reference
+  shapes, so they can all be compiled ahead of time.
   """
   from PIL import Image
   from diffusers.image_processor import VaeImageProcessor
   image = Image.open(path).convert("RGB")
+  if aspect_buckets:
+    # One canonical size per bucket (short edge `short_edge`, long edge from
+    # the bucket ratio), whatever the upload's exact size.
+    import math
+    w0, h0 = image.size
+    b = min(aspect_buckets, key=lambda x: abs(math.log((w0 / h0) / x)))
+    m = CANVAS_MULTIPLE
+    if b >= 1:
+      th, tw = short_edge, max(m, round(short_edge * b / m) * m)
+    else:
+      tw, th = short_edge, max(m, round(short_edge / b / m) * m)
+    sc = short_edge / min(w0, h0)
+    plain = (max(m, round(w0 * sc / m) * m), max(m, round(h0 * sc / m) * m))
+    if plain != (tw, th):   # already the bucket's size: same as without buckets
+      image = snap_to_aspect(image, [tw / th])
+    if image.size != (tw, th):
+      image = VaeImageProcessor().resize(image, height=th, width=tw)
+    return image
   width, height = image.size
   multiple = CANVAS_MULTIPLE
   scale = short_edge / min(width, height)
