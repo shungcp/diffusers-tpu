@@ -115,4 +115,23 @@ Workload / 测试负载：**Pika-H3-Flex 6-step text-to-video with audio (`t2va`
 | **Opt-4** | Sharded JIT-compiled 3D causal reference VAE encoder (`tiled_encode` with `with_sharding_constraint`: `0.045 s` at 2K, `0.055 s` at 4K) + `jnp.where` segmented modulation + `DT_STREAM_SHARD=whole` in `edit` mode + `--scan-layers` / `--parallel-compile` / scoped VMEM in `--requests` serving (new shape `45.4 ->` **`7.9 s`** `t2i`, `77.9 ->` **`10.5 s`** `edit`; warm `edit` **`0.929 s`**) | `2.787 s` -> **`0.909 s` e2e** (`0.817 s` warm; `denoise+vae` **`0.770 s`**) | `4.37 s` (`v6e-8`) -> **`2.653 s` e2e** (`2.561 s` warm; `denoise+vae` **`2.505 s`**) | **`3.07×` (2K Edit)** |
 | **Opt-5** | `torch_tpu` (`libtpu 0.0.52`) 8-rank TP (`AotBlocks(group=10)` single-compile + `tpu:0` device fix + 128-lane BHSD RoPE + `DT_SEGMOD_WHERE=1` + `DT_SEGMOD_F32=1` + compiled 27-layer Qwen3-VL vision tower `DT_VIS_COMPILE=1` (`0.030 s`) + 256-bucket compiled text tower + 2-matmul/2D-FF compiled ViT tile decode `0.024 s` / `0.092 s` + `DT_POST_ATTN_PIPE=1` 2-slab overlap on 4K; `edit` `2.914 ->` **`1.031 s` e2e**, cold start `51.6 ->` **`16.7 s`**) | `1.287 s` -> **`0.578 s` e2e** (`0.551 s` warm, `denoise` **`0.524 s`**, cold `25.8 s`) | `3.709 s` -> **`1.977 s` e2e** (`1.951 s` warm, `denoise` **`1.845 s`**, cold `36.6 s`) | **`3.99×` (2K) / `3.98×` (4K)** |
 
+---
+
+## 6. `MOSS-Image` (50-Step CFG 3 & 8-Step DMD) on TPU `v7x-8` vs. `v6e-4` & GPU / `MOSS-Image` 性能对比
+
+`MOSS-Image` (`OpenMOSS-Team/MOSS-Image-Base`, 5B 42-layer DiT with 24 heads × 128 dim, `Qwen3.5-9B` hybrid Gated-DeltaNet + full-attention text encoder, and `AutoencoderKLFlux2` VAE) runs on a 2D `("cfg", "tensor")` mesh where the two CFG branches execute side-by-side (`cfg=2`, skipping layer 22 in the unconditional branch via `jnp.where`/`torch.where`), the FFN `ffn_up_gate` is split into separate `ffn_up` and `ffn_gate` linears to eliminate inter-chip collective-permutes, Splash attention uses a single masked loop (`kv_mask_all=True`) for `seq > 8192` (`2048×2048`), and the VAE decoder runs as a native NHWC JAX program (`jax_vae.py`, `9.44 ms` in `fp32` / `8.01 ms` in `bf16` at `1024×1024` across 8 devices vs `122.58 ms` traced through `torchax`).
+
+| Workload / Mode | 1 Device (`v7x` / `v6e`) | 2 Devices (`v7x` / `v6e`) | 4 Devices (`v7x-4` / `v6e-4`) | **8 Devices (`v7x-8` / `v6e-8`)** | GPU Reference | Stage Breakdown on `v7x-8` (`text + denoise + decode`) |
+| :--- | :---: | :---: | :---: | :---: | :---: | :--- |
+| **`1024×1024` (50 steps, CFG 3, `--dit torchax`)** | **`9.97 s`** / `13.0 s` | **`4.96 s`** / `5.64 s` | **`2.87 s`** / `4.03 s` | **`2.68 s`** / `2.56 s` | `17.1 s` (H100 diffusers) | `0.021 s + 2.66 s (53.1 ms/step) + 0.02 s` |
+| **`1024×1024` (50 steps, CFG 3, `--dit jax`)** | — | — | **`2.70 s`** / `3.96 s` | **`2.58 s`** (cold `27.8 s`) | `17.1 s` (H100 diffusers) | `0.021 s + 2.57 s (51.4 ms/step) + 0.02 s` |
+| **`2048×2048` (50 steps, CFG 3, `--dit torchax`)** | **`63.0 s`** / `82.2 s` | **`31.3 s`** / — | **`16.36 s`** / `24.9 s` | **`12.84 s`** / `13.8 s` | `≈139 s` (RTX 5090 DiT only) | `0.021 s + 12.79 s (255.8 ms/step) + 0.05 s` |
+| **`2048×2048` (50 steps, CFG 3, `--dit jax`)** | — | — | **`16.24 s`** / `24.48 s` | **`12.74 s`** (cold `42.5 s`) | `≈139 s` (RTX 5090 DiT only) | `0.021 s + 12.69 s (253.8 ms/step) + 0.05 s` |
+| **8-Step DMD (`--dmd`, `1024×1024`, no CFG)** | — | — | **`0.61 s`** / `0.48 s` | **`0.38 s`** / `0.46 s` | — | `0.021 s + 0.36 s (45.0 ms/step, tensor=8) + 0.02 s` |
+| **8-Step DMD (`--dmd`, `2048×2048`, no CFG)** | — | — | **`2.82 s`** / — | **`1.58 s`** (cold `54.3 s`) | — | `0.021 s + 1.54 s (192.5 ms/step, tensor=8) + 0.05 s` |
+| **Resident Serving (`--requests`, `1024×1024`, `--replicas 1`)** | — | — | **`2.89 s`/req** / `4.05 s`/req | **`2.71 s`/req** / `2.43 s`/req | — | `0.03 s text + 2.66 s denoise + 0.02 s decode` (fresh prompt) |
+| **Resident Serving (`--requests`, `1024×1024`, `--replicas 2`)** | — | — | **`2.50 s`/img** / `2.85 s`/img | **`1.52 s`/img** (`3.04 s` / batch of 2) | — | Two 4-device (`cfg=2 × tensor=2`) replicas overlapped |
+| **Resident Serving (`--requests`, `1024×1024`, `--replicas 4`)** | — | — | — | **`1.28 s`/img** / `1.46 s`/img | — | Four 2-device (`cfg=2 × tensor=1`) replicas (`5.12 s` / batch of 4) |
+
+
 
