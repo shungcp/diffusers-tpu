@@ -58,6 +58,7 @@ Warm requests, end to end (text encoding, six DiT steps, decode). / 暖请求,�
 | 4096x4096 edit, 1 reference / 编辑 | **3.38 s** | — | — |
 
 An image is a 4k-16k-row sequence, so eight-way tensor parallelism is communication-bound. What made the JAX transformer 2.4x faster at 4736x3552 (denoise 7.42 -> 2.99 s), in order:
+
 图像是 4k-16k 行的短序列,8 路张量并行受通信限制。JAX transformer 在 4736x3552 上快 2.4 倍(去噪 7.42 -> 2.99 秒)依次来自:
 
 | Change / 改动 | Denoise / 去噪 |
@@ -69,6 +70,7 @@ An image is a 4k-16k-row sequence, so eight-way tensor parallelism is communicat
 | SwiGLU rows interleaved per chip (`DT_SWIGLU_INTERLEAVE`) / SwiGLU 行按 chip 交错 | **2.99 s** |
 
 Each block then holds two plain all-reduces and nothing else crosses the mesh; on v6e those do not overlap compute (about 40% of a step). Tried and dropped: sequence-parallel stream with the same fixes (4.54 s), Pallas SwiGLU FFN (3.22 s), hand-written collective matmul and XLA flag variants (no change).
+
 此后每个 block 只有两次普通 all-reduce,再无其他跨 chip 交换;v6e 上 all-reduce 不与计算重叠(约占一步的 40%)。试过但放弃:同样修正下的序列并行残差流(4.54 秒)、Pallas SwiGLU FFN(3.22 秒)、手写 collective matmul 与 XLA 标志组合(无变化)。
 
 Later fixes (2026-11-12), each found in a profile / 之后的修正(2026-11-12),每项都由剖面定位:
@@ -80,7 +82,9 @@ Later fixes (2026-11-12), each found in a profile / 之后的修正(2026-11-12),
 | torch_tpu: masked modulation in float32 (torch's per-op bfloat16 rounding sat in the FF projection's prologue), 128-lane RoPE, libtpu 0.0.52 (same attention kernel 5% faster), decoder attention as two matmuls and FF kept 2-D (261-row tiles made every 3-D view a copy) / torch_tpu:掩码调制用 float32、128 通道 RoPE、libtpu 0.0.52、解码器注意力改两次矩阵乘且 FF 保持二维 | 4736 3.36 -> 2.95 s; decode 0.131 -> 0.076 s |
 
 What is left: about 1.05 s of the 2.77 s at 4736x3552 is the two all-reduces a block, measured at the link's rate (16,481 rows: 1.78 ms each, 174 GB/s bus); a reduce-scatter + all-gather of the same bytes is 2.3x slower, so a sequence-parallel stream does not pay on v6e.
+
 剩下的:4736x3552 的 2.77 秒里约 1.05 秒是每个 block 的两次 all-reduce,实测已跑在链路带宽上(16,481 行每次 1.78 ms,总线 174 GB/s);同字节的 reduce-scatter + all-gather 慢 2.3 倍,所以 v6e 上序列并行残差流不划算。
 
 Fewer chips / 更少的 chip: 4 chips with `--text-int8` 0.88 s / 4.22 s (edit 1.52 s; measured on a v6e-4); one v5e chip with `--offload --int8-weights --free-text-after` 11.4 s / 43.7 s (2048x2048 / 4736x3552).
+
 4 个 chip 加 `--text-int8`:0.89 / 4.20 秒(编辑 1.57 秒);单个 v5e chip 加 `--offload --int8-weights --free-text-after`:11.4 / 43.7 秒(2048x2048 / 4736x3552)。
