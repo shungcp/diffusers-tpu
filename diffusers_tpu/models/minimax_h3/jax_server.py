@@ -89,10 +89,27 @@ def parse_args():
                        "ratios ('default' = 13 common ones, or e.g. '16:9,9:16,1:1') so any "
                        "reference size maps to a few compiled shapes; changes the input by "
                        "the crop (off by default: references keep their own ratio)")
+  ap.add_argument("--ref-pad-buckets", action="store_true",
+                  help="exact alternative to --ref-aspect-buckets: keep each reference as is but "
+                       "pad its vision patches, text, encoder tiles and DiT reference rows to "
+                       "buckets (padding masked), so references of different sizes share "
+                       "programs with unchanged output; sizes via --vision-bucket, "
+                       "--text-bucket-ref, --ref-row-bucket, --enc-tile-bucket")
+  ap.add_argument("--vision-bucket", type=int, default=8192,
+                  help="with --ref-pad-buckets: vision patches padded to a multiple of this")
+  ap.add_argument("--text-bucket-ref", type=int, default=4096,
+                  help="with --ref-pad-buckets: ref2va text (vision tokens included) padded "
+                       "to a multiple of this")
+  ap.add_argument("--ref-row-bucket", type=int, default=4096,
+                  help="with --ref-pad-buckets: DiT reference rows padded to a multiple of this")
+  ap.add_argument("--enc-tile-bucket", type=int, default=1,
+                  help="with --ref-pad-buckets: encode the reference by fixed-size tile groups "
+                       "(one encoder program for every size); 0 = per-size program")
   ap.add_argument("--warmup-ref-buckets", action="store_true",
-                  help="with --ref-aspect-buckets: at startup run one 3-step ref2va request per "
-                       "bucket (a synthetic reference, the first --warmup/--requests prompt) so "
-                       "every bucket is compiled before serving (cached on disk afterwards)")
+                  help="with --ref-aspect-buckets or --ref-pad-buckets: at startup run one 3-step "
+                       "ref2va request per aspect bucket (a synthetic reference, the first ref2va "
+                       "prompt of --requests) so those shapes are compiled before serving "
+                       "(cached on disk afterwards)")
   ap.add_argument("--fp8", action="store_true",
                   help="float8_e4m3fn weights and activations for DiT linears (native fp8 MXU "
                        "on v7x). Do not use on v6e (no fp8 MXU): lossless t2va 112.4 -> 120.7 s, "
@@ -522,8 +539,11 @@ class Server:
               [pres["ids"], np.full(pad_to - n_real, pad_id, pres["ids"].dtype)]))
           tail = pos3[:, -1:] + np.arange(1, pad_to - n_real + 1)[None, :]
           pos_in = np.concatenate([pos3, tail], axis=1)
-        emb = r2v.encode_text_with_vision(enc, vis, pres_in, pos_in, self.cfg_text,
-                                          self.dtype, TEXT_ENCODER_LAYER, jit=True)
+        if self.a.ref_pad_buckets:
+          emb = self._text_vision_padded(enc, vis, pres, pos3, n_real)
+        else:
+          emb = r2v.encode_text_with_vision(enc, vis, pres_in, pos_in, self.cfg_text,
+                                            self.dtype, TEXT_ENCODER_LAYER, jit=True)
         emb = jax.block_until_ready(emb)[:, :n_real]
         if not resident:
           r2v.release_text_jit()   # the towers go back to host after this
@@ -565,7 +585,137 @@ class Server:
             f"{time.perf_counter() - t_back:.1f}s (to make room for the ref2va text program)", flush=True)
     return emb, tags, extra
 
+  def _pad_ref_rows(self, position_ids, token_tags, video_idx, seq, n_ref):
+    """`--ref-pad-buckets`: reference rows padded to `--ref-row-bucket`. The
+    pad rows join the reference rows in `video_idx` but sit past the real
+    length at the end of the sequence, so they are masked as keys (like the
+    text pad rows) and the output is unchanged."""
+    jnp = self.jnp
+    b = self.a.ref_row_bucket
+    if not (self.a.ref_pad_buckets and n_ref and b):
+      return position_ids, token_tags, video_idx, seq, n_ref
+    rb = -(-n_ref // b) * b
+    rpad = rb - n_ref
+    if rpad:
+      position_ids = jnp.concatenate([position_ids, jnp.repeat(position_ids[-1:], rpad, axis=0)])
+      token_tags = jnp.concatenate(
+          [token_tags, jnp.full((rpad,), token_tags[video_idx[0]], jnp.int32)])
+      video_idx = jnp.concatenate([video_idx[:n_ref],
+                                   jnp.arange(seq, seq + rpad, dtype=jnp.int32),
+                                   video_idx[n_ref:]])
+    return position_ids, token_tags, video_idx, seq + rpad, rb
+
+  def _text_vision_padded(self, enc, vis, pres, pos3, n_real):
+    """Vision + text towers with the patches padded to `--vision-bucket` (pad
+    patches masked as keys in the vision tower; their merged tokens land on
+    the last text pad row) and the text to `--text-bucket-ref`, so
+    references of different sizes share one program. Real rows unchanged."""
+    jax, jnp, nnx = self.jax, self.jnp, self.nnx
+    from ..qwen3_vl import jax_text as qwen_text
+    from ..qwen3_vl import jax_vision as qv
+    a = self.a
+    merge = pres["processor"].image_processor.merge_size ** 2
+    pix = pres["pixel_values"]
+    npatch = pix.shape[0]
+    pb = -(-npatch // a.vision_bucket) * a.vision_bucket
+    vpad = pb - npatch
+    tbr = a.text_bucket_ref
+    tb = -(-(n_real + 1) // tbr) * tbr          # at least one pad row
+    pad_id = self.tokenizer.pad_token_id or 0
+    ids = np.concatenate([pres["ids"], np.full(tb - n_real, pad_id, pres["ids"].dtype)])
+    pos = np.concatenate([pos3, pos3[:, -1:] + np.arange(1, tb - n_real + 1)[None, :]], axis=1)
+    vmeta = qv.vision_metadata(pres["grid_thw"])
+    vcos, vsin = qv.vision_rope(vmeta["position_ids"])
+    ii, iw = vmeta["interp_indices"], vmeta["interp_weights"]
+    pix = np.concatenate([pix, np.zeros((vpad, pix.shape[1]), pix.dtype)])
+    ii = np.concatenate([ii, np.repeat(ii[-1:], vpad, axis=0)])
+    iw = np.concatenate([iw, np.zeros((vpad,) + iw.shape[1:], iw.dtype)])
+    vcos = np.concatenate([vcos, np.ones((vpad, vcos.shape[1]), vcos.dtype)])
+    vsin = np.concatenate([vsin, np.zeros((vpad, vsin.shape[1]), vsin.dtype)])
+    vpos = np.flatnonzero(ids == int(pres["image_pad_id"]))
+    vpos = np.concatenate([vpos, np.full((pb // merge - vpos.shape[0],), tb - 1, vpos.dtype)])
+    cos, sin = qwen_text.mrope_cos_sin(
+        pos, head_dim=self.cfg_text["head_dim"], rope_theta=self.cfg_text["rope_theta"],
+        mrope_section=self.cfg_text["mrope_section"])
+    ge, se = nnx.split(enc)
+    gv, sv = nnx.split(vis)
+    fns = self.__dict__.setdefault("_tv_padded", {})
+    if (ge, gv) not in fns:
+      @jax.jit
+      def tv(se_, sv_, pix_, ii_, iw_, vc_, vs_, ids_, c_, s_, vpos_, kv_len):
+        e_, vm = nnx.merge(ge, se_), nnx.merge(gv, sv_)
+        merged, deep = vm(pix_, {"interp_indices": ii_, "interp_weights": iw_}, vc_, vs_,
+                          kv_len=kv_len)
+        emb0 = e_.embed_tokens[...][ids_]
+        emb0 = emb0.at[:, vpos_].set(merged.astype(emb0.dtype))
+        return e_(ids_, c_, s_, inputs_embeds=emb0, deepstack=deep, visual_positions=vpos_,
+                  stop_at_layer=TEXT_ENCODER_LAYER)
+      fns[(ge, gv)] = tv
+    dt = self.dtype
+    return fns[(ge, gv)](se, sv, jnp.asarray(pix, dt), jnp.asarray(ii), jnp.asarray(iw),
+                         jnp.asarray(vcos, dt), jnp.asarray(vsin, dt), jnp.asarray(ids)[None],
+                         jnp.asarray(cos, dt), jnp.asarray(sin, dt), jnp.asarray(vpos),
+                         jnp.int32(npatch))
+
+  def _encode_reference_tiles(self, image):
+    """Reference encode by tile count (`--enc-tile-bucket`): the 256 px tiles
+    of any reference are stacked, padded and encoded by one program per
+    count; only the small blend-and-stitch is per layout."""
+    jax, jnp, jvae = self.jax, self.jnp, self.jvae
+    from . import jax_ref2va as r2v
+    from . import jax_pipeline as jp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    mesh = self.mesh
+    px = np.asarray(image, np.float32).transpose(2, 0, 1)[None, :, None] / 255.0
+    px = (px - np.asarray(r2v.PIXEL_MEAN, np.float32).reshape(1, 3, 1, 1, 1)) \
+        / np.asarray(r2v.PIXEL_STD, np.float32).reshape(1, 3, 1, 1, 1)
+    x = jnp.asarray(px, jnp.float32)
+    rep = self.NS(mesh, self.P())
+    w = (jax.device_put(self._es_host, rep), jax.device_put(self._qs_host, rep))
+    if not hasattr(self, "_enc_tiles_fns"):
+      tile_sh = NamedSharding(mesh, P(mesh.axis_names[0]))
+      enc1 = self._encode_one
+      kib = int(os.environ.get("DT_ENC_VMEM_KIB", 16384))
+
+      @functools.partial(jax.jit, compiler_options=(
+          {"xla_tpu_scoped_vmem_limit_kib": kib} if kib else None))
+      def enc_batch(w_, tiles):
+        tiles = jax.lax.with_sharding_constraint(tiles, tile_sh)
+        out = jax.vmap(lambda t: enc1(w_[0], w_[1], t))(tiles)
+        return jax.lax.with_sharding_constraint(out, tile_sh)
+
+      @functools.partial(jax.jit, static_argnums=(1, 2, 3, 4))
+      def stitch(flat, ny, nx, yo, xo):
+        rows = [[flat[i * nx + j] for j in range(nx)] for i in range(ny)]
+        return jvae.stitch_encoded_tiles(rows, list(yo), list(xo))
+      self._enc_tiles_fns = (enc_batch, stitch)
+    enc_batch, stitch = self._enc_tiles_fns
+    ys, yl, yo = jvae.split_tiles(x.shape[-2], 256, 64)
+    xs, xl, xo = jvae.split_tiles(x.shape[-1], 256, 64)
+    tiles = [x[..., i:i + li, j:j + lj] for i, li in zip(ys, yl) for j, lj in zip(xs, xl)]
+    # Fixed-size groups (as `tiled_encode`'s DT_ENC_GROUP: 5 tiles a chip,
+    # which fits beside the resident DiT), so one encoder program serves
+    # every reference size.
+    g = int(os.environ.get("DT_ENC_GROUP", "5") or 5) * mesh.devices.size
+    nb = -(-len(tiles) // g) * g
+    with jax.set_mesh(mesh):
+      tiles = tiles + [tiles[-1]] * (nb - len(tiles))
+      flat = jnp.concatenate([enc_batch(w, jnp.stack(tiles[k:k + g]))
+                              for k in range(0, nb, g)], axis=0)[:len(ys) * len(xs)]
+      if os.environ.get("DT_HOST_STITCH", "1") == "1":
+        # Blend and stitch on the host: a few MB of latents, no per-layout
+        # program to compile (3-6 s per new reference size on the device).
+        moments = _np_stitch(np.asarray(jax.device_get(flat), np.float32),
+                             len(ys), len(xs), yo, xo, jvae.SPATIAL_RATIO)
+      else:
+        moments = stitch(flat, len(ys), len(xs), tuple(yo), tuple(xo))
+    del w
+    return r2v._finish_condition(moments, self.vae_cfg["latents_mean"],
+                                 self.vae_cfg["latents_std"])
+
   def _encode_reference(self, image):
+    if self.a.ref_pad_buckets and self.a.enc_tile_bucket:
+      return self._encode_reference_tiles(image)
     jax = self.jax
     from . import jax_ref2va as r2v
     dev = self.NS(self.mesh, self.P())
@@ -651,7 +801,8 @@ class Server:
     # encode below then loads it from the compilation cache.
     enc_th = None
     if (image is not None and os.environ.get("DT_ENC_JIT", "1") == "1"
-        and os.environ.get("DT_PAR_ENC", "1") == "1"):
+        and os.environ.get("DT_PAR_ENC", "1") == "1"
+        and not (a.ref_pad_buckets and a.enc_tile_bucket)):
       hw = tuple(np.asarray(image).shape[:2])
       if hw not in self.__dict__.setdefault("_enc_precompiled", set()):
         import threading
@@ -716,7 +867,7 @@ class Server:
     # attention masks to the real length, so output is unchanged while prompts
     # in the same bucket share a shape and a compilation.
     n_txt = int(emb.shape[1])   # not `T`: that is the timing dict
-    bucket = a.text_bucket
+    bucket = a.text_bucket_ref if (n_ref and a.ref_pad_buckets) else a.text_bucket
     Tb = -(-n_txt // bucket) * bucket if bucket else n_txt
     extra = Tb - n_txt
     seq_len_arg, text_len_arg = None, None
@@ -731,6 +882,12 @@ class Server:
             [text_idx, jnp.arange(seq, seq + extra, dtype=jnp.int32)])
       seq_len_arg, text_len_arg = jnp.int32(seq), jnp.int32(n_txt)
     seq_real, seq = seq, seq + extra
+    n_ref_real = n_ref
+    position_ids, token_tags, video_idx, seq, n_ref = self._pad_ref_rows(
+        position_ids, token_tags, video_idx, seq, n_ref)
+    if n_ref != n_ref_real:
+      cond_rows = np.concatenate(
+          [cond_rows, np.zeros((n_ref - n_ref_real, cond_rows.shape[1]), cond_rows.dtype)])
     T_info = (n_txt, Tb)
     v = randn_tensor((1, dit.CONFIG_FULL["in_channels"], latent_frames, latent_h, latent_w),
                      generator=tgen, dtype=torch.float32)
@@ -887,10 +1044,6 @@ class Server:
           dv, da = cache["last_out"]
           cache["skipped"] += 1
         else:
-          if os.environ.get("DT_PRINT_SHARD") and i < 2:
-            for nm, v in (("video", video), ("audio", audio), ("emb", emb), ("tt", tt)):
-              print(f"  [shard] step {i} {nm} {getattr(v, 'sharding', None)} "
-                    f"committed={getattr(v, '_committed', None)}", flush=True)
           if call_sparse is not None and i >= dense_steps:
             fn = sparse_future.result() if sparse_future is not None else call_sparse
             try:
@@ -1000,7 +1153,7 @@ class Server:
     video_idx, audio_idx, text_idx = (jnp.asarray(np.asarray(x)).astype(jnp.int32)
                                       for x in layout[2:5])
     seq = int(position_ids.shape[0])
-    bucket = a.text_bucket
+    bucket = a.text_bucket_ref if (n_ref and a.ref_pad_buckets) else a.text_bucket
     Tb = -(-n_txt // bucket) * bucket if bucket else n_txt
     extra = Tb - n_txt
     seq_len_arg = text_len_arg = None
@@ -1013,6 +1166,9 @@ class Server:
             [text_idx, jnp.arange(seq, seq + extra, dtype=jnp.int32)])
       seq_len_arg, text_len_arg = jnp.int32(seq), jnp.int32(n_txt)
     seq = seq + extra
+    seq_real0 = seq - extra
+    position_ids, token_tags, video_idx, seq, n_ref = self._pad_ref_rows(
+        position_ids, token_tags, video_idx, seq, n_ref)
     key = (kind, seq, Tb, n_ref, int(video_idx.shape[0]), int(audio_idx.shape[0]))
     done = self.__dict__.setdefault("_dense_pre", {})
     if key in done:
@@ -1040,8 +1196,7 @@ class Server:
       vs, rpf = int(vi.min()), int((times == times[0]).sum())
       qlen = (-(-seq // dit.PAD_SEQUENCE_TO) * dit.PAD_SEQUENCE_TO
               if dit.PAD_SEQUENCE_TO else seq)
-      seq_real = seq - extra
-      tab, cnt, W = self._sparse_table(qlen, seq_real, vs, rpf, a.sparse_window, seq)
+      tab, cnt, W = self._sparse_table(qlen, seq_real0, vs, rpf, a.sparse_window, seq)
       call_sparse = self._call_sparse_dyn(qlen, W)
       sparse_args = (jnp.asarray(tab), jnp.asarray(cnt))
       skey = (id(call_sparse), video.shape, audio.shape, emb.shape,
@@ -1151,6 +1306,45 @@ def _server_helpers(mesh):
   return blend, frames_to_uint8
 
 
+def _np_stitch(flat, ny, nx, yo, xo, ratio):
+  """NumPy `jax_vae.stitch_encoded_tiles` over `flat` (tiles row-major)."""
+  def blend(a, b, extent, axis):
+    extent = min(a.shape[axis], b.shape[axis], extent)
+    if extent <= 0:
+      return b
+    shape = [1] * a.ndim
+    shape[axis] = extent
+    pos = (np.arange(extent, dtype=np.float32) / np.float32(extent)).reshape(shape)
+    sa = [slice(None)] * a.ndim
+    sa[axis] = slice(-extent, None)
+    sb = [slice(None)] * b.ndim
+    sb[axis] = slice(0, extent)
+    head = a[tuple(sa)] * (np.float32(1.0) - pos) + b[tuple(sb)] * pos
+    if extent == b.shape[axis]:
+      return head
+    rest = [slice(None)] * b.ndim
+    rest[axis] = slice(extent, None)
+    return np.concatenate([head, b[tuple(rest)]], axis=axis)
+  rows = [[flat[i * nx + j] for j in range(nx)] for i in range(ny)]
+  lyo = [o // ratio for o in yo]
+  lxo = [o // ratio for o in xo]
+  out_rows = []
+  for i, row in enumerate(rows):
+    out = []
+    for j, tile in enumerate(row):
+      if i > 0:
+        tile = blend(rows[i - 1][j], tile, lyo[i - 1], -2)
+      if j > 0:
+        tile = blend(row[j - 1], tile, lxo[j - 1], -1)
+      if i < len(rows) - 1:
+        tile = tile[..., :-lyo[i], :]
+      if j < len(row) - 1:
+        tile = tile[..., :, :-lxo[j]]
+      out.append(tile)
+    out_rows.append(np.concatenate(out, axis=-1))
+  return np.concatenate(out_rows, axis=-2)
+
+
 def main():
   args = parse_args()
   server = Server(args)
@@ -1171,14 +1365,16 @@ def main():
     print(f"[warmup] {len(warm)} shapes, {time.perf_counter() - t0:.0f}s", flush=True)
   with open(args.requests) as f:
     reqs = [json.loads(l) for l in f if l.strip()]
-  if args.warmup_ref_buckets and args.ref_aspect_buckets:
+  if args.warmup_ref_buckets and (args.ref_aspect_buckets or args.ref_pad_buckets):
     from PIL import Image
     from . import jax_ref2va as r2v
     base = next((r for r in reqs if r.get("reference")), reqs[0] if reqs else {})
     wdir = os.path.join(args.out, "_bucket_refs")
     os.makedirs(wdir, exist_ok=True)
     t0 = time.perf_counter()
-    for b in r2v.parse_aspect_buckets(args.ref_aspect_buckets):
+    # With --ref-pad-buckets alone: synthetic references at the common ratios
+    # compile the padded buckets they fall in.
+    for b in r2v.parse_aspect_buckets(args.ref_aspect_buckets or "default"):
       h = 1024
       w = max(1, round(h * b))
       pth = os.path.join(wdir, f"ref_{w}x{h}.png")
