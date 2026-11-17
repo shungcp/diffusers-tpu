@@ -131,7 +131,7 @@ def main():
   device = torch.device("tpu")
   rank, world, all_reduce = tp_h3.init_parallel()
   if world > 1:
-    device = torch.device("tpu", rank)
+    device = torch.device("tpu", 0)
   say = (lambda *a, **k: print(*a, **k)) if rank == 0 else (lambda *a, **k: None)
   dtype = torch.bfloat16
 

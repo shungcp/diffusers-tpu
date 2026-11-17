@@ -351,7 +351,10 @@ def main():
         if args.shard_adaln else None)
     print(f"tensor parallel: rank {rank} of {world}, {sliced} blocks sliced",
           flush=True)
-    dev = torch.device("tpu", rank)
+    # Each torchrun process owns one chip, its device 0. torch_tpu 0.2.0
+    # accepted `tpu:<rank>` and tagged it as device 0 anyway; 0.3.0 rejects an
+    # index past the process's addressable devices.
+    dev = torch.device("tpu", 0)
   blocks = transformer.transformer_blocks
   total = sum(p.numel() for p in transformer.parameters())
   resident = sum(
@@ -934,7 +937,7 @@ def _free_text_after_encode(pipe, verbose=print):
     return n
 
   def encode(*a, **k):
-    dev = torch.device("tpu", int(os.environ.get("RANK", 0)))
+    dev = torch.device("tpu", 0)
     if parked:
       verbose(f"  [free-text] restored {_restore(dev)} tensors before encode "
               f"({tied['restore']} shared reuses)", flush=True)
@@ -986,8 +989,7 @@ def _free_text_after_encode(pipe, verbose=print):
             hooks += len(d)
             d.clear()
       type(pipe)._execution_device = property(
-          lambda _self, _d=torch.device("tpu",
-                                        int(os.environ.get("RANK", 0))): _d)
+          lambda _self, _d=torch.device("tpu", 0): _d)
       try:
         from torch_tpu._internal import compile as tt_compile
         tt_compile.clear_cache()
@@ -1104,7 +1106,7 @@ def _rank0_text_encode(rank, all_reduce, on_cpu=False, keep=0, verbose=print,
              **kwargs):
     # Ignore `kwargs["device"]`: `_execution_device` is inferred from
     # parameter placement and resolves to cpu if the encoder is on the host.
-    device = torch.device("tpu", rank)
+    device = torch.device("tpu", 0)
     verbose(f"  [rank0-text] rank {rank} in encode, "
             f"{'computing' if rank == 0 else 'waiting for broadcast'}", flush=True)
     if rank == 0:
@@ -1357,7 +1359,7 @@ def _vae_on_demand(pipe, verbose=print):
     def staged(z, *a, **k):
       dev = getattr(z, "device", None) or torch.device("tpu")
       if dev.type == "cpu":
-        dev = torch.device("tpu", int(os.environ.get("RANK", 0)))
+        dev = torch.device("tpu", 0)
       up = move(vae, dev)
       if up and said["up"] < 2:
         said["up"] += 1
@@ -1484,7 +1486,7 @@ def _dit_park_for_decode(pipe, verbose=print):
     return n
 
   host = torch.device("cpu")
-  chip = torch.device("tpu", int(os.environ.get("RANK", 0)))
+  chip = torch.device("tpu", 0)
   inner = vae.decode
   said = {"n": 0}
 

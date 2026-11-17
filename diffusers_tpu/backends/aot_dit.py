@@ -35,6 +35,26 @@ import time
 import torch
 
 
+def _use_artifact():
+  """Call the `aot_compile` artifact: only with `DT_AOT_CALL_ART=1` and the
+  per-program function copies off (`DT_AOT_FRESH_FN=0`). The artifact's
+  AOTAutograd key holds a per-process uuid, so it is never found in the
+  cache by a later process."""
+  return (os.environ.get("DT_AOT_CALL_ART") == "1"
+          and os.environ.get("DT_AOT_FRESH_FN", "1") != "1")
+
+
+def _fresh_function(fn, tag):
+  """A copy of `fn` with its own code object (same globals and closure)."""
+  import types
+  code = fn.__code__.replace(co_name=f"{fn.__code__.co_name}_p{tag}")
+  new = types.FunctionType(code, fn.__globals__, fn.__name__, fn.__defaults__,
+                           fn.__closure__)
+  new.__kwdefaults__ = fn.__kwdefaults__
+  new.__dict__.update({k: v for k, v in fn.__dict__.items() if k != "__wrapped__"})
+  return new
+
+
 def _flat_forward(module, *args, **kwargs):
   """The module is the first argument so its parameters get lifted.
 
@@ -157,6 +177,12 @@ class AotBlocks:
             )
           fn = spmd_safe_fn(fn)
           self._say("  [aot] spmd_safe: graph no longer split at all-reduce", flush=True)
+        if os.environ.get("DT_AOT_FRESH_FN", "1") == "1":
+          # One function object (own code object) per program: Dynamo keeps
+          # its compiled frames per code object, so programs for the same
+          # shapes (dense vs sparse steps) no longer share a frame cache and
+          # the wrapper can serve lossy runs too, without `aot_compile`.
+          fn = _fresh_function(fn, len(self._cache))
         compiled = torch.compile(fn, backend="tpu",
                                  fullgraph=True, dynamic=self._dynamic)
         # The artifact is only called with `DT_AOT_CALL_ART=1`; otherwise the
@@ -168,7 +194,7 @@ class AotBlocks:
         # c630). A cache-loaded graph is not serializable, so `aot_compile`
         # cannot simply be given stable names (c631).
         art = (compiled.aot_compile(((block, *args), kwargs))
-               if os.environ.get("DT_AOT_CALL_ART") == "1" else None)
+               if _use_artifact() else None)
     finally:
       for m, fn in installed:
         if fn is not None:
@@ -208,7 +234,7 @@ class AotBlocks:
     # frame cache, which is shared by all instances of the same function and
     # ignores KEY_EXTRA, so it can pick the dense program for a sparse step.
     # The artifact checks its own guards and raises on mismatch.
-    if os.environ.get("DT_AOT_CALL_ART") == "1" and self._art is not None:
+    if _use_artifact() and self._art is not None:
       return self._art(block, *args, **kwargs)
     return self._compiled(block, *args, **kwargs)
 
