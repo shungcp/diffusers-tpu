@@ -159,7 +159,16 @@ class AotBlocks:
           self._say("  [aot] spmd_safe: graph no longer split at all-reduce", flush=True)
         compiled = torch.compile(fn, backend="tpu",
                                  fullgraph=True, dynamic=self._dynamic)
-        art = compiled.aot_compile(((block, *args), kwargs))
+        # The artifact is only called with `DT_AOT_CALL_ART=1`; otherwise the
+        # `torch.compile` wrapper compiles the same graph again on its first
+        # call. And `aot_compile` never hits the AOTAutograd cache: the key
+        # includes the backend id `__compiled_fn_<n>_<uuid4>`, new in every
+        # process (c629), so every start recompiled each block twice
+        # (8-chip Pika 480p/121: warm start 37.6 -> 19 s, cold 85 -> 63 s,
+        # c630). A cache-loaded graph is not serializable, so `aot_compile`
+        # cannot simply be given stable names (c631).
+        art = (compiled.aot_compile(((block, *args), kwargs))
+               if os.environ.get("DT_AOT_CALL_ART") == "1" else None)
     finally:
       for m, fn in installed:
         if fn is not None:
@@ -179,6 +188,13 @@ class AotBlocks:
     # and (2, 2688) afterwards, so a single-slot cache would recompile twice
     # per request (~26 s each when grouping 10 blocks).
     hit = self._cache.get(key)
+    if hit is not None and key != self._key and self._art is None and hit[1] is None:
+      # Without the artifact the wrapper traces lazily, and Dynamo guards on
+      # the state PRE_TRACE sets (segmod's runs): restore it for this
+      # program when the shape changes (twice a request), or a later call
+      # retraces against the other program's state.
+      for fn in self.PRE_TRACE:
+        fn(args, kwargs)
     if hit is None:
       if self._cache:
         self._say(f"  [aot] new shape, compiling program #{len(self._cache) + 1}",
