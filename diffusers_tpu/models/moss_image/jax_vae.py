@@ -162,8 +162,14 @@ def make_decoder(vae_dir, mesh=None, dtype=jnp.float32, batch_norm_eps=1e-4):
   params = load(vae_dir, dtype)
   if mesh is not None:
     params = jax.device_put(params, NamedSharding(mesh, P()))
+  # 16 MiB scoped VMEM: the decoder compiles in ~11 s instead of ~25 s at
+  # the 32 MiB default (v6e-8, 1024x1024), and its run time is ~10 ms either
+  # way. `DT_MOSS_VAE_VMEM_KIB=0` keeps the global value.
+  import os
+  kib = int(os.environ.get("DT_MOSS_VAE_VMEM_KIB", 16384))
   fn = jax.jit(functools.partial(decode, mesh=mesh, dtype=dtype,
-                                 batch_norm_eps=batch_norm_eps))
+                                 batch_norm_eps=batch_norm_eps),
+               compiler_options={"xla_tpu_scoped_vmem_limit_kib": kib} if kib else None)
   return params, fn
 
 

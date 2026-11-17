@@ -263,6 +263,7 @@ class Generator:
     self.jax_decoder = None  # vae_dir: decode with jax_vae (decoders made lazily per dtype)
     self.vae_dtype = "auto"
     self._decoders = {}
+    self._dec_seen, self._dec_threads = set(), {}
 
   def _put(self, array, spec):
     return self._env.j2t_iso(jax.device_put(array, NamedSharding(self._mesh, spec)))
@@ -298,9 +299,10 @@ class Generator:
       self._prompts[prompt] = hit
     return hit
 
-  def _inputs(self, prompts, height, width):
+  def _inputs(self, prompts, height, width, encoded=None):
     """Padded contexts, per-sample RoPE, valid lengths; batch on ``cfg``."""
-    encoded = [self.encode(p) for p in prompts]
+    if encoded is None:
+      encoded = [self.encode(p) for p in prompts]
     longest = max(n for _, n in encoded)
     padded = math.ceil(longest / self._bucket) * self._bucket
     rows = []
@@ -352,6 +354,114 @@ class Generator:
     """The latents after every step; dispatched asynchronously, not waited on."""
     return _drain(self.denoise_steps(*args, **kwargs))
 
+  def _decoder_for(self, shape):
+    """(params, jitted decoder) for latents of ``shape`` (dtype by size)."""
+    import jax.numpy as jnp
+
+    from diffusers_tpu.models.moss_image import jax_vae
+
+    dtype = self.vae_dtype
+    if dtype == "auto":
+      # fp32 like upstream, unless one chip's share of the image passes
+      # 2 MP: 1 chip at 2048x2048 needs 9.5 GiB of fp32 scratch beside the
+      # resident models (8.8 free). bf16 needs 5.5 (57 dB PSNR to fp32).
+      pixels = shape[-1] * shape[-2] * 256 / self._mesh.devices.size
+      dtype = "bf16" if pixels > 2 * 1024 * 1024 else "fp32"
+    if dtype not in self._decoders:
+      self._decoders[dtype] = jax_vae.make_decoder(
+          self.jax_decoder, mesh=self._mesh,
+          dtype=jnp.bfloat16 if dtype == "bf16" else jnp.float32)
+    return self._decoders[dtype]
+
+  def _token_length(self, prompt):
+    lengths = self.__dict__.setdefault("_token_lengths", {})
+    if prompt in lengths:
+      return lengths[prompt]
+    tokenizer = self.pipe.tokenizer
+    formatted = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}], tokenize=False,
+        add_generation_prompt=True, enable_thinking=True)
+    n = int(tokenizer(formatted, return_tensors="pt", truncation=True,
+                      max_length=4096).input_ids.shape[1])
+    lengths[prompt] = n
+    return n
+
+  def _precompile_step(self, prompt, kwargs):
+    """Compile the denoising step for a new (size, text bucket) in a thread,
+    beside the text encoder, from the token counts alone. Compile only: the
+    same program is lowered from the step module's functional call and
+    written to the compilation cache, nothing runs on the chips, so a busy
+    server is not interrupted. `DT_MOSS_PAR_STEP=0` turns it off."""
+    import os
+    import threading
+
+    if os.environ.get("DT_MOSS_PAR_STEP", "1") != "1" or type(self) is not Generator:
+      return None
+    height, width = kwargs.get("height", 1024), kwargs.get("width", 1024)
+    gs = kwargs.get("guidance_scale", 3.0)
+    cfg = gs != 1.0
+    prompts = [prompt, kwargs.get("negative_prompt", "")] if cfg else [prompt]
+    lengths = [self._token_length(p) for p in prompts]
+    padded = math.ceil(max(lengths) / self._bucket) * self._bucket
+    skip_layers = tuple(sorted(kwargs.get("uncond_skip_layers", (22,)) or ())) if cfg else ()
+    key = (height, width, padded, cfg, skip_layers)   # the program's shapes only
+    seen = self.__dict__.setdefault("_step_seen", set())
+    if key in seen:
+      return None
+    seen.add(key)
+    zeros = self._put_torch(torch.zeros(1, padded, 4096, dtype=torch.bfloat16))
+    context, rope, kv_len = self._inputs(prompts, height, width,
+                                         encoded=[(zeros, n) for n in lengths])
+    skip = self._put(np.array([False, True][:len(prompts)]), P("cfg") if cfg else P())
+    scheduler = self.pipe.scheduler
+    scheduler.set_timesteps(kwargs.get("steps", 50), device="cpu")
+    with torchax_paused():
+      sinusoid = time_sinusoid(self._model, scheduler.timesteps.float()[0]).numpy()
+    latents = self._put(np.zeros((1, 128, height // 16, width // 16), np.float32), P())
+    args = (latents, self._put(sinusoid, P()), context, rope, kv_len, skip,
+            self._put(np.float32(-0.02), P()), self._put(np.float32(gs), P()))
+
+    core = self._step
+    if not hasattr(core, "functional_call"):   # e.g. the native JAX step
+      return None
+    import functools
+
+    from torchax.interop import jax_view
+    jx = lambda t: t._elem if hasattr(t, "_elem") else t
+    fn = jax.jit(jax_view(functools.partial(core.functional_call, "forward")),
+                 **(core._extra_jit_args or {}))
+    params = jax.tree.map(jx, core.params)
+    buffers = jax.tree.map(jx, core.buffers)
+    jargs = tuple(jx(a) for a in args)
+
+    def run():
+      fn.lower(params, buffers, *jargs, skip_layers=skip_layers).compile()
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    return th
+
+  def _precompile_decode(self, height, width):
+    """Compile the decoder for a new image size in a thread, beside the text
+    encoder and the denoising steps (it depends only on the size); the
+    decode then finds it in the compilation cache. `DT_MOSS_PAR_DECODE=0`
+    turns it off."""
+    import os
+    import threading
+
+    shape = (1, 128, height // 16, width // 16)
+    if (self.jax_decoder is None or shape in self._dec_seen
+        or os.environ.get("DT_MOSS_PAR_DECODE", "1") != "1"):
+      return
+    self._dec_seen.add(shape)
+    params, fn = self._decoder_for(shape)
+    aval = jax.ShapeDtypeStruct(shape, np.float32, sharding=NamedSharding(self._mesh, P()))
+
+    def run():
+      fn.lower(params, aval).compile()
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    self._dec_threads[shape] = th
+
   def decode(self, latents):
     """The pipeline's decode: BN de-normalisation, 2x2 unpatchify, VAE.
 
@@ -363,18 +473,10 @@ class Generator:
 
       from diffusers_tpu.models.moss_image import jax_vae
 
-      dtype = self.vae_dtype
-      if dtype == "auto":
-        # fp32 like upstream, unless one chip's share of the image passes
-        # 2 MP: 1 chip at 2048x2048 needs 9.5 GiB of fp32 scratch beside the
-        # resident models (8.8 free). bf16 needs 5.5 (57 dB PSNR to fp32).
-        pixels = latents.shape[-1] * latents.shape[-2] * 256 / self._mesh.devices.size
-        dtype = "bf16" if pixels > 2 * 1024 * 1024 else "fp32"
-      if dtype not in self._decoders:
-        self._decoders[dtype] = jax_vae.make_decoder(
-            self.jax_decoder, mesh=self._mesh,
-            dtype=jnp.bfloat16 if dtype == "bf16" else jnp.float32)
-      params, fn = self._decoders[dtype]
+      params, fn = self._decoder_for(latents.shape)
+      th = self._dec_threads.pop(tuple(latents.shape), None)
+      if th is not None:
+        th.join()
       return np.asarray(fn(params, self._env.t2j_iso(latents)))[0]
     vae = self.pipe.vae
     z = latents.to(dtype=vae.dtype)
@@ -393,10 +495,14 @@ class Generator:
       return t
 
     t0 = time.perf_counter()
+    self._precompile_decode(kwargs.get("height", 1024), kwargs.get("width", 1024))
+    step_th = self._precompile_step(prompt, kwargs)
     self.encode(prompt)
     if kwargs.get("guidance_scale", 3.0) != 1.0:
       self.encode(kwargs.get("negative_prompt", ""))
     sync(self._prompts[prompt][0])
+    if step_th is not None:
+      step_th.join()
     t1 = time.perf_counter()
     latents = sync(self.denoise(prompt, **kwargs))
     t2 = time.perf_counter()

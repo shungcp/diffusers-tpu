@@ -386,18 +386,18 @@ Measured 2026-11-04, before the audio decode and the faster video decode; 8-devi
 
 ### MOSS-Image — 50 steps, CFG 3, torchax backend
 
-v6e-4 (4 chips), warm, end to end including text encoding and decode. GPU numbers are third-party (OpenMOSS publishes none); the H100 one runs the official diffusers pipeline with the same settings.
+v6e-4 (4 chips) and v6e-8 (8 chips), warm, end to end including text encoding and decode. GPU numbers are third-party (OpenMOSS publishes none); the H100 one runs the official diffusers pipeline with the same settings.
 
-v6e-4(4 个 chip),暖请求,端到端含文本编码与解码。GPU 数字来自第三方(OpenMOSS 未公布速度);H100 那一行是官方 diffusers pipeline、相同参数。
+v6e-4(4 个 chip)与 v6e-8(8 个 chip),暖请求,端到端含文本编码与解码。GPU 数字来自第三方(OpenMOSS 未公布速度);H100 那一行是官方 diffusers pipeline、相同参数。
 
-| | 1 chip | 2 chips / 2 chip | 4 chips / 4 chip | GPU |
-|---|---|---|---|---|
-| 1024x1024 | 13.0 s | 5.64 s | **4.03 s** | H100 (diffusers) 17.1 s |
-| 2048x2048 | 82.2 s | | **24.9 s** | RTX 5090 (bf16, DiT only) ≈139 s |
+| | 1 chip | 2 chips / 2 chip | 4 chips / 4 chip | 8 chips / 8 chip (v6e-8) | GPU |
+|---|---|---|---|---|---|
+| 1024x1024 | 13.0 s | 5.64 s | 4.03 s | **2.56 s** | H100 (diffusers) 17.1 s |
+| 2048x2048 | 82.2 s | | 24.9 s | **13.8 s** | RTX 5090 (bf16, DiT only) ≈139 s |
 
-Resident serving of new prompts (`--requests`): 4.05 s a request on 4 chips; `--replicas 2` (two model copies, two chips each) 2.85 s an image. The community 8-step DMD adapter (`--dmd`, no CFG): 0.48 s at 1024x1024.
+Resident serving of new prompts (`--requests`): 4.05 s a request on 4 chips, 2.43 s on 8; `--replicas 2` (two model copies, two chips each) 2.85 s an image on 4 chips; on 8 chips `--replicas 4` gives the most throughput, 1.46 s an image (5.8 s latency). The community 8-step DMD adapter (`--dmd`, no CFG): 0.48 s at 1024x1024 (0.46 s on 8 chips). A new image size compiles its text, denoising and decode programs side by side (the decoder and the step are compiled from their shapes alone while the text encoder compiles; the decoder at a 16 MiB scoped-VMEM ceiling): first request on 8 chips with an empty cache 74.6 -> **40 s** at 1024x1024, 87.4 -> **55 s** at 2048x2048.
 
-常驻服务(`--requests`,每条新提示词):4 chip 每条 4.05 秒;`--replicas 2`(两份模型各 2 chip)每张 2.85 秒。社区 8 步 DMD 适配器(`--dmd`,无 CFG):1024x1024 0.48 秒。
+常驻服务(`--requests`,每条新提示词):4 chip 每条 4.05 秒,8 chip 2.43 秒;4 chip 上 `--replicas 2`(两份模型各 2 chip)每张 2.85 秒;8 chip 上 `--replicas 4` 吞吐最高,每张 1.46 秒(延迟 5.8 秒)。社区 8 步 DMD 适配器(`--dmd`,无 CFG):1024x1024 0.48 秒(8 chip 0.46 秒)。新图像尺寸的文本、去噪、解码三个程序并行编译(解码器与去噪一步只按形状编译,与文本编码器同时进行;解码器用 16 MiB scoped VMEM):8 chip、空缓存时首个请求 1024x1024 74.6 -> **40 秒**,2048x2048 87.4 -> **55 秒**。
 
 ---
 
