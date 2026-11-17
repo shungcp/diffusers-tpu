@@ -127,6 +127,7 @@ def _flash_attention_kernel(
     use_fixed_m: bool,
     emit_residuals: bool,
     dynamic_kv: bool = False,
+    kv_mask_all: bool = False,
     unroll: bool | None = None,
 ) -> None:
   """Hybrid fixed-m / online-softmax flash attention over one (h, i) tile.
@@ -308,7 +309,19 @@ def _flash_attention_kernel(
   # runs the masked online body for every head, like the last block does
   # (exact for fixed heads too, see below). Blocks wholly before it are
   # untouched, so an unpadded call compiles to the same schedule.
-  if dynamic_kv:
+  if dynamic_kv and kv_mask_all:
+    # One masked online body for every non-last block, no branch. The
+    # branching form below cost 2.4-3.4x at 12 heads x 16448 on a v6e
+    # (10.35 / 11.07 ms against 4.34 / 3.23 unmasked, without / with
+    # fixed-m); this is 4.90 ms for both. A fixed-m masked body beside the
+    # online one degrades the schedule the same way (8.91 ms).
+
+    @pl.when(j != grid_width - 1)
+    def body_all_masked():
+      _run_main(compute_masked)
+
+    clean = False
+  elif dynamic_kv:
     has_pad = (j + 1) * bkv > mk_ref[2, 0].astype(jnp.int32)
     clean = jnp.logical_not(has_pad)
 
@@ -372,6 +385,7 @@ def _splash_attention_forward(
     q_seq_len: int | None = None,
     kv_seq_len: int | None = None,
     dynamic_kv: bool = False,
+    kv_mask_all: bool = False,
     use_fixed_m: bool = False,
     emit_residuals: bool = False,
     qk_fp8: bool = False,
@@ -491,6 +505,7 @@ def _splash_attention_forward(
           use_fixed_m=use_fixed_m,
           emit_residuals=emit_residuals,
           dynamic_kv=dynamic_kv,
+          kv_mask_all=kv_mask_all,
           unroll=unroll,
       ),
       grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -560,6 +575,7 @@ def attention(
     use_fixed_m: bool = False,
     qk_fp8: bool = False,
     kv_len: jax.Array | None = None,
+    kv_mask_all: bool = False,
     unroll: bool | None = None,
 ) -> jax.Array:
   """Device-local custom splash attention, normalized.
@@ -581,6 +597,9 @@ def attention(
       ``fixed_m_bound.FIXED_M_SAFE_BOUND`` over this call's Q and K, whose
       no-flush guarantee presumes the caller k-smoothed ``key``.
     qk_fp8: E4M3 Q/K into the QK dot.
+    kv_mask_all: With ``kv_len``, mask every KV block in one body rather
+      than branching to a masked body where the padding starts; much
+      faster when the padding can start anywhere (see the kernel).
 
   Returns:
     ``(B, heads, seq_q, dim)`` in ``query``'s dtype.
@@ -621,6 +640,7 @@ def attention(
         use_fixed_m=use_fixed_m,
         qk_fp8=qk_fp8,
         dynamic_kv=kv_len is not None,
+        kv_mask_all=kv_mask_all,
         unroll=unroll,
     )
     # Output is (heads, dim, seq) — transpose back to (heads, seq, dim)

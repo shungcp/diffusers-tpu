@@ -4,9 +4,9 @@ Fast inference for open diffusion models on Cloud TPU, built on top of [huggingf
 
 基于 [huggingface/diffusers](https://github.com/huggingface/diffusers),在 Cloud TPU 上高速运行开源扩散模型。
 
-Three models are supported today: **MiniMax-H3** (video + audio), **MiniMax-H3-Image** (image and image editing) and **Qwen-Image-2.1** (image).
+Four models are supported today: **MiniMax-H3** (video + audio), **MiniMax-H3-Image** (image and image editing), **Qwen-Image-2.1** (image) and **MOSS-Image** (image, torchax backend).
 
-目前支持三个模型:**MiniMax-H3**(视频 + 音频)、**MiniMax-H3-Image**(图像与图像编辑)和 **Qwen-Image-2.1**(图像)。
+目前支持四个模型:**MiniMax-H3**(视频 + 音频)、**MiniMax-H3-Image**(图像与图像编辑)、**Qwen-Image-2.1**(图像)和 **MOSS-Image**(图像,torchax 后端)。
 
 MiniMax-H3 also runs with the six-step **Pika-H3-Flex** adapters.
 
@@ -30,6 +30,9 @@ Newest first. Each entry links a date to what changed.
 
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-17** — **MOSS-Image** (OpenMOSS, 5B DiT, Qwen3.5-9B text encoder, FLUX.2 VAE) on the torchax backend. On a v6e-4, 50 steps with CFG 3: 1024x1024 in **4.03 s** end to end, 2048x2048 in **24.9 s**, one chip 1024x1024 in **13.0 s**; resident serving of new prompts 4.05 s a request, or **2.85 s** an image with two 2-chip replicas; the community 8-step DMD adapter **0.48 s** ([usage](#run-moss-image--运行-moss-image)). The CFG branches run as one batch on two halves of the chips; the VAE decoder is native JAX (15x the traced one); `kernels/splash.py` gains `kv_mask_all`, one masked body for a runtime kv length (2048x2048 step 723 -> 495 ms; off by default).
+
+  **2026-11-17** — torchax 后端支持 **MOSS-Image**(OpenMOSS,5B DiT、Qwen3.5-9B 文本编码器、FLUX.2 VAE)。v6e-4 上 50 步 CFG 3:1024x1024 端到端 **4.03 秒**,2048x2048 **24.9 秒**,单 chip 1024x1024 **13.0 秒**;常驻服务每条新提示词 4.05 秒,两个 2-chip 副本吞吐 **2.85 秒**/张;社区 8 步 DMD 适配器 **0.48 秒**。CFG 两支作为一个批次在两半 chip 上并行;VAE 解码器为原生 JAX(比追踪版快 15 倍);`kernels/splash.py` 新增 `kv_mask_all`,运行时 kv 长度用单一带 mask 循环体(2048x2048 每步 723 -> 495 ms;默认关闭)。
 - **2026-11-17** — torch_tpu: the DiT blocks were compiled twice per shape (an unused `aot_compile` artifact besides the `torch.compile` wrapper), and the extra one could never hit the AOTAutograd cache (its key holds a per-process uuid). Lossless runs now compile once: 8-chip Pika 480x832x121 first run 85 -> **66 s** cold and 37.6 -> **18 s** with a warm cache (on a v7x-8, 768p 345f Pika first run 95 -> **70 s** cold); H3-Image cold 58 -> 42 s (t2i), 82 -> 65 s (edit) on a v6e-8, and on a v7x-8 45 -> **26 s** (2048x2048 t2i, warm **0.58 s**), 52 -> **37 s** (4736x3552 t2i), 52 -> **17 s** (2048x2048 edit); bit-identical output. Lossy runs (`--sparse-window`) no longer need the artifact either: each program gets its own function object, so dense and sparse programs of the same shapes keep separate Dynamo frame caches (warm start 26.5 -> **19-21 s**, bit-identical). Each rank now addresses its chip as `tpu:0` instead of `tpu:<rank>`: torch_tpu 0.3.0 rejects the old index, and on 0.2.0 it made the torch_tpu H3-Image output drift from the JAX reference (DINO 0.910 -> **0.971** against JAX; pixel cosine **0.984**, PSNR **22.4 dB** on v7x-8; video unaffected). torch_tpu 0.3.0 runs but is no faster here, so 0.2.0 stays pinned.
 
   **2026-11-17** — torch_tpu:DiT block 每个形状编译了两遍(`torch.compile` 包装之外还有一个用不上的 `aot_compile` 产物),多出的那一遍的 AOTAutograd 缓存 key 带每进程不同的 uuid,永远命中不了。无损模式现在只编译一遍:8 chip Pika 480x832x121 首次运行冷启动 85 -> **66 秒**,带缓存 37.6 -> **18 秒**(v7x-8 上 768p 345 帧 Pika 首次运行冷启动 95 -> **70 秒**);v6e-8 上 H3-Image 冷启动 58 -> 42 秒(文生图)、82 -> 65 秒(编辑),v7x-8 上冷启动 45 -> **26 秒**(2048x2048 文生图,暖请求 **0.58 秒**)、52 -> **37 秒**(4736x3552 文生图)、52 -> **17 秒**(2048x2048 编辑);输出逐位一致。有损模式(`--sparse-window`)也不再需要该产物:每个程序一份独立的函数对象,同形状的稠密与稀疏程序各有自己的 Dynamo 帧缓存(暖启动 26.5 -> **19-21 秒**,逐位一致)。各 rank 改用 `tpu:0` 而不是 `tpu:<rank>` 指代自己的 chip:torch_tpu 0.3.0 会拒绝旧写法,在 0.2.0 上它让 torch_tpu 的 H3-Image 出图偏离 JAX 参考(与 JAX 的 DINO 0.910 -> **0.971**;v7x-8 上像素余弦 **0.984**、PSNR **22.4 dB**;视频不受影响)。torch_tpu 0.3.0 能跑但这里没有更快,仍固定 0.2.0。
@@ -381,6 +384,21 @@ Measured 2026-11-04, before the audio decode and the faster video decode; 8-devi
 
 ³ On a v7x-8 (8 devices), `torchax` lossless text-to-video takes 128.5 s. ³ 在 v7x-8(8 个 device)上,`torchax` 无损文生视频为 128.5 秒。
 
+### MOSS-Image — 50 steps, CFG 3, torchax backend
+
+v6e-4 (4 chips), warm, end to end including text encoding and decode. GPU numbers are third-party (OpenMOSS publishes none); the H100 one runs the official diffusers pipeline with the same settings.
+
+v6e-4(4 个 chip),暖请求,端到端含文本编码与解码。GPU 数字来自第三方(OpenMOSS 未公布速度);H100 那一行是官方 diffusers pipeline、相同参数。
+
+| | 1 chip | 2 chips / 2 chip | 4 chips / 4 chip | GPU |
+|---|---|---|---|---|
+| 1024x1024 | 13.0 s | 5.64 s | **4.03 s** | H100 (diffusers) 17.1 s |
+| 2048x2048 | 82.2 s | | **24.9 s** | RTX 5090 (bf16, DiT only) ≈139 s |
+
+Resident serving of new prompts (`--requests`): 4.05 s a request on 4 chips; `--replicas 2` (two model copies, two chips each) 2.85 s an image. The community 8-step DMD adapter (`--dmd`, no CFG): 0.48 s at 1024x1024.
+
+常驻服务(`--requests`,每条新提示词):4 chip 每条 4.05 秒;`--replicas 2`(两份模型各 2 chip)每张 2.85 秒。社区 8 步 DMD 适配器(`--dmd`,无 CFG):1024x1024 0.48 秒。
+
 ---
 
 ## Setup / 安装
@@ -510,6 +528,37 @@ A reference reused across requests is preprocessed and VAE-encoded once (a repea
 The text encoder is the same file as MiniMax-H3's (the Hub deduplicates it), and the prompt is used verbatim.
 
 文本编码器与 MiniMax-H3 是同一个文件(Hub 会去重),提示词原样使用。
+
+---
+
+## Run MOSS-Image / 运行 MOSS-Image
+
+```bash
+hf download OpenMOSS-Team/MOSS-Image-Base
+bash scripts/run_moss_image.sh --prompt "..."                  # 1024x1024, all chips
+bash scripts/run_moss_image.sh --prompt "..." --size 2048
+bash scripts/run_moss_image.sh --prompt "..." --chips 1
+bash scripts/run_moss_image.sh --requests reqs.jsonl --out out  # {"prompt": ..., "seed": ..., "tag": ...} per line
+bash scripts/run_moss_image.sh --requests reqs.jsonl --replicas 2
+```
+
+The model code is MOSS-Image's own `pipeline_moss_image.py` from the Hub snapshot; the denoising loop is ours: each step (both CFG branches, the CFG combine and the Euler update) is one compiled program, so nothing waits on the host until the decode.
+
+模型代码就是 Hub 快照里 MOSS-Image 自己的 `pipeline_moss_image.py`;去噪循环是我们的:每一步(CFG 两支、CFG 合并与 Euler 更新)是一个编译好的程序,解码之前不等主机。
+
+`--dit jax` runs the same step as native JAX (`models/moss_image/jax_dit.py`): about 2% faster (1024x1024 3.96 s, 2048x2048 24.48 s); the time left is the all-reduces and the attention kernel.
+
+`--dit jax` 用原生 JAX 跑同一个步骤(`models/moss_image/jax_dit.py`):快约 2%(1024x1024 3.96 秒,2048x2048 24.48 秒);剩下的时间是 all-reduce 和注意力 kernel。
+
+The 8-step DMD adapter (`lodestones/MOSS-Image-SFT-8-steps-dmd`, a community distillation of MOSS-Image-SFT) runs with `--dmd`:
+
+8 步 DMD 适配器(`lodestones/MOSS-Image-SFT-8-steps-dmd`,MOSS-Image-SFT 的社区蒸馏版)用 `--dmd` 运行:
+
+```bash
+hf download OpenMOSS-Team/MOSS-Image-SFT --include "transformer/*" --include "scheduler/*"
+hf download lodestones/MOSS-Image-SFT-8-steps-dmd generator.safetensors
+bash scripts/run_moss_image.sh --dmd --prompt "..."
+```
 
 ---
 

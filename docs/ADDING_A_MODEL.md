@@ -15,6 +15,7 @@ diffusers_tpu/
   models/
     qwen3_vl/         Qwen3-VL text and vision towers in flax (shared by models that use them)
     minimax_h3/       MiniMax-H3: JAX DiT/VAE/pipeline/server, torchax runner
+    moss_image/       MOSS-Image: torchax DiT core and one-program step, JAX VAE decoder
 ```
 
 ## Recommended order for a new diffusers model
