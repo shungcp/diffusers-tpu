@@ -79,7 +79,28 @@ class AudioDecoder:
       return pool.submit(run_cpu)
     # Its own mesh: the pipeline's context mesh spans every chip.
     with jax.set_mesh(self._mesh):
-      return self._run(self._params, z=jax.device_put(z.numpy(), self._z_sharding))
+      zz = jax.device_put(z.numpy(), self._z_sharding)
+      compiled = getattr(self, "_compiled", {}).get(tuple(zz.shape))
+      if compiled is not None:
+        try:
+          return compiled(self._params, z=zz)
+        except (TypeError, ValueError):
+          pass
+      return self._run(self._params, z=zz)
+
+  def precompile(self, t):
+    """Compile (only) the decode for `t` latent frames; `start` then calls
+    the compiled program. Nothing runs on the chips, so it can overlap a
+    request without taking device time."""
+    import jax
+    import numpy as np
+    if self._cpu is not None:
+      return
+    shape = (2, self.channels, t)
+    aval = jax.ShapeDtypeStruct(shape, np.float32, sharding=self._z_sharding)
+    with jax.set_mesh(self._mesh):
+      compiled = self._run.lower(self._params, z=aval).compile()
+    self.__dict__.setdefault("_compiled", {})[shape] = compiled
 
   def finish(self, out):
     """Float32 numpy `(2, samples)` from what `start` returned."""

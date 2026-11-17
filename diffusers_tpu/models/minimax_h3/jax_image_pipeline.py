@@ -1033,11 +1033,17 @@ def serve_requests(args, env):
   _fast_kib = int(os.environ.get("DT_STEP_FAST_KIB", 32768))
   _ready, _pending, _lock = set(), set(), threading.Lock()
 
+  _compiled64 = {}
+  _static = ("run_vals", "n_ref", "img_contig")
+
   def _bg_compile(key, a, kw):
+    # Compile only (nothing runs on the chips, so serving is not held up);
+    # later steps call the compiled program directly.
     t0 = time.perf_counter()
     with jax.set_mesh(mesh):
-      jax.block_until_ready(step_jit(None)(*a, **kw))
+      compiled = step_jit(None).lower(*a, **kw).compile()
     with _lock:
+      _compiled64[key] = compiled
       _ready.add(key)
     print(f"  [step] {key[0]} rows: 64 MiB program ready after "
           f"{time.perf_counter() - t0:.1f} s in the background", flush=True)
@@ -1050,6 +1056,11 @@ def serve_requests(args, env):
       with _lock:
         ready, start = key in _ready, key not in _pending
         _pending.add(key)
+      if ready:
+        try:
+          return _compiled64[key](*a, **{k: v for k, v in kw.items() if k not in _static})
+        except (TypeError, ValueError):   # inputs laid out differently: use the jit
+          return step_jit(None)(*a, **kw)
       if not ready:
         if start:
           print(f"  [step] {rows} rows -> scoped VMEM {_fast_kib} KiB now, "

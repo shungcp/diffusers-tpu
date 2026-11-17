@@ -764,8 +764,7 @@ class Server:
       n_a = audio_latent_num_frames(num_frames)
       if n_a not in self._audio_compiling and n_a != getattr(self, "_audio_warm_n", None):
         import threading
-        z_ = np.zeros((2 * n_a, self.audio_dec.channels), np.float32)
-        th = threading.Thread(target=self.audio_dec.decode, args=(z_,), daemon=True)
+        th = threading.Thread(target=self.audio_dec.precompile, args=(n_a,), daemon=True)
         th.start()
         self._audio_compiling[n_a] = th
     self._ensure_dit(kind)     # no-op unless the workflow changes
