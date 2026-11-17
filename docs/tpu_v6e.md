@@ -87,4 +87,36 @@ What is left: about 1.05 s of the 2.77 s at 4736x3552 is the two all-reduces a b
 
 Fewer chips / 更少的 chip: 4 chips with `--text-int8` 0.88 s / 4.22 s (edit 1.52 s; measured on a v6e-4); one v5e chip with `--offload --int8-weights --free-text-after` 11.4 s / 43.7 s (2048x2048 / 4736x3552).
 
-4 个 chip 加 `--text-int8`:0.89 / 4.20 秒(编辑 1.57 秒);单个 v5e chip 加 `--offload --int8-weights --free-text-after`:11.4 / 43.7 秒(2048x2048 / 4736x3552)。
+4 个 chip 加 `--text-int8`:0.88 / 4.22 秒(编辑 1.52 秒;在 v6e-4 上实测);单个 v5e chip 加 `--offload --int8-weights --free-text-after`:11.4 / 43.7 秒(2048x2048 / 4736x3552)。
+
+## 5. `torch_tpu` Compile Cache on Disk / `torch_tpu` 编译缓存的磁盘占用
+
+Pika-H3-Flex `t2va` 480x832, 121 frames, 2 steps, 8 chips, torch_tpu 0.2.0 + libtpu 0.0.52 (2026-11-17). One shape writes 1.99 GB to `TORCHINDUCTOR_CACHE_DIR` (`aotautograd/`, 30 files) plus 0.46 GB of tier-3 (`TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT`). The AOTAutograd directory holds each compiled graph eight times, once per rank: two copies of the same graph differ in 21 bytes (two 8-byte ids, one varint, `forward_time_taken_ns`), so each gets its own content-hash file name.
+
+Pika-H3-Flex `t2va` 480x832、121 帧、2 步、8 chip,torch_tpu 0.2.0 + libtpu 0.0.52(2026-11-17)。一个形状在 `TORCHINDUCTOR_CACHE_DIR` 写 1.99 GB(`aotautograd/`,30 个文件),tier-3 另写 0.46 GB。AOTAutograd 目录里每个编译图存了 8 份,每个 rank 一份:同一个图的两份只差 21 字节(两个 8 字节 id、一个 varint、`forward_time_taken_ns`),内容哈希不同,所以各占一个文件名。
+
+| Cache on disk / 磁盘缓存 | Size / 体积 | Warm run 0 / 暖启动 run 0 | run 1 / run 2 | Output / 输出 |
+| :--- | :---: | :---: | :---: | :---: |
+| None (cold) / 无(冷启动) | — | 62–64 s | 9.1 s | — |
+| Tier-3 only / 只有 tier-3 | 0.46 GB | 50.0 s | 7.6 s | — |
+| AOTAutograd (8 copies per graph) + tier-3 / 每图 8 份 | 2.45 GB | 19.4–20.5 s | 7.0 / 6.1 s | reference / 基准 |
+| AOTAutograd, **one file per graph** + tier-3 / **每图只留 1 份** | **0.71 GB** | 18.6–19.0 s | 6.8 / 5.8 s | bit-identical / 逐位一致 |
+
+Deleting all but one file in every `aotautograd/<key>/` directory keeps every rank's warm start hitting the cache (no files rewritten, same compile counts) at a third of the size. Tested on one shape and one host so far.
+
+把每个 `aotautograd/<key>/` 目录删到只剩一个文件后,8 个 rank 暖启动照样命中(没有重新写文件,编译次数不变),体积降到三分之一。目前只在一个形状、一台主机上验证过。
+
+`LIBTPU_INIT_ARGS` flags tried for cache size, each added alone to the defaults / 为缓存体积试过的 libtpu 参数(每个单独加在默认参数上):
+
+| Flag / 参数 | AOTAutograd size / 体积 | Cold / Warm run 0 / 冷 / 暖 run 0 | Warm run 1 / 暖 run 1 | Output / 输出 |
+| :--- | :---: | :---: | :---: | :---: |
+| (defaults) / 默认 | 1.99 GB | 63.1 / 18.6 s | 6.6 s | — |
+| `--xla_tpu_save_original_hlo_module=false` | 1.98 GB | 64.0 / 19.0 s | 7.3 s | bit-identical / 逐位一致 |
+| `--xla_xprof_register_llo_debug_info=false` | 1.99 GB | 64.3 / 18.1 s | 6.9 s | bit-identical / 逐位一致 |
+| `--xla_tpu_compiler_metadata_on_load=strip_and_compress` | 0.25 GB | 64.7 / 19.8 s | **15.2 s** | bit-identical / 逐位一致 |
+| `--xla_tpu_keep_hlo_proto_literals_up_to=1` | already the default in libtpu 0.0.52 / 0.0.52 默认即为 1 | | | |
+
+`strip_and_compress` shrinks the directory only because writes fail: an executable stripped at load can no longer be serialized (`Cannot serialize a TpuExecutable whose compiler metadata was stripped at load time`), so 26 of 32 AOTAutograd writes and 3,756 in-process cache writes are dropped, and each process recompiles 404–461 times instead of 45–94. Not usable on this path. The other two flags change neither size nor speed beyond run-to-run noise (±0.5–1 s).
+
+`strip_and_compress` 让目录变小只是因为写入失败:加载时去掉元数据的可执行文件无法再序列化(`Cannot serialize a TpuExecutable whose compiler metadata was stripped at load time`),32 次 AOTAutograd 写入失败 26 次,进程内缓存写入失败 3756 次,每个进程编译次数从 45–94 涨到 404–461。这条路径不能用。另外两个参数对体积和速度都没有超出单次运行噪声(±0.5–1 秒)的影响。
+
