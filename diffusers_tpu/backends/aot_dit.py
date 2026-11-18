@@ -91,9 +91,9 @@ _SALT = None
 
 
 def _persist_salt():
-  """What else decides the program besides the shape key: torch / torch_tpu
-  versions, every `DT_*` setting, and the source of the modules that build
-  the block graph. A change to any of them gives new file names instead of
+  """What else decides the program besides the shape key: torch / torch_tpu /
+  libtpu versions, chip type, world size, every `DT_*` setting, and the
+  source of the modules that build the block graph. A change to any of them gives new file names instead of
   loading a stale program (the loaded function's guards check shapes, not
   code)."""
   global _SALT
@@ -105,13 +105,28 @@ def _persist_salt():
     h.update(torch.__version__.encode())
     tt = sys.modules.get("torch_tpu")
     h.update(str(getattr(tt, "__version__", "")).encode())
+    # Chip generation and world size: a shared disk must not hand a v6e
+    # program to a v7x host, or an 8-chip program to a 4-chip run.
+    try:
+      import importlib.metadata as md
+      h.update(md.version("libtpu").encode())
+    except Exception:  # noqa: BLE001
+      pass
+    try:
+      h.update(str(torch.tpu.get_device_name(0)).encode())
+    except Exception:  # noqa: BLE001
+      pass
+    h.update(os.environ.get("WORLD_SIZE", "1").encode())
     h.update(repr(sorted((k, v) for k, v in os.environ.items()
                          if k.startswith("DT_") and k != "DT_AOT_PERSIST")).encode())
     for name in ("diffusers.models.transformers.transformer_minimax_h3",
                  "diffusers_tpu.backends.aot_dit",
                  "diffusers_tpu.backends.ours_splash_tt",
                  "diffusers_tpu.backends.segmented_mod_tt",
+                 "diffusers.models.transformers.transformer_minimax_h3_image",
                  "diffusers_tpu.backends.tp_h3",
+                 "diffusers_tpu.backends.fixed_tslots",
+                 "diffusers_tpu.backends.sparse_attn_tt",
                  "diffusers_tpu.kernels.splash"):
       try:
         mod = sys.modules.get(name) or importlib.import_module(name)
@@ -186,9 +201,9 @@ class AotBlocks:
       fn(args, kwargs)
     begin = time.perf_counter()
     if persist_path and os.path.exists(persist_path):
-      # `DT_AOT_PERSIST`: a program saved by an earlier process. Loading it
-      # skips Dynamo tracing and AOTAutograd entirely; the executable itself
-      # still comes from torch_tpu's own caches.
+      # `DT_AOT_PERSIST`: a program saved by an earlier process. The file
+      # holds the whole program, PJRT executable included, so loading it
+      # skips Dynamo, AOTAutograd and torch_tpu's own caches alike.
       try:
         with open(persist_path, "rb") as f:
           art = torch.compiler.load_compiled_function(f, f_globals=globals())
