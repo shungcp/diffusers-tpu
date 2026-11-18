@@ -132,7 +132,7 @@ A fresh process that only loads the cache from disk produces frames bit-identica
 
 只从磁盘加载缓存的新进程,输出与当场编译的进程逐位一致(含 Pallas 注意力)。
 
-Filesystem dedup on the one-file-per-graph cache of the three shapes (ZFS 2.2 on a loop device; all files read back with matching SHA-1) / 每图 1 份的三形状缓存上的文件系统去重:
+Filesystem dedup on the one-file-per-graph cache of the three shapes (ZFS kernel module 2.2.2 with 2.1.5 userland, on a loop device; all files read back with matching SHA-1) / 每图 1 份的三形状缓存上的文件系统去重:
 
 | Filesystem / 文件系统 | Size / 体积 | Cold read / 冷读 |
 | :--- | :---: | :---: |
