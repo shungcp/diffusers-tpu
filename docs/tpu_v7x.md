@@ -133,5 +133,18 @@ Workload / 测试负载：**Pika-H3-Flex 6-step text-to-video with audio (`t2va`
 | **Resident Serving (`--requests`, `1024×1024`, `--replicas 2`)** | — | — | **`2.50 s`/img** / `2.85 s`/img | **`1.52 s`/img** (`3.04 s` / batch of 2) | — | Two 4-device (`cfg=2 × tensor=2`) replicas overlapped |
 | **Resident Serving (`--requests`, `1024×1024`, `--replicas 4`)** | — | — | — | **`1.28 s`/img** / `1.46 s`/img | — | Four 2-device (`cfg=2 × tensor=1`) replicas (`5.12 s` / batch of 4) |
 
+---
 
+## 7. `torch_tpu` Warm-Start Persistence (`DT_AOT_PERSIST`) on `v7x-8` / 跨进程编译产物持久化与压缩
 
+Measured on `v7x-8` (`torch_tpu 0.2.0`, `libtpu 0.0.52`, fresh OS processes with `/dev/shm/torch_tpu_cache` wiped between runs) using `b9a487b` (`DT_FIXED_TSLOTS=1` + pure-torch Pallas `register_fake`) and `DT_AOT_PERSIST=<dir>` (`0c9d592`, `3dcddf3`, `d6a4afa`), where `aot_compile` + `save_compiled_function` / `load_compiled_function` skips TorchDynamo and AOTAutograd tracing entirely:
+
+| Workload (`v7x-8`, 8 ranks, `DT_SPMD_SAFE=1`) | Cold Compile + Save (`run 0` / `run 1`) | Warm Tier-3 Only (`DT_AOT_PERSIST=OFF`, `run 0` / `run 1`) | **Warm Saved Programs (`DT_AOT_PERSIST=ON`, `run 0` / `run 1`)** | Cross-Process Pixel Check |
+| :--- | :---: | :---: | :---: | :---: |
+| **`MiniMax-H3` Pika `t2va` (`480×832×121`, 6 steps)** | `35.4 s` / `6.0 s` | `17.0 s` / `4.7 s` | **`6.1 s` / `4.7 s`** (`-10.9 s` / **`2.79×`** faster `run 0`) | **`max\|d\| = 0`** (`sha_eq = True`) |
+| **`MiniMax-H3-Image` `2048×2048` (6 steps)** | `40.4 s` / `0.614 s` | `14.6 s` (`denoise 6.69 s`) / `0.613 s` | **`6.74 s`** (`denoise` **`1.29 s`**, **`5.2×`** faster) / `0.610 s` | **`max\|d\| = 0`** (`exact = True`) |
+| **`MiniMax-H3-Image` `4736×3552` (6 steps)** | `36.7 s` / `2.365 s` | `27.1 s` (`denoise 8.17 s`) / `2.337 s` | **`18.9 s`** (`denoise` **`2.98 s`**, `+0.77 s` vs `run 1`) / `2.344 s` | **`max\|d\| = 0`** (`exact = True`) |
+
+- **Storage & compression notes (`dedup_stats.py`)**:
+  - Sharing one `rank 0` archive across all 8 ranks (`3dcddf3`) cuts `DT_AOT_PERSIST` disk usage by **8×** immediately (`H3 t2va` `829.3 MiB -> 105.5 MiB`; `H3-Image 2K+4K` `2,645.7 MiB -> 330.7 MiB`).
+  - Because `save_compiled_function` embeds uncompressed PJRT executable bytes inside a Python pickle, plain `zstd -3` (4 MiB window) only achieves `~4.4×`, whereas **`zstd -3 --long=27`** (128 MiB window) compresses single rank-0 files by **`16×–25×`** (`330.7 MiB -> 13.4 MiB` on `H3-Image 2K+4K`) and **FastCDC `1 KiB` + `zstd --long=27`** compresses cross-shape archives down to **`9.76 MiB`** (`33.9×` on rank-0; `164.9×–329.5×` if per-rank copies were stored).
