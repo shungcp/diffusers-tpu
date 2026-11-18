@@ -149,3 +149,7 @@ ZFS dedup reaches the same size without deleting anything: the as-written cache 
 
 ZFS 去重不删文件也能达到同样体积:原样写入的缓存(6.58 GB,每图 8 份)在记录大小 16K 去重下占 1.68 GB(4.07 倍,去重表 9.85 万条,约 10–17 MB 内存;冷读 18.1 秒),去重 128K + zstd 占 0.51 GB(冷读 35.5 秒)。缓存放在 ZFS 上就不必手动删副本。手动删除依赖"任意一份都能给所有 rank 用",在测过的形状上成立,但不是 torch_tpu 承诺的行为。
 
+The two big programs are stored twice: tier-3's two >50 MB files are the same executables as the two big AOTAutograd entries (113.4 MB block-identical, shifted by 1,017 bytes, which is why block dedup misses them). Deleting those two tier-3 files keeps warm starts at 18.4–18.8 s with bit-identical output and they are not rewritten, so one shape needs 0.48 GB (0.25 AOTAutograd + 0.23 tier-3). No weights are baked in: in the dumped HLO of a 10-block program the 125 entry parameters include every weight shard (e.g. `bf16[896,5376]` x30) and all 282 constants are scalars; no 64-byte probe from the 1,262 checkpoint/adapter tensors occurs anywhere in the cache.
+
+两个大程序存了两遍:tier-3 里两个 >50 MB 的文件与 AOTAutograd 的两个大条目是同一份可执行文件(113.4 MB 逐块相同,错开 1017 字节,所以块去重找不到)。删掉这两个 tier-3 文件后暖启动 18.4–18.8 秒、输出逐位一致、不会被写回,一个形状只需 0.48 GB(AOTAutograd 0.25 + tier-3 0.23)。权重没有被烧进程序:10-block 程序导出的 HLO 里 125 个入口参数包含全部权重分片(如 `bf16[896,5376]` 30 个),282 个常量全是标量;1262 个权重/adapter 张量取的 64 字节探针在缓存里一个都没出现。
+
