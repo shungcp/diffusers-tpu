@@ -145,3 +145,7 @@ Once the per-rank copies are gone, block dedup finds almost nothing across shape
 
 去掉每 rank 副本后,块去重在不同形状之间几乎找不到重复(1.02–1.14 倍);zstd 省 3.4 倍,但这里读回慢约 4.7 倍。btrfs + duperemove 0.11.2 没有去掉任何重复,连只差 21 字节的两份也没有。
 
+ZFS dedup reaches the same size without deleting anything: the as-written cache (6.58 GB, 8 copies per graph) takes 1.68 GB with dedup at recordsize 16K (4.07x, 98.5k table entries, ~10–17 MB of RAM; cold read 18.1 s) and 0.51 GB with dedup 128K + zstd (cold read 35.5 s), so the copies need not be pruned by hand when the cache lives on ZFS. Pruning instead relies on any copy serving every rank, which held on the shapes tested but is not a documented torch_tpu guarantee.
+
+ZFS 去重不删文件也能达到同样体积:原样写入的缓存(6.58 GB,每图 8 份)在记录大小 16K 去重下占 1.68 GB(4.07 倍,去重表 9.85 万条,约 10–17 MB 内存;冷读 18.1 秒),去重 128K + zstd 占 0.51 GB(冷读 35.5 秒)。缓存放在 ZFS 上就不必手动删副本。手动删除依赖"任意一份都能给所有 rank 用",在测过的形状上成立,但不是 torch_tpu 承诺的行为。
+
