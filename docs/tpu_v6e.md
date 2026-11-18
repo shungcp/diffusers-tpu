@@ -120,3 +120,28 @@ Deleting all but one file in every `aotautograd/<key>/` directory keeps every ra
 
 `strip_and_compress` 让目录变小只是因为写入失败:加载时去掉元数据的可执行文件无法再序列化(`Cannot serialize a TpuExecutable whose compiler metadata was stripped at load time`),32 次 AOTAutograd 写入失败 26 次,进程内缓存写入失败 3756 次,每个进程编译次数从 45–94 涨到 404–461。这条路径不能用。另外两个参数对体积和速度都没有超出单次运行噪声(±0.5–1 秒)的影响。
 
+Three shapes in one cache (480x832x121, 480x832x175, 544x960x121; 2026-11-18) / 三个形状共用一个缓存目录:
+
+| Layout / 存法 | Size / 体积 | Notes / 说明 |
+| :--- | :---: | :---: |
+| As written (8 copies per graph) + tier-3 / 原样(每图 8 份) | 6.58 GB | — |
+| One file per graph + tier-3 / 每图 1 份 | 1.75 GB (0.69 + 1.05) | warm run 0 18–23 s, bit-identical / 逐位一致 |
+| One file per graph, no tier-3 / 每图 1 份、无 tier-3 | 0.69 GB | warm run 0 28.5–30.3 s (vs 20.7 s), rewrites 0.2 GB of tier-3 / 暖启动慢约 10 秒并回写 tier-3 |
+
+A fresh process that only loads the cache from disk produces frames bit-identical to the process that compiled them (Pallas attention included).
+
+只从磁盘加载缓存的新进程,输出与当场编译的进程逐位一致(含 Pallas 注意力)。
+
+Filesystem dedup on the one-file-per-graph cache of the three shapes (ZFS 2.2 on a loop device; all files read back with matching SHA-1) / 每图 1 份的三形状缓存上的文件系统去重:
+
+| Filesystem / 文件系统 | Size / 体积 | Cold read / 冷读 |
+| :--- | :---: | :---: |
+| ext4 | 1.75 GB | 5.9 s |
+| ZFS dedup, recordsize 4K / 16K / 128K | 1.68 / 1.65 / 1.76 GB | 12.8 / 7.0 / 6.5 s |
+| ZFS zstd | 0.51 GB | 27.7 s |
+| ZFS dedup 128K + zstd | 0.50 GB | 26.8 s |
+
+Once the per-rank copies are gone, block dedup finds almost nothing across shapes (1.02–1.14x); zstd saves 3.4x but read back about 4.7x slower here. btrfs + duperemove 0.11.2 deduplicated nothing, not even two copies of a graph that differ in 21 bytes.
+
+去掉每 rank 副本后,块去重在不同形状之间几乎找不到重复(1.02–1.14 倍);zstd 省 3.4 倍,但这里读回慢约 4.7 倍。btrfs + duperemove 0.11.2 没有去掉任何重复,连只差 21 字节的两份也没有。
+
