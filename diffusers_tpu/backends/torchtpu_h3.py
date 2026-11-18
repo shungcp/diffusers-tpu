@@ -1768,8 +1768,11 @@ def _shard_decode(vae, verbose=print):
         xs, xl, xo = vae._split_tiles(width, vae.tile_sample_min_width,
                                       vae.tile_sample_min_overlap_width)
         nrows = len(ys)
-        r0 = (part_idx * nrows) // ways
-        r1 = ((part_idx + 1) * nrows) // ways
+        # More parts than tile rows would hand part 0 nothing; ranks past
+        # the last part sit this chunk out.
+        ways = min(ways, nrows)
+        r0 = (part_idx * nrows) // ways if part_idx < ways else 0
+        r1 = ((part_idx + 1) * nrows) // ways if part_idx < ways else 0
         sub_rows = [
             [vae.decoder(vae.post_quant_conv(
                 zc[..., ys[r] // ratio:(ys[r] + yl[r]) // ratio,
