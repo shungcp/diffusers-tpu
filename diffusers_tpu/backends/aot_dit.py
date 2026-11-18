@@ -87,6 +87,42 @@ def _flat_group(modules, hidden_states, *rest, **kwargs):
   return hidden_states
 
 
+_SALT = None
+
+
+def _persist_salt():
+  """What else decides the program besides the shape key: torch / torch_tpu
+  versions, every `DT_*` setting, and the source of the modules that build
+  the block graph. A change to any of them gives new file names instead of
+  loading a stale program (the loaded function's guards check shapes, not
+  code)."""
+  global _SALT
+  if _SALT is None:
+    import hashlib
+    import importlib
+    import sys
+    h = hashlib.sha1()
+    h.update(torch.__version__.encode())
+    tt = sys.modules.get("torch_tpu")
+    h.update(str(getattr(tt, "__version__", "")).encode())
+    h.update(repr(sorted((k, v) for k, v in os.environ.items()
+                         if k.startswith("DT_") and k != "DT_AOT_PERSIST")).encode())
+    for name in ("diffusers.models.transformers.transformer_minimax_h3",
+                 "diffusers_tpu.backends.aot_dit",
+                 "diffusers_tpu.backends.ours_splash_tt",
+                 "diffusers_tpu.backends.segmented_mod_tt",
+                 "diffusers_tpu.backends.tp_h3",
+                 "diffusers_tpu.kernels.splash"):
+      try:
+        mod = sys.modules.get(name) or importlib.import_module(name)
+        with open(mod.__file__, "rb") as f:
+          h.update(f.read())
+      except Exception:  # noqa: BLE001
+        h.update(name.encode())
+    _SALT = h.hexdigest()
+  return _SALT
+
+
 class AotBlocks:
   """Compiles one transformer block, then runs all of them through it.
 
@@ -145,10 +181,23 @@ class AotBlocks:
   #: attention steps).
   KEY_EXTRA: list = []
 
-  def _build(self, block, args, kwargs):
+  def _build(self, block, args, kwargs, persist_path=None):
     for fn in self.PRE_TRACE:
       fn(args, kwargs)
     begin = time.perf_counter()
+    if persist_path and os.path.exists(persist_path):
+      # `DT_AOT_PERSIST`: a program saved by an earlier process. Loading it
+      # skips Dynamo tracing and AOTAutograd entirely; the executable itself
+      # still comes from torch_tpu's own caches.
+      try:
+        with open(persist_path, "rb") as f:
+          art = torch.compiler.load_compiled_function(f, f_globals=globals())
+        self._say(f"  [aot] loaded saved program in {time.perf_counter() - begin:.1f}s"
+                  f" ({os.path.basename(persist_path)})", flush=True)
+        return None, art
+      except Exception as exc:  # noqa: BLE001
+        self._say(f"  [aot] saved program unusable, recompiling: "
+                  f"{type(exc).__name__}: {' '.join(str(exc).split())[:200]}", flush=True)
     # Put the block's original `forward` back for the duration of the
     # compile. `install()` leaves a closure in the instance `__dict__`,
     # and `aot_compile` serialises its guards (`save=True`, hard-coded
@@ -194,7 +243,14 @@ class AotBlocks:
         # c630). A cache-loaded graph is not serializable, so `aot_compile`
         # cannot simply be given stable names (c631).
         art = (compiled.aot_compile(((block, *args), kwargs))
-               if _use_artifact() else None)
+               if (_use_artifact() or persist_path) else None)
+        if persist_path and art is not None:
+          try:
+            art.save_compiled_function(persist_path)
+            self._say(f"  [aot] saved program to {os.path.basename(persist_path)}", flush=True)
+          except Exception as exc:  # noqa: BLE001
+            self._say(f"  [aot] could not save program: {type(exc).__name__}: "
+                      f"{' '.join(str(exc).split())[:200]}", flush=True)
     finally:
       for m, fn in installed:
         if fn is not None:
@@ -225,7 +281,7 @@ class AotBlocks:
       if self._cache:
         self._say(f"  [aot] new shape, compiling program #{len(self._cache) + 1}",
                   flush=True)
-      hit = self._build(block, args, kwargs)
+      hit = self._build(block, args, kwargs, persist_path=self._persist_path(key))
       self._cache[key] = hit
     self._compiled, self._art = hit
     self._key = key
@@ -234,9 +290,22 @@ class AotBlocks:
     # frame cache, which is shared by all instances of the same function and
     # ignores KEY_EXTRA, so it can pick the dense program for a sparse step.
     # The artifact checks its own guards and raises on mismatch.
-    if _use_artifact() and self._art is not None:
+    if self._art is not None and (_use_artifact() or self._compiled is None
+                                  or os.environ.get("DT_AOT_PERSIST")):
       return self._art(block, *args, **kwargs)
     return self._compiled(block, *args, **kwargs)
+
+  def _persist_path(self, key):
+    """Where `DT_AOT_PERSIST=<dir>` keeps this program, one file per rank.
+    The name covers the shape key and group size only: clear the directory
+    when the model code or torch / torch_tpu versions change."""
+    root = os.environ.get("DT_AOT_PERSIST")
+    if not root:
+      return None
+    import hashlib
+    os.makedirs(root, exist_ok=True)
+    tag = hashlib.sha1(repr((key, self._group, _persist_salt())).encode()).hexdigest()[:16]
+    return os.path.join(root, f"prog_{tag}_rank{os.environ.get('RANK', '0')}.bin")
 
   def set_manager(self, manager):
     """Set the offload manager. When grouping, we stage weights ourselves:
