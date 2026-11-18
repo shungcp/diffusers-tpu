@@ -68,9 +68,10 @@ def _auto_env():
   # small host), and round to a whole GiB: the runtime requires page alignment.
   _premap = min(192, max(1, (_ram // 2 // _local) >> 30)) << 30
   os.environ.setdefault("TPU_PREMAPPED_BUFFER_SIZE", str(_premap))
-  # Disable AOTAutograd's disk cache: grouped-block graphs are large and the
-  # cache can grow to tens of GB, while `AotBlocks` already caches by shape
-  # within a process.
+  # Disable PyTorch's AOTAutograd disk cache: grouped-block graphs are large
+  # and `AotBlocks` already caches by shape within a process. torch_tpu keeps
+  # its own entries under `aotautograd/torchtpu_*`, which still hit across
+  # processes (c634 trace: 4 of 4); re-enabling this changes nothing (c672).
   os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
   os.environ.setdefault(
       "LIBTPU_INIT_ARGS",
@@ -329,6 +330,9 @@ def main():
   begin = time.perf_counter()
   pipe = _load_pipeline(args)
   print(f"host load {time.perf_counter() - begin:.1f}s", flush=True)
+  if os.environ.get("DT_FIXED_TSLOTS", "1") in ("1", "pad"):
+    from diffusers_tpu.backends import fixed_tslots
+    fixed_tslots.install()
 
   from diffusers_tpu.backends.tp_h3 import init_parallel, shard_transformer
 

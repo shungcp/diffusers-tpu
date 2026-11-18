@@ -41,6 +41,18 @@
 | **2026-11-10** (`91d89fe`) | Pipelined `/dev/shm` writes + 8-thread parallel gather + zero-copy `.numpy()` (`Opt-1`) + 8-rank tail-chunk spatial tile split (`Opt-3`) | **`47.4 s`** | **`44.5 s`** | **`78.0 s`** | **`identical=True`** (`max\|d\|=0`) |
 | **2026-11-11** (`1016192`) | Fused `residual + gate * x` in segmented modulation + BHSD-first `norm_q`/`norm_k`/RoPE | **`46.6 s`** | **`43.2 s`** | `78.0 s` (unchanged) | **`identical=True`** |
 
+Start-up (2026-11-18, Pika `t2va` 480x832x121 and `ref2va`, fresh process): two changes, both on by default.
+
+| Change / 改动 | `t2va` cold run 0 / 冷启动 | `t2va` warm run 0 / 暖启动 | `ref2va` cold / 冷启动 | DiT programs / 程序数 | Cache / 缓存 | Output / 输出 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| Before / 之前 | 69–71 s | 20–22 s | 106–114 s | 15 | 2.45 GB | — |
+| Plain-torch fake for the Pallas attention op (`DT_OURS_FAKE`) | −1.0 s | −0.5 s | — | — | — | bit-identical / 逐位一致 |
+| Fixed timestep slots by row role (`DT_FIXED_TSLOTS`) | **42–45 s** | **14–16 s** | **80–86 s** | **7** | **1.41 GB** | DINO 0.977 (padding alone: 0.969) |
+
+`jax_op`'s default fake kernel re-exports the Pallas kernel every time Dynamo traces a call. The first denoising step had one distinct timestep and later steps two, so the time embedding changed shape and torch_tpu compiled (and traced, in every new process) a second copy of each grouped DiT program; giving every row role its own slot keeps one program for all steps. The remaining warm-start gap to run 1 is Dynamo tracing of that program (~5.5 s; PyTorch's AOTAutograd cache flag makes no difference, torch_tpu's own cache already hits).
+
+`jax_op` 的默认 fake 每次 Dynamo 追踪都会把 Pallas kernel 重新导出一遍。第 1 步只有一个不同的时间步、之后两个,时间嵌入形状不同,torch_tpu 给每个分组 DiT 程序多编(新进程里也多追踪)一份;按行的角色固定槽位后,所有步共用一个程序。暖启动与 run 1 剩下的差距是追踪这个程序(约 5.5 秒;打开 PyTorch 的 AOTAutograd 缓存开关没有变化,torch_tpu 自己的缓存已命中)。
+
 > **Why `Opt-2` (`DT_RESIDENT_TEXT=1`) is disabled on `v6e-8`**:
 > Unlike `v7x-8` (95 GiB HBM per TensorCore device), each `v6e` chip has 32 GiB HBM. Keeping the `7.3 GiB` sharded Text Encoder resident alongside the `7.5 GiB` sharded DiT and VAE leaves insufficient HBM headroom for the `103,989`-token `768p` denoising activations, so `torchtpu_h3.py` enables `DT_RESIDENT_TEXT` automatically only on `v7x` (`TORCH_TPU_TOPOLOGY == "2,2,1,2"`).
 
