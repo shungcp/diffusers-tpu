@@ -244,7 +244,9 @@ class AotBlocks:
         # cannot simply be given stable names (c631).
         art = (compiled.aot_compile(((block, *args), kwargs))
                if (_use_artifact() or persist_path) else None)
-        if persist_path and art is not None:
+        if persist_path and art is not None and os.environ.get("RANK", "0") == "0":
+          # One copy for all ranks: the per-rank files differ only in a few
+          # bytes and any of them serves every rank (bit-identical, c680).
           try:
             art.save_compiled_function(persist_path)
             self._say(f"  [aot] saved program to {os.path.basename(persist_path)}", flush=True)
@@ -296,16 +298,16 @@ class AotBlocks:
     return self._compiled(block, *args, **kwargs)
 
   def _persist_path(self, key):
-    """Where `DT_AOT_PERSIST=<dir>` keeps this program, one file per rank.
-    The name covers the shape key and group size only: clear the directory
-    when the model code or torch / torch_tpu versions change."""
+    """Where `DT_AOT_PERSIST=<dir>` keeps this program: one file shared by
+    all ranks, written by rank 0. The name hashes the shape key, the group
+    size and `_persist_salt()`."""
     root = os.environ.get("DT_AOT_PERSIST")
     if not root:
       return None
     import hashlib
     os.makedirs(root, exist_ok=True)
     tag = hashlib.sha1(repr((key, self._group, _persist_salt())).encode()).hexdigest()[:16]
-    return os.path.join(root, f"prog_{tag}_rank{os.environ.get('RANK', '0')}.bin")
+    return os.path.join(root, f"prog_{tag}.bin")
 
   def set_manager(self, manager):
     """Set the offload manager. When grouping, we stage weights ourselves:
