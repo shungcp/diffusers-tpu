@@ -17,6 +17,9 @@ export TORCH_TPU_SLICEBUILDER_ADDRESSES=$(for j in 0 1 2 3 4 5 6 7; do printf "l
 unset TORCH_DEVICE_BACKEND_AUTOLOAD
 export PYTHONPATH=$R/compat/torchvision_stub${PYTHONPATH:+:$PYTHONPATH}
 export DT_SPMD_SAFE=1 DT_OURS_BQ=2048 DT_OURS_BKV=4096
+# Save compiled DiT programs and load them in later processes, skipping Dynamo (v7x-8 2048x2048
+# warm first run 14.6 -> 6.7 s, bit-identical). DT_AOT_PERSIST= (empty) turns it off.
+export DT_AOT_PERSIST=${DT_AOT_PERSIST-$HOME/.cache/diffusers_tpu/aot_programs}
 exec "${PYTHON:-python}" -m torch.distributed.run --nproc_per_node 8 --master_port $((BASE + 10)) \
   -m diffusers_tpu.backends.torchtpu_h3_image \
   --steps 6 --seed 42 --aot-group 10 --aot-vae-group 12 \
