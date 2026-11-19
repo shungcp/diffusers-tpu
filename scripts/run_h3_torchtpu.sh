@@ -35,6 +35,11 @@ export TORCH_TPU_SLICEBUILDER_ADDRESSES=$(for j in 0 1 2 3 4 5 6 7; do printf "l
 # torch_tpu environments usually lack torchvision; diffusers only needs a few names from it.
 export PYTHONPATH=$R/compat/torchvision_stub${PYTHONPATH:+:$PYTHONPATH}
 export DT_SPMD_SAFE=1 DT_DECODE_SHM=1 DT_OURS_BQ=2048 DT_OURS_BKV=4096
+# Save each compiled DiT program and load it in later processes, skipping Dynamo: a fresh
+# process's first request runs at steady-state speed (Pika 480p t2va warm run 0 20 -> 8-9 s).
+# One file per program for all ranks; names hash shapes, versions, DT_* settings and sources.
+# DT_AOT_PERSIST= (empty) turns it off.
+export DT_AOT_PERSIST=${DT_AOT_PERSIST-$HOME/.cache/diffusers_tpu/aot_programs}
 # Lossy runs compile a dense and a sparse DiT; call each compiled artifact directly so they do not
 # share one Dynamo frame cache. Lossless runs do not need it (and are ~2 s faster without).
 case " $* " in *" --sparse-window "*) export DT_AOT_CALL_ART=1 ;; esac
