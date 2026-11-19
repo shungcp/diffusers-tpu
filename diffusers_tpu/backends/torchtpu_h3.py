@@ -333,6 +333,9 @@ def main():
   if os.environ.get("DT_FIXED_TSLOTS", "1") in ("1", "pad"):
     from diffusers_tpu.backends import fixed_tslots
     fixed_tslots.install()
+  from diffusers_tpu.backends import vl_host_meta
+  if vl_host_meta.install():
+    print("  [vl-host-meta] Qwen3-VL index metadata computed on host", flush=True)
 
   from diffusers_tpu.backends.tp_h3 import init_parallel, shard_transformer
 
