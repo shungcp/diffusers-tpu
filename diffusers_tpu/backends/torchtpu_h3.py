@@ -723,6 +723,9 @@ def main():
       # Remainder = request time minus the timed phases (mostly denoise).
       print(f"  [phases] {bits}  denoise/other {took - named:.1f}s", flush=True)
       _STAGE.clear()
+      steps = _report_steps()
+      if steps:
+        print(f"  [steps] {steps}", flush=True)
     if prof_ctx is not None and run == args.runs - 1:
       prof_ctx.__exit__(None, None, None)
       print(f"  [profile] written to {args.profile}", flush=True)
@@ -885,11 +888,75 @@ def _install_phase_clocks(pipe, verbose=print):
   vae = getattr(pipe, "vae", None)
   if vae is not None:
     _clock("vae_decode", vae, "decode")
+    if hasattr(vae, "encode"):
+      _clock("vae_encode", vae, "encode")
+  if os.environ.get("DT_STEP_CLOCK") == "1":
+    _install_step_clock(pipe)
   # The DiT forward is not wrapped: some callers invoke it as an unbound
   # function, bypassing instance attributes. Denoise time is the remainder.
   verbose("  [phases] wall clocks installed: text_encoder / vae_decode (rest counted as denoise)",
           flush=True)
 
+
+
+_STEPS: list = []
+
+
+def _install_step_clock(pipe, verbose=print):
+  """`DT_STEP_CLOCK=1` (with --phases): time each denoising step.
+
+  Synchronizes the chip at every scheduler step, so step k is the time from
+  the previous scheduler step (or, for step 0, from the end of the last
+  timed phase before the loop) to this one: the DiT call(s) of that step.
+  Adds a sync per step; diagnosis only.
+  """
+  import torch
+
+  sch = getattr(pipe, "scheduler", None)
+  if sch is None:
+    return
+  inner = sch.step
+
+  def step(*a, **k):
+    torch.accelerator.synchronize()
+    _STEPS.append(time.perf_counter())
+    return inner(*a, **k)
+
+  sch.step = step
+  # Mark where the loop starts: the last call into the text encoder / VAE
+  # encode before step 0 ends there.
+  enc = getattr(pipe, "text_encoder", None)
+  for label, owner, attr in (("text", getattr(enc, "model", enc), "forward"),
+                             ("enc", getattr(pipe, "vae", None), "encode")):
+    if owner is None or not hasattr(owner, attr):
+      continue
+    f = getattr(owner, attr)
+
+    def wrapped(*a, _f=f, **k):
+      out = _f(*a, **k)
+      torch.accelerator.synchronize()
+      _STEPS.append(("mark", time.perf_counter()))
+      return out
+
+    setattr(owner, attr, wrapped)
+  verbose("  [steps] per-step clock installed (syncs every scheduler step)", flush=True)
+
+
+def _report_steps():
+  if not _STEPS:
+    return ""
+  marks = [t for t in _STEPS if isinstance(t, tuple)]
+  steps = [t for t in _STEPS if not isinstance(t, tuple)]
+  out = []
+  if steps:
+    start = max((m[1] for m in marks if m[1] < steps[0]), default=None)
+    prev = start
+    for i, t in enumerate(steps):
+      if prev is not None:
+        out.append(f"step{i} {t - prev:.2f}s")
+      prev = t
+  _STEPS.clear()
+  return " ".join(out)
 
 
 def _free_text_after_encode(pipe, verbose=print):
