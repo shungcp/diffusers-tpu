@@ -147,6 +147,12 @@ class LayerwiseOffloadManager:
     self._resident: dict[int, list[torch.Tensor]] = {}
     # Blocks [0, pinned) stay on the chip for the whole request.
     self.pinned: int = 0
+    #: (rank, world, process group) to stream a 1/world row slice per rank
+    #: and all-gather it, or None to stream whole tensors (set before
+    #: `offload_all_layers`).
+    self.gather = None
+    #: (layer index, slot) -> full shape of the tensors streamed as slices.
+    self._gathered: dict = {}
     self._device: torch.device | None = None
 
   # -- layer access ---------------------------------------------------------
@@ -234,6 +240,20 @@ class LayerwiseOffloadManager:
               b = hist[name]
               b[0] += 1; b[1] += nbytes; b[2] += t1 - t0
               break
+        full_shape = None
+        g = self.gather
+        if (g is not None and staged.dim() >= 1 and staged.shape[0] % g[1] == 0
+            and staged.numel() * staged.element_size() >= (1 << 20)):
+          # `gather` (rank, world, group): keep only this rank's 1/world of
+          # rows on the host; `prefetch_layer` uploads it and all-gathers
+          # the full tensor over ICI (c779: 208.6 -> 24.4 ms a 0.9 GiB layer
+          # on 8 ranks, since every rank no longer pulls the whole layer
+          # through the shared host link). The gathered tensor is the
+          # original, so outputs are unchanged.
+          r, w, _ = g
+          n = staged.shape[0] // w
+          full_shape = torch.Size(staged.shape)
+          staged = staged[r * n:(r + 1) * n].contiguous()
         shape = tuple(staged.shape)
         host = torch.empty(
             tiled_numel(shape, staged.dtype),
@@ -246,6 +266,8 @@ class LayerwiseOffloadManager:
         if timing:
           t3 = time.perf_counter(); t_d2h += t3 - t2
         copies.append((module, attr, host, torch.Size(shape), is_param))
+        if full_shape is not None:
+          self._gathered[(idx, len(copies) - 1)] = full_shape
         total_bytes += host.numel() * host.element_size()
         del staged
         self._put(module, attr,
@@ -346,6 +368,17 @@ class LayerwiseOffloadManager:
               f"{self._pf_tensors / self._pf_calls:.1f} tensors, "
               f"avg {self._pf_bytes / self._pf_batches / 2**20:.1f} MiB/batch",
               flush=True)
+    if self._gathered:
+      import torch.distributed as dist
+      group = self.gather[2]
+      for j in range(len(device_tensors)):
+        full_shape = self._gathered.get((layer_idx, j))
+        if full_shape is None:
+          continue
+        full = torch.empty(full_shape, dtype=device_tensors[j].dtype,
+                           device=self._device)
+        dist.all_gather_into_tensor(full, device_tensors[j], group=group)
+        device_tensors[j] = full
     for (module, attr, host, _, is_param), staged in zip(copies, device_tensors):
       self._put(module, attr, staged, is_param)
     self._resident[layer_idx] = device_tensors

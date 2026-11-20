@@ -1345,6 +1345,18 @@ def _stream_text_encoder(pipe, args):
           encoder, layers_attr_str=attr, num_layers=len(node),
           enabled=True, prefetch_size=args.prefetch,
       )
+      # c780: text stage 6.0 -> 4.7 s, ref2va 16.7 -> 15.1 s a request,
+      # bit-identical; each rank also keeps 1/world of the layers on the host.
+      if (os.environ.get("DT_TEXT_GATHER", "1") == "1"
+          and int(os.environ.get("WORLD_SIZE", "1")) > 1
+          and not getattr(args, "shard_text", False)):
+        # Every rank streams the same layers: pull 1/world of each from the
+        # host and all-gather the rest over ICI.
+        from diffusers_tpu.backends.tp_h3 import init_parallel
+        _r, _w, _ = init_parallel()
+        manager.gather = (_r, _w, init_parallel.device_group)
+        print(f"  [text-gather] streaming 1/{_w} of each text layer per rank, "
+              f"all-gathered over ICI", flush=True)
       manager.offload_all_layers(stage_from_host=True)
       manager.register_forward_hooks()
     _move_non_block_modules(encoder, torch.device("tpu"), blocks_attr=attr)

@@ -143,6 +143,7 @@ def init_parallel():
   device_group = dist.new_group(list(range(world)), backend="tpu_dist")
   group_name = device_group.group_name
   init_parallel.group_name = group_name
+  init_parallel.device_group = device_group
 
   def _all_reduce(input_: torch.Tensor) -> torch.Tensor:
     if torch.compiler.is_compiling():

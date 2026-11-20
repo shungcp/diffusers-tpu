@@ -118,7 +118,7 @@ def _persist_salt():
       pass
     h.update(os.environ.get("WORLD_SIZE", "1").encode())
     h.update(repr(sorted((k, v) for k, v in os.environ.items()
-                         if k.startswith("DT_") and k not in ("DT_AOT_PERSIST", "DT_VL_HOST_META", "DT_DIT_PRECOMPILE", "DT_DIT_PRECOMPILE_START", "DT_REF_CACHE", "DT_TEXT_CACHE"))).encode())
+                         if k.startswith("DT_") and k not in ("DT_AOT_PERSIST", "DT_VL_HOST_META", "DT_DIT_PRECOMPILE", "DT_DIT_PRECOMPILE_START", "DT_REF_CACHE", "DT_TEXT_CACHE", "DT_TEXT_GATHER"))).encode())
     for name in ("diffusers.models.transformers.transformer_minimax_h3",
                  "diffusers_tpu.backends.aot_dit",
                  "diffusers_tpu.backends.ours_splash_tt",
