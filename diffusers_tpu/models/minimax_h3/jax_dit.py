@@ -371,6 +371,14 @@ def _build_modules():
         # `kv_len` -- one program for every length in the bucket.
         keep = (jnp.arange(x.shape[1]) < true_len)[None, :, None, None]
         k, v = jnp.where(keep, k, 0), jnp.where(keep, v, 0)
+        # Zero the padded queries too. Their outputs are never read, but the
+        # kernel's per-head fixed-m eligibility is computed over the whole Q,
+        # so their content could switch a head between the fixed-m and online
+        # softmax and change real rows at rounding level (c757: 2-5e-4;
+        # c754: padded-row content changed the video). Zero rows cannot raise
+        # the bound, so real rows no longer depend on the pad content.
+        if os.environ.get("DT_PAD_Q_ZERO", "1") == "1":
+          q = jnp.where(keep, q, 0)
       elif true_len is not None and true_len != x.shape[1]:
         # The padded rows are keys to nobody. Queries stay padded: the
         # kernel pads the query axis itself anyway and those output rows

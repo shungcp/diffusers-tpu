@@ -576,6 +576,16 @@ class Server:
             enc, jnp.asarray(ids), jnp.asarray(cos, self.dtype),
             jnp.asarray(sin, self.dtype)))[:, :n_real]
         tags, extra = np.ones(n_real, np.int64), None
+    if os.environ.get("DT_EMB_NOISE"):
+      # Diagnosis only: multiply the text embedding by (1 + eps * N(0,1)) to
+      # measure how far a tiny, semantics-free perturbation moves the video
+      # (control for the text-bucket comparison, c720/c721).
+      eps = float(os.environ["DT_EMB_NOISE"])
+      key = jax.random.PRNGKey(int(os.environ.get("DT_EMB_NOISE_SEED", "0")))
+      jnp = self.jnp
+      e32 = emb.astype(jnp.float32)
+      emb = (e32 * (1 + eps * jax.random.normal(key, e32.shape))).astype(emb.dtype)
+      print(f"  [emb-noise] eps={eps} seed={os.environ.get('DT_EMB_NOISE_SEED', '0')}", flush=True)
     del enc
     if parked:
       t_back = time.perf_counter()
@@ -872,8 +882,13 @@ class Server:
     seq_len_arg, text_len_arg = None, None
     if bucket:
       if extra:
-        emb = jnp.concatenate(
-            [emb, jnp.zeros((1, extra, emb.shape[2]), emb.dtype)], axis=1)
+        fill = jnp.zeros((1, extra, emb.shape[2]), emb.dtype)
+        if os.environ.get("DT_PAD_ROW_FILL") == "randn":
+          # Diagnosis only: if the pad rows are truly masked, their content
+          # cannot reach the real rows and the output must be bit-identical.
+          fill = (3.0 * self.jax.random.normal(self.jax.random.PRNGKey(7), fill.shape)).astype(emb.dtype)
+          print(f"  [pad-fill] {extra} text pad rows filled with randn*3", flush=True)
+        emb = jnp.concatenate([emb, fill], axis=1)
         position_ids = jnp.concatenate(
             [position_ids, jnp.repeat(position_ids[-1:], extra, axis=0)])
         token_tags = jnp.concatenate([token_tags, jnp.ones((extra,), jnp.int32)])
