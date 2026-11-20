@@ -1032,7 +1032,43 @@ def _free_text_after_encode(pipe, verbose=print):
     parked_obj.clear()
     return n
 
+  # Keep the conditioning of the last `DT_TEXT_CACHE` (default 8, 0 = off)
+  # presentations, keyed by token ids, vision inputs, layer and dtype. A
+  # repeat (same prompt and reference, e.g. a new seed) skips the text
+  # encoder; the embedding is the same tensor, so the output is identical.
+  import collections
+  import hashlib
+  tcache_n = int(os.environ.get("DT_TEXT_CACHE", "8") or 0)
+  tcache: "collections.OrderedDict" = collections.OrderedDict()
+
+  def _tkey(a, k):
+    ids = k.get("token_ids", a[2] if len(a) > 2 else None)
+    vis = k.get("vision_inputs", a[3] if len(a) > 3 else None)
+    h = hashlib.sha1(repr((list(ids) if ids is not None else None,
+                           k.get("text_encoder_layer", a[4] if len(a) > 4 else None),
+                           str(k.get("dtype", a[6] if len(a) > 6 else None)))).encode())
+    for name, v in sorted((vis or {}).items()):
+      h.update(name.encode())
+      if isinstance(v, torch.Tensor):
+        h.update(repr((tuple(v.shape), str(v.dtype))).encode())
+        h.update(v.detach().cpu().contiguous().view(-1).view(torch.uint8).numpy().tobytes())
+      else:
+        h.update(repr(v).encode())
+    return h.hexdigest()
+
   def encode(*a, **k):
+    key = _tkey(a, k) if tcache_n > 0 else None
+    if key is not None and key in tcache:
+      tcache.move_to_end(key)
+      return tcache[key].to(torch.device("tpu", 0))
+    out = _encode_uncached(*a, **k)
+    if key is not None:
+      tcache[key] = out.detach().to("cpu")
+      while len(tcache) > tcache_n:
+        tcache.popitem(last=False)
+    return out
+
+  def _encode_uncached(*a, **k):
     dev = torch.device("tpu", 0)
     if parked:
       verbose(f"  [free-text] restored {_restore(dev)} tensors before encode "
