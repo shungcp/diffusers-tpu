@@ -1397,8 +1397,35 @@ def _fix_reference_encode():
 
   original = enc.encode_vae_condition
 
+  # Keep the encoded latents of the last `DT_REF_CACHE` (default 8, 0 = off)
+  # reference images, keyed by their pixels, normalisation and seed. A
+  # repeated reference skips the VAE encode and both VAE moves; the latents
+  # are the same tensor, so the output is bit-identical (c767: ref2va with a
+  # repeated reference 22.2 -> 16.4 s a request).
+  import collections
+  import hashlib
+  cache_n = int(os.environ.get("DT_REF_CACHE", "8") or 0)
+  cache: "collections.OrderedDict" = collections.OrderedDict()
+
   def encode_vae_condition(vae, pixels, pixel_mean, pixel_std,
                            encode_seed=42):
+    key = None
+    if cache_n > 0:
+      h = hashlib.sha1(pixels.detach().cpu().contiguous().numpy().tobytes())
+      h.update(repr((tuple(pixels.shape), str(pixels.dtype), repr(pixel_mean),
+                     repr(pixel_std), encode_seed)).encode())
+      key = h.hexdigest()
+      if key in cache:
+        cache.move_to_end(key)
+        return cache[key].clone()
+    out = _encode(vae, pixels, pixel_mean, pixel_std, encode_seed)
+    if key is not None:
+      cache[key] = out.clone()
+      while len(cache) > cache_n:
+        cache.popitem(last=False)
+    return out
+
+  def _encode(vae, pixels, pixel_mean, pixel_std, encode_seed):
     cpu = torch.device("cpu")
     latents_mean = torch.tensor(
         vae.config.latents_mean, device=cpu).view(1, -1, 1, 1, 1)

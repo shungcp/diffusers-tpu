@@ -53,7 +53,7 @@ Start-up (2026-11-18, Pika `t2va` 480x832x121 and `ref2va`, fresh process): two 
 
 `jax_op` 的默认 fake 每次 Dynamo 追踪都会把 Pallas kernel 重新导出一遍。第 1 步只有一个不同的时间步、之后两个,时间嵌入形状不同,torch_tpu 给每个分组 DiT 程序多编(新进程里也多追踪)一份;按行的角色固定槽位后,所有步共用一个程序。暖启动与 run 1 剩下的差距是追踪这个程序(约 5.5 秒;打开 PyTorch 的 AOTAutograd 缓存开关没有变化,torch_tpu 自己的缓存已命中)。
 
-Saving the compiled programs (`DT_AOT_PERSIST=<dir>`, off by default): the first process writes each grouped program with `aot_compile` + `save_compiled_function`; later processes load it with `torch.compiler.load_compiled_function`, skipping Dynamo and AOTAutograd. File names hash the shape, torch / torch_tpu versions, every `DT_*` setting and the sources that build the block graph, so a change writes new files instead of loading a stale program.
+Saving the compiled programs (`DT_AOT_PERSIST=<dir>`, off by default): the first process writes each grouped program with `aot_compile` + `save_compiled_function`; later processes load it with `torch.compiler.load_compiled_function`, skipping Dynamo and AOTAutograd. File names hash the shape, torch / torch_tpu versions, every `DT_*` setting, `XLA_FLAGS` / `LIBTPU_INIT_ARGS` and every source under `diffusers_tpu/backends` and `diffusers_tpu/kernels`, so a change writes new files instead of loading a stale program. A narrower hash once reused a stale DiT program whose output differed from a fresh compile (c770–c772); after upgrading anything else (diffusers, torch_tpu internals), clear the directory.
 
 | Fresh process / 新进程 | run 0 | run 1 | Output / 输出 |
 | :--- | :---: | :---: | :---: |
@@ -63,7 +63,7 @@ Saving the compiled programs (`DT_AOT_PERSIST=<dir>`, off by default): the first
 
 Rank 0 writes one copy that every rank loads (the per-rank copies differed only in a few bytes). With saved programs the AOTAutograd entries (`TORCHINDUCTOR_CACHE_DIR`) and tier-3's large files are no longer read, so one shape needs only the program files plus tier-3's small files: `t2va` 0.14 + 0.23 = 0.37 GB, `ref2va` 0.12 + 0.43 = 0.54 GB (was 2.45 GB), warm run 0 unchanged and output bit-identical (c681).
 
-把编好的程序存盘(`DT_AOT_PERSIST=<目录>`,默认关):第一个进程用 `aot_compile` + `save_compiled_function` 写下每个分组程序,之后的进程用 `torch.compiler.load_compiled_function` 读回,跳过 Dynamo 和 AOTAutograd。文件名包含形状、torch / torch_tpu 版本、全部 `DT_*` 设置和构建图的源码的哈希,任一变化都会写新文件,不会读到旧程序。rank 0 写一份、所有 rank 共用(各 rank 的副本只差几个字节)。有了存档就不再读 AOTAutograd 条目和 tier-3 的大文件,一个形状只需存档加 tier-3 小文件:`t2va` 0.14 + 0.23 = 0.37 GB,`ref2va` 0.12 + 0.43 = 0.54 GB(原来 2.45 GB),暖启动 run 0 不变、输出逐位一致(c681)。
+把编好的程序存盘(`DT_AOT_PERSIST=<目录>`,默认关):第一个进程用 `aot_compile` + `save_compiled_function` 写下每个分组程序,之后的进程用 `torch.compiler.load_compiled_function` 读回,跳过 Dynamo 和 AOTAutograd。文件名包含形状、torch / torch_tpu 版本、全部 `DT_*` 设置、`XLA_FLAGS` / `LIBTPU_INIT_ARGS` 以及 `diffusers_tpu/backends`、`diffusers_tpu/kernels` 下全部源码的哈希,任一变化都会写新文件,不会读到旧程序。早先哈希范围较窄时,曾复用到一份输出与现编不同的旧 DiT 程序(c770–c772);升级其他依赖(diffusers、torch_tpu 内部)后请清空该目录。rank 0 写一份、所有 rank 共用(各 rank 的副本只差几个字节)。有了存档就不再读 AOTAutograd 条目和 tier-3 的大文件,一个形状只需存档加 tier-3 小文件:`t2va` 0.14 + 0.23 = 0.37 GB,`ref2va` 0.12 + 0.43 = 0.54 GB(原来 2.45 GB),暖启动 run 0 不变、输出逐位一致(c681)。
 
 > **Why `Opt-2` (`DT_RESIDENT_TEXT=1`) is disabled on `v6e-8`**:
 > Unlike `v7x-8` (95 GiB HBM per TensorCore device), each `v6e` chip has 32 GiB HBM. Keeping the `7.3 GiB` sharded Text Encoder resident alongside the `7.5 GiB` sharded DiT and VAE leaves insufficient HBM headroom for the `103,989`-token `768p` denoising activations, so `torchtpu_h3.py` enables `DT_RESIDENT_TEXT` automatically only on `v7x` (`TORCH_TPU_TOPOLOGY == "2,2,1,2"`).

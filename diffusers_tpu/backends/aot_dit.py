@@ -134,6 +134,19 @@ def _persist_salt():
           h.update(f.read())
       except Exception:  # noqa: BLE001
         h.update(name.encode())
+    # Compiler flags change the program too, and so may any backend module
+    # (c770-c772: a DiT program saved in the morning gave different output
+    # than a fresh compile under the same key; which change it missed is not
+    # known). Hash every backend/kernel source and the flags, so editing
+    # any of them recompiles instead of reusing a stale program.
+    for var in ("XLA_FLAGS", "LIBTPU_INIT_ARGS"):
+      h.update(f"{var}={os.environ.get(var, '')}".encode())
+    import glob
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in sorted(glob.glob(os.path.join(here, "*.py"))
+                       + glob.glob(os.path.join(here, "..", "kernels", "*.py"))):
+      with open(path, "rb") as f:
+        h.update(f.read())
     _SALT = h.hexdigest()
   return _SALT
 
