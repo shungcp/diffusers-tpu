@@ -1006,6 +1006,8 @@ def _free_text_after_encode(pipe, verbose=print):
   tied = {"park": 0, "restore": 0, "empty": 0}
   #: Host copies indexed by `gid`; each `parked` entry records its slot's gid.
   parked_obj: list = []
+  keep_host = os.environ.get("DT_FREE_TEXT_KEEP_HOST", "1") == "1"
+  host_copy: dict = {}
 
   def _key(t):
     s = t.untyped_storage()
@@ -1058,9 +1060,18 @@ def _free_text_after_encode(pipe, verbose=print):
             gid = seen[k]
             setattr(mod, attr, parked_obj[gid])
           else:
-            moved = t.detach().to("cpu")
-            if is_param:
-              moved = torch.nn.Parameter(moved, requires_grad=False)
+            # The weights never change, so reuse the host copy made at the
+            # first park instead of copying device->host after every encode
+            # (park 1.0-1.4 -> 0.01 s, ref2va 23.5 -> 21.5 s, bit-identical,
+            # c753). `DT_FREE_TEXT_KEEP_HOST=0` copies every time as before.
+            hk = (id(mod), attr)
+            moved = host_copy.get(hk) if keep_host else None
+            if moved is None:
+              moved = t.detach().to("cpu")
+              if is_param:
+                moved = torch.nn.Parameter(moved, requires_grad=False)
+              if keep_host:
+                host_copy[hk] = moved
             gid = len(parked_obj)
             seen[k] = gid
             parked_obj.append(moved)
