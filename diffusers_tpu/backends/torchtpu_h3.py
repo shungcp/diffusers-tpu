@@ -1441,6 +1441,35 @@ def _vae_on_demand(pipe, verbose=print):
 
   host = torch.device("cpu")
   move(vae, host)          # start on the host
+  if os.environ.get("DT_VAE_KEEP_HOST", "1") == "1":
+    # The weights never change, so keep the host copy: going down just puts
+    # the host tensors back instead of copying 9.7 GiB device->host (~2 s per
+    # encode/decode, c747). Going up is unchanged. Bit-identical (c749).
+    # Pinning that copy and uploading via `_stage_h2d` made each upload 2-3x
+    # faster but the request ~14 s slower elsewhere (c747/c749): not done.
+    keep = {}
+    for sub in vae.modules():
+      for attr, t in list(sub.named_parameters(recurse=False)):
+        keep[(id(sub), attr, True)] = t.detach()
+      for attr, t in list(sub.named_buffers(recurse=False)):
+        if t is not None:
+          keep[(id(sub), attr, False)] = t.detach()
+
+    def move(mod, dev):  # noqa: F811
+      n = 0
+      for sub in mod.modules():
+        for attr, t in list(sub.named_parameters(recurse=False)):
+          if t.device != dev:
+            src = keep[(id(sub), attr, True)]
+            sub._parameters[attr] = torch.nn.Parameter(
+                src if dev.type == "cpu" else src.to(dev), requires_grad=False)
+            n += 1
+        for attr, t in list(sub.named_buffers(recurse=False)):
+          if t is not None and t.device != dev:
+            src = keep[(id(sub), attr, False)]
+            sub._buffers[attr] = src if dev.type == "cpu" else src.to(dev)
+            n += 1
+      return n
   verbose("  [vae-on-demand] VAE parked on the host (9.70GiB)", flush=True)
 
   # Wrap both entry points: ref2va also calls `vae.encode` for the
@@ -1454,16 +1483,23 @@ def _vae_on_demand(pipe, verbose=print):
       dev = getattr(z, "device", None) or torch.device("tpu")
       if dev.type == "cpu":
         dev = torch.device("tpu", 0)
+      t0 = time.perf_counter()
       up = move(vae, dev)
+      if os.environ.get("DT_VAE_MOVE_TIMING") == "1":
+        torch.accelerator.synchronize()
+      t_up = time.perf_counter() - t0
       if up and said["up"] < 2:
         said["up"] += 1
-        verbose(f"  [vae-on-demand] before {name}: moved {up} tensors to chip", flush=True)
+        verbose(f"  [vae-on-demand] before {name}: moved {up} tensors to chip"
+                f" in {t_up:.2f}s", flush=True)
       try:
         return inner(z, *a, **k)
       finally:
+        t0 = time.perf_counter()
         down = move(vae, host)
-        if down and said["up"] <= 2:
-          verbose(f"  [vae-on-demand] after {name}: moved {down} back to host", flush=True)
+        if down and (said["up"] <= 2 or os.environ.get("DT_VAE_MOVE_TIMING") == "1"):
+          verbose(f"  [vae-on-demand] after {name}: moved {down} back to host"
+                  f" in {time.perf_counter() - t0:.2f}s", flush=True)
 
     setattr(vae, name, staged)
 
