@@ -89,6 +89,10 @@ def parse_args():
   p.add_argument("--workflow", choices=("t2va", "ref2va"), default="t2va")
   p.add_argument("--reference", default=None, help="ref2va's condition image")
   p.add_argument("--prompt", default="a red fox trotting through snow")
+  p.add_argument("--prompts", default="",
+                 help="'||'-separated prompts, one per run (cycled); "
+                      "overrides --prompt. Serves several prompts in one "
+                      "process, e.g. to measure a new prompt length warm.")
   p.add_argument("--num-frames", type=int, default=362)
   p.add_argument("--max-duration", type=int, default=16)
   p.add_argument("--height", type=int, default=480)
@@ -401,6 +405,10 @@ def main():
                      group=args.aot_group).install()
     print(f"DiT: {len(blocks)} blocks via aot_compile, "
           f"compiled once and reused (dynamic={args.aot_dynamic})", flush=True)
+    _enc = getattr(getattr(pipe, "text_encoder", None), "model", None)
+    if _enc is not None:
+      from diffusers_tpu.backends import dit_precompile
+      dit_precompile.install(_aot, _enc, transformer)
 
   if args.compile_dit:
     # Note: torch_tpu's `mark_embedded_constants` pass turns a compiled
@@ -694,7 +702,10 @@ def main():
         on_trace_ready=tt_prof.xprof_trace_handler(dir_name=args.profile),
     )
 
+  _prompts = [x.strip() for x in args.prompts.split("||") if x.strip()]
   for run in range(args.runs):
+    if _prompts:
+      args.prompt = _prompts[run % len(_prompts)]
     if manager is not None:
       manager.prepare_for_next_req()
     if run and args.aot_release_between_runs and _aot is not None:
@@ -869,12 +880,19 @@ def _clock(label, owner, attr):
   """
   inner = getattr(owner, attr)
 
+  stamp = (os.environ.get("DT_PHASE_STAMP") == "1"
+           and os.environ.get("RANK", "0") == "0")
+
   def timed(*a, **k):
     begin = time.perf_counter()
+    if stamp:
+      print(f"  [stamp] {label} start {time.time():.2f}", flush=True)
     try:
       return inner(*a, **k)
     finally:
       _STAGE[label] = _STAGE.get(label, 0.0) + time.perf_counter() - begin
+      if stamp:
+        print(f"  [stamp] {label} end {time.time():.2f}", flush=True)
 
   setattr(owner, attr, timed)
 
@@ -923,6 +941,8 @@ def _install_step_clock(pipe, verbose=print):
   def step(*a, **k):
     torch.accelerator.synchronize()
     _STEPS.append(time.perf_counter())
+    if os.environ.get("DT_PHASE_STAMP") == "1" and os.environ.get("RANK", "0") == "0":
+      print(f"  [stamp] step boundary {time.time():.2f}", flush=True)
     return inner(*a, **k)
 
   sch.step = step
