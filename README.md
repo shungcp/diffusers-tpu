@@ -30,6 +30,10 @@ Newest first. Each entry links a date to what changed.
 
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-21** — torch_tpu per-request time (steady state, not compilation). Reference-to-video no longer copies weights that never change back to the host after every use: the 9.7 GiB VAE and the parked text-encoder modules swap back to a kept host copy. The text encoder's layers are streamed as 1/8 per chip and all-gathered over ICI, instead of every chip pulling each whole layer through the shared host link. The last reference images and prompt conditionings are cached (`DT_REF_CACHE`, `DT_TEXT_CACHE`, 8 each), so a request repeating a reference or a prompt (e.g. a new seed) skips those encoders. 768x1344x345, 20 steps, v6e-8: reference-to-video 167.2 -> **161.8 s** lossless and 66.3 -> **60.9 s** lossy for a new prompt and reference, **151.8 s** / **50.7 s** when both repeat; the torch_tpu column above now also includes the changes since 2026-11-10 (text-to-video 135.2 -> 118.9 s, 43.2 -> 38.6 s). Output bit-identical. Two compilation changes: Qwen3-VL's index metadata (3D RoPE positions, deepstack rows) is computed on the host, so a new prompt length no longer compiles dozens of data-dependent programs (480p reference-to-video text stage 24 -> 7–14 s); `DT_DIT_PRECOMPILE=1` (off by default) compiles a new prompt length's DiT program during the text stage. Fixes: in the JAX server's text buckets the padded queries took part in the attention kernel's fixed-m choice and changed real rows at rounding level, now zeroed; saved DiT programs are keyed by every backend/kernel source and the compiler flags (a narrower key once reused a stale program).
+
+  **2026-11-21** — torch_tpu 每请求耗时(稳态推理,与编译无关)。参考图生视频不再把从不改变的权重在每次用完后拷回主机:9.7 GiB 的 VAE 和停放的文本编码器模块改为换回保留的主机副本。文本编码器的各层改为每个 chip 拷 1/8、再经 ICI all-gather 拼回,不再每个 chip 都经共享的主机链路拷整层。最近的参考图与提示词条件各缓存 8 份(`DT_REF_CACHE`、`DT_TEXT_CACHE`),参考图或提示词重复的请求(例如只换种子)跳过对应编码器。768x1344x345、20 步、v6e-8:新提示词新参考图时参考图生视频无损 167.2 -> **161.8 秒**、有损 66.3 -> **60.9 秒**,两者都重复时 **151.8 秒** / **50.7 秒**;上表 torch_tpu 一列同时计入了 2026-11-10 以来的改动(文生视频 135.2 -> 118.9 秒、43.2 -> 38.6 秒)。输出逐位一致。两项编译相关改动:Qwen3-VL 的索引元数据(3D RoPE 位置、deepstack 行号)改在主机上算,新长度的提示词不再编译几十个数据相关的小程序(480p 参考图生视频文本阶段 24 -> 7–14 秒);`DT_DIT_PRECOMPILE=1`(默认关)在文本阶段提前编译新长度的 DiT 程序。修复:JAX 服务端文本分桶时补齐行的查询参与了注意力 kernel 的 fixed-m 选择、在舍入级改变真实行,现已置零;存盘的 DiT 程序以全部 backend/kernel 源码和编译参数为键(过窄的键曾复用到过期程序)。
+
 - **2026-11-18** — torch_tpu start-up and cache size. All denoising steps now share one DiT program (the first step had one distinct timestep and later steps two, so the time embedding changed shape and a second copy of every grouped program was compiled): 8-chip Pika 480x832x121 cold first run 69 -> **44 s**, ref2va 114 -> **86 s**, 15 -> 7 programs. Compiled DiT programs are now saved and loaded by later processes, skipping Dynamo (`DT_AOT_PERSIST`, on by default in `run_h3_torchtpu.sh`): a fresh process's first t2va run **7–9 s** against 7–8 s steady state (was 20 s), ref2va 29–31 s against 26–29 s, bit-identical in lossless and lossy runs. With one saved copy shared by all ranks, a shape's cache shrinks from 2.45 GB to **0.37 GB** ([details](docs/tpu_v6e.md)). Fixed a hang decoding frame counts whose last chunk has fewer tile rows than chips (e.g. 175 frames at 480p).
 
   **2026-11-18** — torch_tpu 启动与缓存体积。所有去噪步共用一个 DiT 程序(第 1 步只有一个不同的时间步、之后两个,时间嵌入形状不同,每个分组程序多编一份):8 chip Pika 480x832x121 冷启动首次运行 69 -> **44 秒**,ref2va 114 -> **86 秒**,程序 15 -> 7 个。编好的 DiT 程序现在会存盘,之后的进程直接读回、跳过 Dynamo(`DT_AOT_PERSIST`,`run_h3_torchtpu.sh` 默认打开):新进程第一次 t2va **7–9 秒**,稳态 7–8 秒(原来 20 秒),ref2va 29–31 秒对稳态 26–29 秒,无损与有损模式都逐位一致。所有 rank 共用一份存档后,每个形状的缓存从 2.45 GB 降到 **0.37 GB**([详情](docs/tpu_v6e.md))。修复了最后一段 tile 行数少于 chip 数时解码卡住的问题(例如 480p 175 帧)。
@@ -135,9 +139,9 @@ Hardware-specific architecture notes, optimization ledgers, and XLA flag guides 
 - **TPU v6e (Trillium, 8 chips = 8 TensorCore devices, 32 GiB HBM/chip, 256×256 MXU)**: [`docs/tpu_v6e.md`](docs/tpu_v6e.md)
 - **TPU v5e (`v5litepod-1` / Colab, 1 chip, 16 GiB HBM, 128×128 MXU)**: [`docs/tpu_v5e.md`](docs/tpu_v5e.md)
 
-Measured 2026-11-02 to 2026-11-04 on a TPU v6e-8 (8 chips); warm requests, with the model already loaded and compiled.
+Measured 2026-11-02 to 2026-11-04 on a TPU v6e-8 (8 chips); warm requests, with the model already loaded and compiled. The torch_tpu column was re-measured on 2026-11-21 (mean of two warm requests, each with a new prompt and reference, so neither request cache applies).
 
-测于 2026-11-02 至 2026-11-04,TPU v6e-8(8 个 chip);均为热请求时间,模型已加载并编译完成。
+测于 2026-11-02 至 2026-11-04,TPU v6e-8(8 个 chip);均为热请求时间,模型已加载并编译完成。torch_tpu 一列于 2026-11-21 重测(两次暖请求平均,按每次都是新提示词、新参考图计,不命中两个请求缓存)。
 
 Software: jax 0.12.0.1, libtpu 0.0.52 (torch_tpu moved from 0.0.51 on 2026-11-12: same attention kernel 5% faster), torch_tpu 0.2.0, diffusers `875373a` (see `requirements/`).
 
@@ -147,10 +151,10 @@ Software: jax 0.12.0.1, libtpu 0.0.52 (torch_tpu moved from 0.0.51 on 2026-11-12
 
 | | JAX | torchax | torch_tpu |
 |---|---|---|---|
-| text-to-video, lossless / 文生视频,无损 | **110.0 s** | 110.0 s | 135.2 s |
-| text-to-video, lossy / 文生视频,有损 | **34.0 s** | 34.8 s | 43.2 s |
-| reference-to-video, lossless / 参考图生视频,无损 | **139.2 s** | 186.7 s | 189 s |
-| reference-to-video, lossy / 参考图生视频,有损 | **51.2 s** | 51.6 s | 78.0 s |
+| text-to-video, lossless / 文生视频,无损 | **110.0 s** | 110.0 s | 118.9 s |
+| text-to-video, lossy / 文生视频,有损 | **34.0 s** | 34.8 s | 38.6 s |
+| reference-to-video, lossless / 参考图生视频,无损 | **139.2 s** | 186.7 s | 161.8 s |
+| reference-to-video, lossy / 参考图生视频,有损 | **51.2 s** | 51.6 s | 60.9 s |
 
 JAX times include decoding the audio; the two lossless JAX numbers were measured before it was added (about 0.1 s more).
 
