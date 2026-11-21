@@ -89,6 +89,15 @@ def parse_args():
   p.add_argument("--workflow", choices=("t2va", "ref2va"), default="t2va")
   p.add_argument("--reference", default=None, help="ref2va's condition image")
   p.add_argument("--prompt", default="a red fox trotting through snow")
+  p.add_argument("--warmup", type=int, default=0,
+                 help="Run this many untimed requests before the timed ones "
+                      "(--warmup-prompt, else --prompt), so the first timed "
+                      "request pays no one-time costs: loading saved programs, "
+                      "the first park of the text encoder, the first VAE "
+                      "upload. A resident server would do this at start.")
+  p.add_argument("--warmup-prompt", default="",
+                 help="Prompt for --warmup (a different one keeps the request "
+                      "caches from serving the timed runs).")
   p.add_argument("--prompts", default="",
                  help="'||'-separated prompts, one per run (cycled); "
                       "overrides --prompt. Serves several prompts in one "
@@ -703,6 +712,17 @@ def main():
     )
 
   _prompts = [x.strip() for x in args.prompts.split("||") if x.strip()]
+  if args.warmup:
+    _real = args.prompt
+    args.prompt = args.warmup_prompt or args.prompt
+    for _w in range(args.warmup):
+      _t0 = time.perf_counter()
+      with torch.device("tpu"):
+        _generate(pipe, args, reference)
+      print(f"  [warmup] request {_w}: {time.perf_counter() - _t0:.1f}s", flush=True)
+    args.prompt = _real
+    _STAGE.clear()
+    _report_steps()
   for run in range(args.runs):
     if _prompts:
       args.prompt = _prompts[run % len(_prompts)]
