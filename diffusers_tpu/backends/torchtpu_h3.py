@@ -1340,6 +1340,17 @@ def _stream_text_encoder(pipe, args):
         node = getattr(node, part)
     except AttributeError:
       continue
+    # Honor `--text-layers` here too (it was only applied on the rank0/cpu
+    # text paths): MiniMax-H3 reads `hidden_states[50]`, so layers past 51 of
+    # 64 were streamed and run for nothing. Found by the v7x weekend run.
+    # `DT_TRUNCATE_TEXT=0` keeps all layers.
+    keep = getattr(args, "text_layers", 0) or 0
+    if keep and len(node) > keep and os.environ.get("DT_TRUNCATE_TEXT", "1") == "1":
+      n0 = len(node)
+      del node[keep:]
+      if os.environ.get("RANK", "0") == "0":
+        print(f"  [text-layers] text encoder truncated {n0} -> {len(node)} layers",
+              flush=True)
     # Shard before offloading: `offload_all_layers` copies each layer's
     # weights to a host-resident copy, which should already be the shard.
     if getattr(args, "shard_text", False):
