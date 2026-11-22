@@ -200,6 +200,13 @@ def parse_args():
                       "With one block per program, ~16%% of the denoise "
                       "is launch overhead (~25 ms per launch, 50 blocks "
                       "x steps) and each block's all-reduce is exposed.")
+  p.add_argument("--text-bucket", type=int, default=256,
+                 help="Pad the text rows (DiT and text tower) to a multiple "
+                      "of N so prompts of similar length share compiled "
+                      "programs; the true length is masked at run time. "
+                      "README config, new prompt: t2va lossy 89.4 -> 42.4 s, "
+                      "lossless 152.6 -> 128.3 s. Not bit-identical to 0 "
+                      "(off). Overrides --seg-mod.")
   p.add_argument("--seg-mod", action="store_true",
                  help="Modulate by run instead of per row. The "
                       "stock block does six "
@@ -306,8 +313,13 @@ def parse_args():
   return p.parse_args()
 
 
+# Text-tower bucket size, set from `--text-bucket` in main().
+_TEXT_BUCKET = {"n": 0}
+
+
 def main():
   args = parse_args()
+  _TEXT_BUCKET["n"] = args.text_bucket
   if args.qk_fp8:
     os.environ["DT_OURS_QK_FP8"] = "1"
   if not args.no_auto_env:
@@ -384,7 +396,11 @@ def main():
         f"{resident / 1e9:.1f}B ({resident * 2 / 2**30:.0f} GiB bf16)",
         flush=True)
 
-  if args.seg_mod:
+  if args.seg_mod and args.text_bucket > 0:
+    # The text bucket's block forward broadcasts the video run itself (what
+    # segmod is for) without baking text-dependent row runs into the program.
+    print("segmod: skipped, --text-bucket does the same per-run modulation", flush=True)
+  elif args.seg_mod:
     # Must run before AOT: it replaces the block class's forward, which
     # `aot_dit._flat_forward` calls via `type(module).forward`.
     from diffusers_tpu.backends import segmented_mod_tt
@@ -414,6 +430,8 @@ def main():
                      group=args.aot_group).install()
     print(f"DiT: {len(blocks)} blocks via aot_compile, "
           f"compiled once and reused (dynamic={args.aot_dynamic})", flush=True)
+    from diffusers_tpu.backends import text_bucket_tt
+    text_bucket_tt.install(transformer, args.text_bucket)
     _enc = getattr(getattr(pipe, "text_encoder", None), "model", None)
     if _enc is not None:
       from diffusers_tpu.backends import dit_precompile
@@ -1093,7 +1111,38 @@ def _free_text_after_encode(pipe, verbose=print):
     if parked:
       verbose(f"  [free-text] restored {_restore(dev)} tensors before encode "
               f"({tied['restore']} shared reuses)", flush=True)
+    # `--text-bucket`: pad the token ids at the tail to a multiple of n and
+    # slice the output back. The text tower is causal, so the padding cannot
+    # reach real tokens; prompts in a bucket then share the tower's programs
+    # instead of compiling them per length (text stage 12.0 -> 4.9 s, c801).
+    tb = _TEXT_BUCKET["n"]
+    n_real = None
+    if tb > 0:
+      a = list(a)
+      ids = k["token_ids"] if "token_ids" in k else a[2]
+      n_real = len(ids)
+      extra = -(-n_real // tb) * tb - n_real
+      if extra:
+        proc = k.get("processor", a[1] if len(a) > 1 else None)
+        tok = getattr(proc, "tokenizer", None)
+        pad = getattr(tok, "pad_token_id", None)
+        if pad is None:
+          pad = getattr(tok, "eos_token_id", 0) or 0
+        ids = list(ids) + [pad] * extra
+        if "token_ids" in k:
+          k["token_ids"] = ids
+        else:
+          a[2] = ids
     out = inner(*a, **k)
+    if n_real is not None:
+      out = out[:, :n_real]
+    if os.environ.get("DT_EMB_NOISE"):
+      # Diagnosis: multiply the conditioning by (1 + eps * N(0,1)), a
+      # semantics-free perturbation, to measure the run-to-run noise floor.
+      eps = float(os.environ["DT_EMB_NOISE"])
+      g = torch.Generator().manual_seed(int(os.environ.get("DT_EMB_NOISE_SEED", "0")))
+      nz = torch.randn(tuple(out.shape), generator=g, device="cpu")
+      out = (out.float() * (1 + eps * nz.to(out.device))).to(out.dtype)
     if True:
       n = 0
       # Move each storage once and record sharing as `gid` for `_restore`.

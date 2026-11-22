@@ -65,6 +65,22 @@ def _op_for(bq: int, bkv: int, fixed_m: bool):
           + ("_fm" if fixed_m else "")
           + ("_fp8" if QK_FP8 else ""))
   op = torch.tpu.pallas.jax_op(name, fn)
+  # Variant with a runtime key length (`text_bucket_tt`): keys at or past
+  # `kv_len[0]` are masked inside the kernel, so one compiled program serves
+  # every true length up to the padded shape.
+  # The runtime-length kernel with a 4096 kv block and fixed-m is
+  # pathologically slow on long sequences (768p ref2va, 118k rows: 363 ms
+  # against 89.6 without kv_len); a 2048 kv block is 94.3 ms (single-chip
+  # sweep, 11-21). `DT_OURS_KV_BKV` overrides.
+  bkv_kv = int(os.environ.get("DT_OURS_KV_BKV", "2048"))
+
+  def fn_kv(query: jax.Array, key: jax.Array, value: jax.Array,
+            kv_len: jax.Array) -> jax.Array:
+    return csa.attention(
+        query, key, value, scale=None, block_q=bq,
+        block_kv=bkv_kv, block_kv_compute=bkv_kv,
+        use_fixed_m=fixed_m, qk_fp8=QK_FP8, kv_len=kv_len[0])
+  op_kv = torch.tpu.pallas.jax_op(name + "_kvlen", fn_kv)
   if os.environ.get("DT_OURS_FAKE", "1") == "1":
     # jax_op's default fake kernel runs a full, uncached jax.export of the
     # kernel every time Dynamo traces a call, only to read the output shape.
@@ -73,7 +89,12 @@ def _op_for(bq: int, bkv: int, fixed_m: bool):
     @op.register_fake
     def _fake(query, key, value):
       return torch.empty_like(query, memory_format=torch.contiguous_format)
+
+    @op_kv.register_fake
+    def _fake_kv(query, key, value, kv_len):
+      return torch.empty_like(query, memory_format=torch.contiguous_format)
   _REGISTERED[key] = op
+  _REGISTERED[key + ("kv",)] = op_kv
   return op
 
 
@@ -84,6 +105,7 @@ def install(verbose=print, fixed_m: bool = True) -> bool:
 
   try:
     op = _op_for(BQ, BKV, fixed_m)   # the only config used; register before compiling
+    op_kv = _REGISTERED[(BQ, BKV, fixed_m, QK_FP8, "kv")]
   except Exception as exc:  # noqa: BLE001
     verbose(f"  [ours] registration failed: {type(exc).__name__}: "
             f"{' '.join(str(exc).split())[:160]}", flush=True)
@@ -102,6 +124,27 @@ def install(verbose=print, fixed_m: bool = True) -> bool:
     already_bhsd = kwargs.pop("_already_bhsd", False)
     seq_ax = -2 if already_bhsd else -3
     tracing = torch.compiler.is_compiling()
+    # A one-element integer `attn_mask` is a runtime key length
+    # (`text_bucket_tt`): rows at or past it are padding.
+    if (attn_mask is not None and attn_mask.numel() == 1
+        and not attn_mask.dtype.is_floating_point):
+      kv = attn_mask.reshape(1).to(torch.int32)
+      if not already_bhsd:
+        query, key, value = (t.transpose(1, 2) for t in (query, key, value))
+      pos = torch.arange(key.shape[-2], device=key.device)
+      keep = (pos < kv)[None, None, :, None]
+      # Padded keys zeroed (the fixed-m bound assumes so), key centering over
+      # the real rows only, padded queries zeroed so their content cannot
+      # change a head's fixed-m choice (the JAX fix, ebfe29a).
+      key = torch.where(keep, key, torch.zeros((), dtype=key.dtype, device=key.device))
+      if fixed_m:
+        mean = (key.float().sum(dim=-2, keepdim=True) / kv.float()).to(key.dtype)
+        key = torch.where(keep, key - mean, torch.zeros((), dtype=key.dtype, device=key.device))
+      query = torch.where(keep, query, torch.zeros((), dtype=query.dtype, device=query.device))
+      value = torch.where(keep, value, torch.zeros((), dtype=value.dtype, device=value.device))
+      if SPARSE_OP is not None and query.shape[-2] == SPARSE_SEQ:
+        return SPARSE_OP(query, key, value, kv).transpose(1, 2)
+      return op_kv(query, key, value, kv).transpose(1, 2)
     if TRIPWIRE and max(query.shape) > 1000:   # skip the 56-token text refiner
       m = None if attn_mask is None else tuple(attn_mask.shape)
       raise RuntimeError(
@@ -178,7 +221,9 @@ def install(verbose=print, fixed_m: bool = True) -> bool:
     _rot_tpu = _rot_cpu.to("tpu") if bhsd_mode == "full" else None
 
     def _bhsd_call(self, attn, hidden_states, rotary_emb=None, attention_mask=None):
-      if attention_mask is not None or hidden_states.shape[-2] < MIN_SEQ:
+      kvmask = (attention_mask is not None and attention_mask.numel() == 1
+                and not attention_mask.dtype.is_floating_point)
+      if (attention_mask is not None and not kvmask) or hidden_states.shape[-2] < MIN_SEQ:
         return orig_call(self, attn, hidden_states, rotary_emb, attention_mask)
       if attn.fused_projections:
         query, key, value = attn.to_qkv(hidden_states).chunk(3, dim=-1)
@@ -212,8 +257,8 @@ def install(verbose=print, fixed_m: bool = True) -> bool:
           k1, k2 = kr.chunk(2, dim=-1)
           key = torch.cat((kr * cos_b + torch.cat((-k2, k1), dim=-1) * sin_b, kp), dim=-1)
       out = dispatch(
-          query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False,
-          _already_bhsd=True,
+          query, key, value, attn_mask=attention_mask if kvmask else None,
+          dropout_p=0.0, is_causal=False, _already_bhsd=True,
       )
       out = out.flatten(2, 3).type_as(query)
       if os.environ.get("DT_POST_ATTN_PIPE") == "1" and out.shape[1] >= 16384:

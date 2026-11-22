@@ -41,6 +41,23 @@ def _table(seq, layout, bq, bkv):
   Copy of `Sparsity.table` in `models/minimax_h3/h3_tpu.py`; not imported
   because that module imports torchax, which the torch_tpu env lacks.
   """
+  if layout[0] == "tail":
+    # `text_bucket_tt` reorder: target video rows [0, V), everything else
+    # (text, conditions, audio, padding) after it and global.
+    _, V, rows_per_frame, window = layout
+    block_q, block_kv = min(bq, seq), min(bkv, seq)
+    reach = window * rows_per_frame
+    num_q, num_kv = -(-seq // block_q), -(-seq // block_kv)
+    rows = []
+    for i in range(num_q):
+      q0, q1 = i * block_q, min((i + 1) * block_q, seq)
+      rows.append([
+          j for j in range(num_kv)
+          if q1 > V or min((j + 1) * block_kv, seq) > V
+          or (j * block_kv < q1 + reach
+              and min((j + 1) * block_kv, seq) > q0 - reach)
+      ])
+    return rows
   video_start, rows_per_frame, window = layout
   block_q, block_kv = min(bq, seq), min(bkv, seq)
   reach = window * rows_per_frame
@@ -64,6 +81,11 @@ def register(seq: int, bq: int, bkv: int, fixed_m: bool):
 
   qk_fp8 = os.environ.get("DT_OURS_QK_FP8") == "1"
   layout = STATE["layout"]
+  if layout[0] == "tail":
+    # c834: the runtime-length sparse kernel with a 4096 kv block was
+    # pathological on ref2va 768p (21.1 s a sparse step vs 5.6), as the dense
+    # one was (c804); use the kv-length block size (`DT_OURS_KV_BKV`).
+    bkv = int(os.environ.get("DT_OURS_KV_BKV", "2048"))
   key = (seq, layout, bq, bkv, fixed_m, qk_fp8)
   if key in _REGISTERED:
     STATE["op"], STATE["op_key"], STATE["seq"] = _REGISTERED[key], key, seq
@@ -84,13 +106,25 @@ def register(seq: int, bq: int, bkv: int, fixed_m: bool):
   # Not functools.partial: `jax_op` infers the schema from the signature and
   # requires every parameter (even bound ones) to be annotated; this kernel's
   # `kv_table` is not.
-  def fn(query: jax.Array, key: jax.Array, value: jax.Array) -> jax.Array:
-    return sparse_splash.attention(
-        query, key, value, scale=None, block_q=bq, block_kv=bkv,
-        block_kv_compute=bkv, use_fixed_m=fixed_m, qk_fp8=qk_fp8,
-        kv_table=table)
-  vs, rpf, win = layout
-  name = (f"pallas::h3_sparse_q{bq}_kv{bkv}_s{seq}_v{vs}_r{rpf}_w{win}"
+  if layout[0] == "tail":
+    # Bucketed: the padded keys are masked by the runtime length.
+    def fn(query: jax.Array, key: jax.Array, value: jax.Array,
+           kv_len: jax.Array) -> jax.Array:
+      return sparse_splash.attention(
+          query, key, value, scale=None, block_q=bq, block_kv=bkv,
+          block_kv_compute=bkv, use_fixed_m=fixed_m, qk_fp8=qk_fp8,
+          kv_table=table, kv_len=kv_len[0])
+    _, vs, rpf, win = layout
+    tag = "_tail"
+  else:
+    def fn(query: jax.Array, key: jax.Array, value: jax.Array) -> jax.Array:
+      return sparse_splash.attention(
+          query, key, value, scale=None, block_q=bq, block_kv=bkv,
+          block_kv_compute=bkv, use_fixed_m=fixed_m, qk_fp8=qk_fp8,
+          kv_table=table)
+    vs, rpf, win = layout
+    tag = ""
+  name = (f"pallas::h3_sparse_q{bq}_kv{bkv}_s{seq}_v{vs}_r{rpf}_w{win}{tag}"
           + ("_fm" if fixed_m else "")
           + ("_fp8" if qk_fp8 else ""))
   op = torch.tpu.pallas.jax_op(name, fn)
