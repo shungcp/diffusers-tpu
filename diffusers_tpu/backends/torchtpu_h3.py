@@ -2452,6 +2452,16 @@ def _write(result, args):
   np.save(tmp, arr)
   os.replace(tmp, path)
   print(f"wrote {path}", flush=True)
+  # The soundtrack too (`(1, 2, samples)` float, at `result["sampling_rate"]`):
+  # until 11-22 only the frames were written, so every review mp4 was silent.
+  audio = result.get("audio") if hasattr(result, "get") else None
+  if audio is not None:
+    a = audio[0] if getattr(audio, "ndim", 0) == 3 else audio
+    a = np.asarray(a.float().cpu() if hasattr(a, "float") else a, dtype=np.float32)
+    apath = os.path.join(args.out, f"h3_{args.tag}_audio.npy")
+    np.save(apath[:-len(".npy")] + ".tmp.npy", a)
+    os.replace(apath[:-len(".npy")] + ".tmp.npy", apath)
+    print(f"wrote {apath} {a.shape} @ {result.get('sampling_rate')} Hz", flush=True)
 
 
 if __name__ == "__main__":
