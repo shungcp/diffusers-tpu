@@ -17,9 +17,9 @@ of the request. `--chips` uses a subset of the host's chips.
 `--reference` runs ref2va (vision tower + VAE-encoded reference +
 `transformer_ref`).
 
-Not implemented: **the audio track.** H3 emits audio latents alongside
-video ones and this decodes only the video. t2va's audio measures -54 to
--64 dBFS in the torch pipeline too, i.e. silence.
+The audio track is decoded too (`AudioDecoder`, `--no-audio` skips it) and
+saved next to the frames as `<tag>_audio.npy` (stereo float32);
+`scripts/frames_to_mp4.py` muxes it.
 
     python -m diffusers_tpu.models.minimax_h3.jax_pipeline \\
         --prompt "a red fox trotting through snow" \\
