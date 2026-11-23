@@ -90,7 +90,6 @@ import os as _os
 # dot_product_attention materialises the f32 score matrix on TPU: at 1024x1024
 # that is [4, 4096, 4114] per chip per layer, ~28 ms of a ~66 ms step.
 ATTN_MESH = None
-SPLASH = _os.environ.get("DT_QWEN_SPLASH", "1") == "1"
 SPLASH_BQ = int(_os.environ.get("DT_QWEN_BQ", "1024"))
 SPLASH_BKV = int(_os.environ.get("DT_QWEN_BKV", "512"))
 _SPLASH_SEEN = set()
@@ -143,7 +142,7 @@ def _splash_attention(q, k, v):
 
 
 def _use_splash(q):
-  return (SPLASH and ATTN_MESH is not None and q.shape[1] % 128 == 0
+  return (ATTN_MESH is not None and q.shape[1] % 128 == 0
           and q.shape[2] % ATTN_MESH.size == 0)
 
 

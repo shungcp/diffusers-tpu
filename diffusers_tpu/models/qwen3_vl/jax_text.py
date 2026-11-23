@@ -56,24 +56,22 @@ def find_snapshot(model_id=MODEL_ID):
   return snapshot_download(model_id)
 
 
-# Text attention in float32 at highest precision (DT_TEXT_ATTN_F32, on by default).
-TEXT_ATTN_F32 = os.environ.get("DT_TEXT_ATTN_F32", "1") == "1"
+# Text attention outside the splash kernel runs in float32 at highest
+# precision: bfloat16 loses accuracy on long prompts at the same speed.
 # Causal text attention a block of queries at a time (DT_TEXT_ATTN_CHUNK=<rows>),
 # for one small chip and a long ref2va prompt.
 TEXT_ATTN_CHUNK = int(os.environ.get("DT_TEXT_ATTN_CHUNK", "0"))
 # Long causal prompts (ref2va's ~7.5k tokens) go through JAX's splash kernel,
 # heads sharded over this mesh axis. The dense path materializes float32
 # scores: text/vision encode 1.0 -> 0.6 s warm, video DINO 0.955 against it
-# (c345; noise floor ~0.948). DT_TEXT_SPLASH=0 restores the dense path.
-TEXT_SPLASH = os.environ.get("DT_TEXT_SPLASH", "1") == "1"
+# (c345; noise floor ~0.948).
 TEXT_SPLASH_MIN = int(os.environ.get("DT_TEXT_SPLASH_MIN", "2048"))
 TEXT_SPLASH_AXIS = "tp"
 TEXT_SPLASH_BLK = int(os.environ.get("DT_TEXT_SPLASH_BLK", "512"))
-if TEXT_SPLASH:
-  # Imported here, not inside the first trace: a Pallas import during
-  # tracing changes the trace context and every later call retraces (c287).
-  from jax.experimental.pallas.ops.tpu.splash_attention import (  # noqa: F401
-      splash_attention_kernel as _sk_preload)
+# Imported here, not inside the first trace: a Pallas import during
+# tracing changes the trace context and every later call retraces (c287).
+from jax.experimental.pallas.ops.tpu.splash_attention import (  # noqa: F401
+    splash_attention_kernel as _sk_preload)
 
 
 _SPLASH_KERNELS = {}
@@ -179,7 +177,7 @@ def _build_modules():
       k = apply_rope(k, cos, sin).astype(v.dtype)
       # jax's attention does grouped queries itself when the head counts
       # differ, so no explicit repeat.
-      if TEXT_SPLASH and mask is None and b == 1 and s >= TEXT_SPLASH_MIN:
+      if mask is None and b == 1 and s >= TEXT_SPLASH_MIN:
         from jax.sharding import PartitionSpec as P
         spec = P(None, TEXT_SPLASH_AXIS, None)
         local = lambda a, c, e: _splash_causal(a, c, e, self.scale)
@@ -194,20 +192,20 @@ def _build_modules():
         qp = jnp.pad(q, ((0, 0), (0, n * c - s), (0, 0), (0, 0)))
         qc = qp.reshape(b, n, c, self.heads, self.head_dim).swapaxes(0, 1)
         cols = jnp.arange(s)[None, :]
-        dt = jnp.float32 if TEXT_ATTN_F32 else v.dtype
+        dt = jnp.float32
         kf, vf = k.astype(dt), v.astype(dt)
 
         def one(args):
           qi, start = args
           rows = start + jnp.arange(c)[:, None]
           m = (cols <= rows)[None, None]
-          with jax.default_matmul_precision("highest" if TEXT_ATTN_F32 else "default"):
+          with jax.default_matmul_precision("highest"):
             return jax.nn.dot_product_attention(qi.astype(dt), kf, vf, mask=m,
                                                 scale=self.scale)
         out = jax.lax.map(one, (qc, jnp.arange(n) * c))
         out = out.swapaxes(0, 1).reshape(b, n * c, self.heads, self.head_dim)[:, :s]
         out = out.astype(v.dtype)
-      elif TEXT_ATTN_F32:
+      else:
         # float32 at highest precision: the bfloat16 path loses accuracy on
         # long prompts (7,518 tokens with a ref2va image) at the same speed.
         with jax.default_matmul_precision("highest"):
@@ -215,10 +213,6 @@ def _build_modules():
               q.astype(jnp.float32), k.astype(jnp.float32),
               v.astype(jnp.float32), mask=mask, is_causal=mask is None,
               scale=self.scale).astype(v.dtype)
-      else:
-        out = jax.nn.dot_product_attention(q, k, v, mask=mask,
-                                           is_causal=mask is None,
-                                           scale=self.scale)
       return self.o_proj(out.reshape(b, s, -1))
 
   class MLP(nnx.Module):
