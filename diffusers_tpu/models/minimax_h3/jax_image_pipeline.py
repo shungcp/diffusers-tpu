@@ -419,7 +419,7 @@ def main():
     vision_model, _ = jvision.build(text_dir, dtype=dtype, abstract=True)
     jvision.load(vision_model, text_dir, mesh=mesh, spec_fn=lambda k, n: P(),
                  memory_kind=text_host if len(devices) == 1 else None)
-    if os.environ.get("DT_VISION_HEAD_SHARD", "1") == "1" and len(devices) > 1:
+    if len(devices) > 1:
       _qv.HEAD_SHARD_AXIS = "tp"
 
   # -- 2. Load 50-layer DiT --------------------------------------------------
@@ -698,15 +698,13 @@ def main():
         moments = _ref_cache[mkey]
       elif _ref_cache.get("encode") is not None:
         moments = _ref_cache["encode"](x_j)
-      elif os.environ.get("DT_ENC_JIT", "1") == "1":
+      else:
         moments = _jit_tiled_encode(enc_w, x_j)
         if os.environ.get("DT_ENC_CHECK") == "1":
           ref = np.asarray(_eager_tiled_encode(enc_w, x_j)[:, :, -1], np.float32).ravel()
           got = np.asarray(moments[:, :, -1], np.float32).ravel()
           print(f"  [enc-check] jit vs eager cos {float(got @ ref / np.linalg.norm(got) / np.linalg.norm(ref)):.6f} "
                 f"max|d| {float(np.abs(got - ref).max()):.3g}", flush=True)
-      else:
-        moments = _eager_tiled_encode(enc_w, x_j)
       if mkey is not None:
         _ref_cache[mkey] = moments
       moments_4d = np.asarray(moments[:, :, -1], np.float32)
@@ -1297,7 +1295,7 @@ def serve_requests(args, env):
     # Image rows in one block (text-to-image; edits with reference padding
     # are not): the step writes them with a dynamic-update-slice.
     ii = lay[2]
-    return (os.environ.get("DT_IMG_DUS", "1") == "1" and ii.size > 0
+    return (ii.size > 0
             and bool(np.all(np.diff(ii) == 1)))
 
   def put_lay(lay):

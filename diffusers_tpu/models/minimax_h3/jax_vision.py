@@ -96,7 +96,7 @@ def load(model, text_encoder_dir, mesh=None, spec_fn=None, place=None,
                      "bias" if name.endswith("bias") else "weight")
     return qwen_vision._resolve(model, name.split("."))
 
-  if (os.environ.get("DT_FAST_LOAD", "1") == "1" and place is None
+  if (place is None
       and mesh is not None and spec_fn is not None):
     return _load_parallel(model, shards, mesh, spec_fn, memory_kind, resolve)
 

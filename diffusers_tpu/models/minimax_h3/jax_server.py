@@ -155,10 +155,8 @@ class Server:
     from ..qwen3_vl import jax_vision as _qv
     _qv.ATTN_CHUNK = int(os.environ.get("DT_VISION_ATTN_CHUNK", "2048"))
     # Shard the vision tower's 16 heads across chips (2 per chip on 8 chips),
-    # which keeps the 2048 attention chunk affordable. `DT_VISION_HEAD_SHARD=0`
-    # computes all heads on every chip.
-    if os.environ.get("DT_VISION_HEAD_SHARD", "1") == "1":
-      _qv.HEAD_SHARD_AXIS = "tp"
+    # which keeps the 2048 attention chunk affordable.
+    _qv.HEAD_SHARD_AXIS = "tp"
     from diffusers_tpu.kernels import mesh_attention
     from diffusers_tpu.kernels import splash as csa
     from jax.sharding import NamedSharding, PartitionSpec as P
@@ -712,13 +710,10 @@ class Server:
       tiles = tiles + [tiles[-1]] * (nb - len(tiles))
       flat = jnp.concatenate([enc_batch(w, jnp.stack(tiles[k:k + g]))
                               for k in range(0, nb, g)], axis=0)[:len(ys) * len(xs)]
-      if os.environ.get("DT_HOST_STITCH", "1") == "1":
-        # Blend and stitch on the host: a few MB of latents, no per-layout
-        # program to compile (3-6 s per new reference size on the device).
-        moments = _np_stitch(np.asarray(jax.device_get(flat), np.float32),
-                             len(ys), len(xs), yo, xo, jvae.SPATIAL_RATIO)
-      else:
-        moments = stitch(flat, len(ys), len(xs), tuple(yo), tuple(xo))
+      # Blend and stitch on the host: a few MB of latents, no per-layout
+      # program to compile (3-6 s per new reference size on the device).
+      moments = _np_stitch(np.asarray(jax.device_get(flat), np.float32),
+                           len(ys), len(xs), yo, xo, jvae.SPATIAL_RATIO)
     del w
     return r2v._finish_condition(moments, self.vae_cfg["latents_mean"],
                                  self.vae_cfg["latents_std"])
@@ -731,21 +726,15 @@ class Server:
     dev = self.NS(self.mesh, self.P())
     es = jax.device_put(self._es_host, dev)
     qs = jax.device_put(self._qs_host, dev)
-    if os.environ.get("DT_ENC_JIT", "1") == "1":
-      # The whole tiled encode as one program, tiles in groups (as in
-      # `jax_pipeline`): 2.8 -> 0.5 s for a 3648x2048 reference.
-      from . import jax_pipeline as jp
-      os.environ.setdefault("DT_ENC_GROUP", "5")
-      jp._ENC_ONE[0] = self._encode_one
-      cond = r2v.encode_condition(jp._ENC_W_FN, image,
-                                  self.vae_cfg["latents_mean"],
-                                  self.vae_cfg["latents_std"], mesh=self.mesh,
-                                  weights=(es, qs))
-    else:
-      enc1 = self._encode_one
-      cond = r2v.encode_condition(lambda t: enc1(es, qs, t), image,
-                                  self.vae_cfg["latents_mean"],
-                                  self.vae_cfg["latents_std"], mesh=self.mesh)
+    # The whole tiled encode as one program, tiles in groups (as in
+    # `jax_pipeline`): 2.8 -> 0.5 s for a 3648x2048 reference.
+    from . import jax_pipeline as jp
+    os.environ.setdefault("DT_ENC_GROUP", "5")
+    jp._ENC_ONE[0] = self._encode_one
+    cond = r2v.encode_condition(jp._ENC_W_FN, image,
+                                self.vae_cfg["latents_mean"],
+                                self.vae_cfg["latents_std"], mesh=self.mesh,
+                                weights=(es, qs))
     del es, qs
     return cond
 
@@ -769,8 +758,7 @@ class Server:
     num_frames = align_num_frames(int(req.get("num_frames", a.num_frames)), 17, 5)
     # A new audio length compiles the audio decoder (~50-60 s): start that in
     # a thread now so it overlaps the text, DiT and video decode.
-    if (self.audio_dec is not None and getattr(self.audio_dec, "_cpu", None) is None
-        and os.environ.get("DT_BG_AUDIO_COMPILE", "1") == "1"):
+    if (self.audio_dec is not None and getattr(self.audio_dec, "_cpu", None) is None):
       n_a = audio_latent_num_frames(num_frames)
       if n_a not in self._audio_compiling and n_a != getattr(self, "_audio_warm_n", None):
         import threading
@@ -796,7 +784,7 @@ class Server:
     # dense) already share the host CPUs and this one did not help (c606:
     # 95.4 -> 91.5 s and 78.8 -> 82.9 s; t2va 62.0 -> 54.4 s).
     _pd = os.environ.get("DT_PRE_DENSE", "t2va")
-    _ps = os.environ.get("DT_PRE_SPARSE", "1") == "1"
+    _ps = True
     if _pd == "1" or _pd == kind or (_ps and lossy):
       try:
         dense_th = self._precompile_dense(
@@ -809,8 +797,7 @@ class Server:
     # in a thread while the text and vision towers compile and run; the
     # encode below then loads it from the compilation cache.
     enc_th = None
-    if (image is not None and os.environ.get("DT_ENC_JIT", "1") == "1"
-        and os.environ.get("DT_PAR_ENC", "1") == "1"
+    if (image is not None
         and not (a.ref_pad_buckets and a.enc_tile_bucket)):
       hw = tuple(np.asarray(image).shape[:2])
       if hw not in self.__dict__.setdefault("_enc_precompiled", set()):
@@ -1013,14 +1000,12 @@ class Server:
     # steps' from the scheduler (replicated over the mesh): two different
     # input shardings, so the same DiT call compiled twice (~30 s each).
     # Commit them to the later sharding up front: one program.
-    if os.environ.get("DT_COMMIT_LATENTS", "1") == "1":
-      rep = self.NS(self.mesh, self.P())
-      video, audio = jax.device_put(video, rep), jax.device_put(audio, rep)
+    rep = self.NS(self.mesh, self.P())
+    video, audio = jax.device_put(video, rep), jax.device_put(audio, rep)
     # The sparse call (lossy requests, from step `dense_steps`) compiles in a
     # thread while the dense steps compile and run.
     sparse_future = None
-    if (call_sparse is not None and dense_steps < len(timesteps)
-        and os.environ.get("DT_PAR_SPARSE", "1") == "1"):
+    if (call_sparse is not None and dense_steps < len(timesteps)):
       import concurrent.futures as cf
 
       def _compile_sparse(v0, a0, t0_):

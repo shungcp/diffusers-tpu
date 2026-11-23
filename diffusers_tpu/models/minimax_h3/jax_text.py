@@ -101,7 +101,7 @@ def load(model, text_encoder_dir, mesh=None, spec_fn=param_spec, place=None,
   if not shards:
     raise FileNotFoundError(f"no safetensors in {text_encoder_dir}")
 
-  if (os.environ.get("DT_FAST_LOAD", "1") == "1" and mesh is not None
+  if (mesh is not None
       and spec_fn is not None and place is None):
     return _load_parallel(model, shards, mesh, spec_fn, memory_kind,
                           int8=int8, keep_layers=keep_layers)

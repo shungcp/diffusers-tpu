@@ -567,7 +567,7 @@ def main():
     jvision.load(vision, text_dir, mesh=mesh, spec_fn=lambda k, n: _P(),
                  memory_kind=text_host if len(devices) == 1 else None)
     # Shard vision attention heads across chips (text stage 4.9 -> 1.4 s).
-    if os.environ.get("DT_VISION_HEAD_SHARD", "1") == "1" and len(devices) > 1:
+    if len(devices) > 1:
       _qv.HEAD_SHARD_AXIS = "tp"
     if text_host is None:
       with jax.set_mesh(mesh):

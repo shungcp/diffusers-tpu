@@ -450,10 +450,7 @@ def main():
       wc = im.width // 16 * 16
       px = np.asarray(im, np.float32)[:hc, :wc].transpose(2, 0, 1)[None, :, None] / 255.0
       px = (px - mean5) / std5
-      if os.environ.get("DT_ENC_JIT", "1") == "1":
-        moments = _jit_tiled_encode(enc_w, jnp.asarray(px, dtype))
-      else:
-        moments = jvae.tiled_encode(lambda t_: _ENC_ONE[0](enc_w, t_), jnp.asarray(px, dtype), mesh=mesh)
+      moments = _jit_tiled_encode(enc_w, jnp.asarray(px, dtype))
       moments_4d = np.asarray(moments[:, :, -1], np.float32)
       mu, logvar = np.split(moments_4d, 2, axis=1)
       sd = np.exp(0.5 * np.clip(logvar, -30.0, 20.0))

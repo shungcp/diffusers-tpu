@@ -377,8 +377,7 @@ def _build_modules():
         # softmax and change real rows at rounding level (c757: 2-5e-4;
         # c754: padded-row content changed the video). Zero rows cannot raise
         # the bound, so real rows no longer depend on the pad content.
-        if os.environ.get("DT_PAD_Q_ZERO", "1") == "1":
-          q = jnp.where(keep, q, 0)
+        q = jnp.where(keep, q, 0)
       elif true_len is not None and true_len != x.shape[1]:
         # The padded rows are keys to nobody. Queries stay padded: the
         # kernel pads the query axis itself anyway and those output rows
@@ -1278,13 +1277,13 @@ def load_transformer(model, transformer_dir, mesh=None, verbose=False,
       node = node[int(part)] if part.isdigit() else getattr(node, part)
     return getattr(node, name.split(".")[-1])
 
-  if (os.environ.get("DT_FAST_LOAD", "1") == "1" and mesh is not None
+  if (mesh is not None
       and place is None and not round_bf16):
     return _load_transformer_parallel(model, shards, mesh, memory_kind,
                                       resolve, verbose, lora=lora, int8=int8,
                                       adaln_temb=adaln_temb)
   if lora or int8 or adaln_temb is not None:
-    raise NotImplementedError("lora= needs the parallel loader (DT_FAST_LOAD=1, a mesh)")
+    raise NotImplementedError("lora= needs the parallel loader (a mesh)")
 
   loaded = 0
   for shard in shards:
