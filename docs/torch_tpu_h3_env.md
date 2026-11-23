@@ -32,4 +32,11 @@ configuration. Prefer the command-line flags where one exists.
 | `DT_OURS_TRIPWIRE=1` | Raise if the main sequence reaches the attention dispatcher unexpectedly |
 | `DT_FIXED_TSLOTS=pad`, `DT_VL_HOST_META=<list>`, `DT_BHSD_ROPE=<mode>`, `DT_SEGMOD_PART=msa\|mlp` | Alternative modes kept for comparisons |
 
-`DT_SEGMOD_WHERE` / `DT_SEGMOD_F32` belong to the H3-Image path.
+## H3-Image (`scripts/run_h3_image_torchtpu.sh`)
+
+| Variable | Meaning |
+|---|---|
+| `DT_SEGMOD_WHERE` / `DT_SEGMOD_F32` | Masked segment-wise modulation in float32; set to 1 by the entry point |
+| `DT_TEXT_CHECK=1`, `DT_ENC_CHECK=1` | Compare the compiled text tower / reference encoder against eager |
+| `DT_TEXT_TIMING=1`, `DT_RANK_TIMES=1` | Per-stage text-encoding times (syncs), per-rank request times |
+| `DT_PROFILE_ALL_RANKS=1` | With `--profile`, trace every rank instead of rank 0 |
