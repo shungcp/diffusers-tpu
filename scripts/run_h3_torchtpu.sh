@@ -35,6 +35,12 @@ export TORCH_TPU_SLICEBUILDER_ADDRESSES=$(for j in 0 1 2 3 4 5 6 7; do printf "l
 # torch_tpu environments usually lack torchvision; diffusers only needs a few names from it.
 export PYTHONPATH=$R/compat/torchvision_stub${PYTHONPATH:+:$PYTHONPATH}
 export DT_SPMD_SAFE=1 DT_DECODE_SHM=1 DT_OURS_BQ=2048 DT_OURS_BKV=4096
+# A prompt that crosses into a new text bucket compiles its DiT program in the
+# background once the text tower starts streaming its layers (the copies wait
+# in C++, so the compile does not slow the encoder through the GIL): 768p
+# ref2va crossing 7424 -> 7680 rows 189.9 -> 182.9 s (c867). Same-bucket
+# prompts trigger nothing. DT_DIT_PRECOMPILE=0 turns it off.
+export DT_DIT_PRECOMPILE=${DT_DIT_PRECOMPILE-1} DT_DIT_PRECOMPILE_START=${DT_DIT_PRECOMPILE_START-prefetch}
 # Save each compiled DiT program and load it in later processes, skipping Dynamo: a fresh
 # process's first request runs at steady-state speed (Pika 480p t2va warm run 0 20 -> 8-9 s).
 # One file per program for all ranks; names hash shapes, versions, DT_* settings and sources.
