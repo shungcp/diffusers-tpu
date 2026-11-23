@@ -36,12 +36,12 @@ import torch
 
 
 def _use_artifact():
-  """Call the `aot_compile` artifact: only with `DT_AOT_CALL_ART=1` and the
-  per-program function copies off (`DT_AOT_FRESH_FN=0`). The artifact's
-  AOTAutograd key holds a per-process uuid, so it is never found in the
-  cache by a later process."""
-  return (os.environ.get("DT_AOT_CALL_ART") == "1"
-          and os.environ.get("DT_AOT_FRESH_FN", "1") != "1")
+  """Whether to call the `aot_compile` artifact directly. Never, now: every
+  program gets its own function object (`_fresh_function`), so the
+  `torch.compile` wrapper serves dense and sparse programs alike, and the
+  artifact's AOTAutograd key holds a per-process uuid that a later process
+  would never find in the cache."""
+  return False
 
 
 def _fresh_function(fn, tag):
@@ -254,12 +254,11 @@ class AotBlocks:
             )
           fn = spmd_safe_fn(fn)
           self._say("  [aot] spmd_safe: graph no longer split at all-reduce", flush=True)
-        if os.environ.get("DT_AOT_FRESH_FN", "1") == "1":
-          # One function object (own code object) per program: Dynamo keeps
-          # its compiled frames per code object, so programs for the same
-          # shapes (dense vs sparse steps) no longer share a frame cache and
-          # the wrapper can serve lossy runs too, without `aot_compile`.
-          fn = _fresh_function(fn, len(self._cache))
+        # One function object (own code object) per program: Dynamo keeps
+        # its compiled frames per code object, so programs for the same
+        # shapes (dense vs sparse steps) no longer share a frame cache and
+        # the wrapper can serve lossy runs too, without `aot_compile`.
+        fn = _fresh_function(fn, len(self._cache))
         compiled = torch.compile(fn, backend="tpu",
                                  fullgraph=True, dynamic=self._dynamic)
         # The artifact is only called with `DT_AOT_CALL_ART=1`; otherwise the

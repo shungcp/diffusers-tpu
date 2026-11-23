@@ -88,18 +88,17 @@ def _op_for(bq: int, bkv: int, fixed_m: bool):
     return torch.tpu.pallas.jax_op(name + f"_kvlen{bkv_kv}", fn_kv)
   op_kv = mk_kv(2048)
   op_kv4 = mk_kv(4096)
-  if os.environ.get("DT_OURS_FAKE", "1") == "1":
-    # jax_op's default fake kernel runs a full, uncached jax.export of the
-    # kernel every time Dynamo traces a call, only to read the output shape.
-    # The output has the query's shape and dtype. Bitwise identical output;
-    # warm run 0 -0.5 s, cold -1.0 s on Pika 480p/121 (c670). DT_OURS_FAKE=0: default fake.
-    @op.register_fake
-    def _fake(query, key, value):
-      return torch.empty_like(query, memory_format=torch.contiguous_format)
+  # jax_op's default fake kernel runs a full, uncached jax.export of the
+  # kernel every time Dynamo traces a call, only to read the output shape.
+  # The output has the query's shape and dtype. Bitwise identical output;
+  # warm run 0 -0.5 s, cold -1.0 s on Pika 480p/121 (c670).
+  @op.register_fake
+  def _fake(query, key, value):
+    return torch.empty_like(query, memory_format=torch.contiguous_format)
 
-    for o in (op_kv, op_kv4):
-      o.register_fake(lambda query, key, value, kv_len:
-                      torch.empty_like(query, memory_format=torch.contiguous_format))
+  for o in (op_kv, op_kv4):
+    o.register_fake(lambda query, key, value, kv_len:
+                    torch.empty_like(query, memory_format=torch.contiguous_format))
   _REGISTERED[key] = op
   _REGISTERED[key + ("kv",)] = op_kv
   _REGISTERED[key + ("kv4",)] = op_kv4

@@ -554,8 +554,7 @@ def main():
     type(pipe)._execution_device = property(lambda _self, _d=dev: _d)
     print(f"  [cpu-text] execution device pinned to {dev}", flush=True)
   _res_text = (args.no_offload and getattr(args, "shard_text", False)
-               and os.environ.get("TORCH_TPU_TOPOLOGY") == "2,2,1,2"
-               and os.environ.get("DT_RESIDENT_TEXT", "1") == "1")
+               and os.environ.get("TORCH_TPU_TOPOLOGY") == "2,2,1,2")
   if args.free_text_after and not _res_text:
     _free_text_after_encode(pipe)
   elif _res_text:
@@ -1049,7 +1048,7 @@ def _free_text_after_encode(pipe, verbose=print, park=True):
   tied = {"park": 0, "restore": 0, "empty": 0}
   #: Host copies indexed by `gid`; each `parked` entry records its slot's gid.
   parked_obj: list = []
-  keep_host = os.environ.get("DT_FREE_TEXT_KEEP_HOST", "1") == "1"
+  keep_host = True
   host_copy: dict = {}
 
   def _key(t):
@@ -1173,7 +1172,7 @@ def _free_text_after_encode(pipe, verbose=print, park=True):
             # The weights never change, so reuse the host copy made at the
             # first park instead of copying device->host after every encode
             # (park 1.0-1.4 -> 0.01 s, ref2va 23.5 -> 21.5 s, bit-identical,
-            # c753). `DT_FREE_TEXT_KEEP_HOST=0` copies every time as before.
+            # c753).
             hk = (id(mod), attr)
             moved = host_copy.get(hk) if keep_host else None
             if moved is None:
@@ -1397,9 +1396,8 @@ def _stream_text_encoder(pipe, args):
     # Honor `--text-layers` here too (it was only applied on the rank0/cpu
     # text paths): MiniMax-H3 reads `hidden_states[50]`, so layers past 51 of
     # 64 were streamed and run for nothing. Found by the v7x weekend run.
-    # `DT_TRUNCATE_TEXT=0` keeps all layers.
     keep = getattr(args, "text_layers", 0) or 0
-    if keep and len(node) > keep and os.environ.get("DT_TRUNCATE_TEXT", "1") == "1":
+    if keep and len(node) > keep:
       n0 = len(node)
       del node[keep:]
       if os.environ.get("RANK", "0") == "0":
@@ -1416,8 +1414,7 @@ def _stream_text_encoder(pipe, args):
 
     _res_text = (getattr(args, "no_offload", False)
                  and getattr(args, "shard_text", False)
-                 and os.environ.get("TORCH_TPU_TOPOLOGY") == "2,2,1,2"
-                 and os.environ.get("DT_RESIDENT_TEXT", "1") == "1")
+                 and os.environ.get("TORCH_TPU_TOPOLOGY") == "2,2,1,2")
     if _res_text:
       encoder.to(torch.device("tpu"))
       print(f"text encoder: {len(node)} sharded layers resident on chip (v7x)",
@@ -1432,8 +1429,7 @@ def _stream_text_encoder(pipe, args):
       )
       # c780: text stage 6.0 -> 4.7 s, ref2va 16.7 -> 15.1 s a request,
       # bit-identical; each rank also keeps 1/world of the layers on the host.
-      if (os.environ.get("DT_TEXT_GATHER", "1") == "1"
-          and int(os.environ.get("WORLD_SIZE", "1")) > 1
+      if (int(os.environ.get("WORLD_SIZE", "1")) > 1
           and not getattr(args, "shard_text", False)):
         # Every rank streams the same layers: pull 1/world of each from the
         # host and all-gather the rest over ICI.
@@ -1612,35 +1608,34 @@ def _vae_on_demand(pipe, verbose=print):
 
   host = torch.device("cpu")
   move(vae, host)          # start on the host
-  if os.environ.get("DT_VAE_KEEP_HOST", "1") == "1":
-    # The weights never change, so keep the host copy: going down just puts
-    # the host tensors back instead of copying 9.7 GiB device->host (~2 s per
-    # encode/decode, c747). Going up is unchanged. Bit-identical (c749).
-    # Pinning that copy and uploading via `_stage_h2d` made each upload 2-3x
-    # faster but the request ~14 s slower elsewhere (c747/c749): not done.
-    keep = {}
-    for sub in vae.modules():
-      for attr, t in list(sub.named_parameters(recurse=False)):
-        keep[(id(sub), attr, True)] = t.detach()
-      for attr, t in list(sub.named_buffers(recurse=False)):
-        if t is not None:
-          keep[(id(sub), attr, False)] = t.detach()
+  # The weights never change, so keep the host copy: going down just puts
+  # the host tensors back instead of copying 9.7 GiB device->host (~2 s per
+  # encode/decode, c747). Going up is unchanged. Bit-identical (c749).
+  # Pinning that copy and uploading via `_stage_h2d` made each upload 2-3x
+  # faster but the request ~14 s slower elsewhere (c747/c749): not done.
+  keep = {}
+  for sub in vae.modules():
+    for attr, t in list(sub.named_parameters(recurse=False)):
+      keep[(id(sub), attr, True)] = t.detach()
+    for attr, t in list(sub.named_buffers(recurse=False)):
+      if t is not None:
+        keep[(id(sub), attr, False)] = t.detach()
 
-    def move(mod, dev):  # noqa: F811
-      n = 0
-      for sub in mod.modules():
-        for attr, t in list(sub.named_parameters(recurse=False)):
-          if t.device != dev:
-            src = keep[(id(sub), attr, True)]
-            sub._parameters[attr] = torch.nn.Parameter(
-                src if dev.type == "cpu" else src.to(dev), requires_grad=False)
-            n += 1
-        for attr, t in list(sub.named_buffers(recurse=False)):
-          if t is not None and t.device != dev:
-            src = keep[(id(sub), attr, False)]
-            sub._buffers[attr] = src if dev.type == "cpu" else src.to(dev)
-            n += 1
-      return n
+  def move(mod, dev):  # noqa: F811
+    n = 0
+    for sub in mod.modules():
+      for attr, t in list(sub.named_parameters(recurse=False)):
+        if t.device != dev:
+          src = keep[(id(sub), attr, True)]
+          sub._parameters[attr] = torch.nn.Parameter(
+              src if dev.type == "cpu" else src.to(dev), requires_grad=False)
+          n += 1
+      for attr, t in list(sub.named_buffers(recurse=False)):
+        if t is not None and t.device != dev:
+          src = keep[(id(sub), attr, False)]
+          sub._buffers[attr] = src if dev.type == "cpu" else src.to(dev)
+          n += 1
+    return n
   verbose("  [vae-on-demand] VAE parked on the host (9.70GiB)", flush=True)
 
   # Wrap both entry points: ref2va also calls `vae.encode` for the
@@ -1965,12 +1960,10 @@ def _shard_decode(vae, verbose=print):
       import numpy as np
       _tm = os.environ.get("DT_DECODE_TIMING") == "1"
       _opt1 = (os.environ.get("DT_DECODE_SHM") == "1"
-               and os.environ.get("DT_OPT1", "1") == "1"
                and not _tiles_done)
       _tail_split = (
           _opt1
           and vae.use_tiling
-          and os.environ.get("DT_DECODE_TAIL_SPLIT", "1") == "1"
           and (num_chunks % world) != 0
           and (world % (num_chunks % world)) == 0
       )
@@ -2095,7 +2088,6 @@ def _shard_decode(vae, verbose=print):
 
     _t2 = time.perf_counter()
     if not (os.environ.get("DT_DECODE_SHM") == "1"
-            and os.environ.get("DT_OPT1", "1") == "1"
             and not _tiles_done and os.environ.get("DT_DECODE_BATCH") != "1"):
       got = {}
       for i, clip in zip(todo, clips):
@@ -2124,7 +2116,7 @@ def _shard_decode(vae, verbose=print):
       # pickles ~1 GB per rank over TCP loopback (7.5-14 s per rank, slower
       # than the decode itself). Every rank still reads everything.
       import numpy as np
-      if not (os.environ.get("DT_OPT1", "1") == "1" and os.environ.get("DT_DECODE_BATCH") != "1"):
+      if not (os.environ.get("DT_DECODE_BATCH") != "1"):
         run_id = getattr(_decode, "_calls", 0)
         _decode._calls = run_id + 1
         base = f"/dev/shm/h3_decode/r{run_id}"
@@ -2138,30 +2130,19 @@ def _shard_decode(vae, verbose=print):
           os.replace(tmp, f"{base}/{i}_{j}.{t.dtype}.npy")   # atomic write
       dist.barrier(group=group)
       if assemble:
-        if os.environ.get("DT_OPT1", "1") == "1":
-          from concurrent.futures import ThreadPoolExecutor
-          names = [n for n in os.listdir(base)
-                   if n.endswith(".npy") and ".tmp." not in n and not n.startswith("tail_")]
-          def _load_one(name):
-            ij, dt = name[:-4].split(".", 1)
-            i, j = (int(x) for x in ij.split("_"))
-            t = torch.from_numpy(np.load(f"{base}/{name}"))
-            if dt == "torch.bfloat16":
-              t = t.view(torch.bfloat16)
-            return (i, j), t
-          with ThreadPoolExecutor(max_workers=8) as ex:
-            for k_ij, t_val in ex.map(_load_one, names):
-              got[k_ij] = t_val
-        else:
-          for name in os.listdir(base):
-            if not name.endswith(".npy") or ".tmp." in name or name.startswith("tail_"):
-              continue
-            ij, dt = name[:-4].split(".", 1)
-            i, j = (int(x) for x in ij.split("_"))
-            t = torch.from_numpy(np.load(f"{base}/{name}"))
-            if dt == "torch.bfloat16":
-              t = t.view(torch.bfloat16)
-            got[(i, j)] = t
+        from concurrent.futures import ThreadPoolExecutor
+        names = [n for n in os.listdir(base)
+                 if n.endswith(".npy") and ".tmp." not in n and not n.startswith("tail_")]
+        def _load_one(name):
+          ij, dt = name[:-4].split(".", 1)
+          i, j = (int(x) for x in ij.split("_"))
+          t = torch.from_numpy(np.load(f"{base}/{name}"))
+          if dt == "torch.bfloat16":
+            t = t.view(torch.bfloat16)
+          return (i, j), t
+        with ThreadPoolExecutor(max_workers=8) as ex:
+          for k_ij, t_val in ex.map(_load_one, names):
+            got[k_ij] = t_val
       dist.barrier(group=group)          # delete only after everyone has read
       # Each rank deletes its own files, so no single rank lags into the
       # next request. The directory itself is kept for reuse.
@@ -2230,13 +2211,13 @@ def _shard_decode(vae, verbose=print):
 
   # The clip is assembled on the host; sending it back to the chip for the
   # postprocessing and then out again cost 3-6 s at 768p/345 on v7x-8.
-  host_post = os.environ.get("DT_DECODE_HOST_POST", "1") == "1"
+  host_post = True
   # Only rank 0, the rank that writes the clip, reads the chunks and
   # assembles it, with more host threads; the others wait at a barrier at
   # the end of the decode step, which keeps the ranks in step for the next
   # request (nothing after the decode touches the chip). 768p/345 decode
-  # 9.0 -> 6.0 s on v7x-8. `DT_DECODE_RANK0_ONLY=0`: every rank assembles.
-  rank0_only = host_post and os.environ.get("DT_DECODE_RANK0_ONLY", "1") == "1"
+  # 9.0 -> 6.0 s on v7x-8.
+  rank0_only = host_post
   assemble = not rank0_only or rank == 0
   if host_post:
     def decode_done():
@@ -2269,8 +2250,7 @@ def _postprocess_where_decoded(done=lambda: None):
     latents = block_state.latents * latents_std + latents_mean
     video = components.vae.decode(latents, return_dict=False)[0]
     t0 = time.perf_counter()
-    if (os.environ.get("DT_OPT1", "1") == "1"
-        and block_state.output_type == "np"
+    if (block_state.output_type == "np"
         and video.device.type == "cpu"
         and not getattr(getattr(components.video_processor, "config", None), "do_normalize", False)):
       if video.numel() == 0:

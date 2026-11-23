@@ -162,7 +162,7 @@ def install(transformer, verbose=print) -> bool:
     # stream overlapping all-reduce; removing all of them on ref2va exposed
     # the all-reduce (1.2 s -> 21.7 s exclusive, net 17 s slower).
     part = os.environ.get("DT_SEGMOD_PART", "all")
-    fused_res = os.environ.get("DT_FUSED_RES_MOD", "1") == "1"
+    fused_res = True
     head_len = runs[-1][0] if len(runs) > 1 else 0
     head_idx = (torch.arange(head_len, device=hidden_states.device)
                 if (fused_res and head_len > 0) else None)
