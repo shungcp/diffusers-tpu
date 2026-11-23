@@ -19,6 +19,14 @@ import os
 import socket
 import time
 
+# Defaults that used to come only from `scripts/run_h3_torchtpu.sh` (as in
+# `torchtpu_h3_image`): compile each block's all-reduces into the block's
+# program, and the 2048/4096 attention blocks. Set before `ours_splash_tt`
+# is imported, which reads the block sizes at import.
+os.environ.setdefault("DT_SPMD_SAFE", "1")
+os.environ.setdefault("DT_OURS_BQ", "2048")
+os.environ.setdefault("DT_OURS_BKV", "4096")
+
 
 def _auto_env():
   """Fills in what torch_tpu's PjRt client insists on, for one or more chips."""
@@ -1891,7 +1899,7 @@ def _shard_decode(vae, verbose=print):
     mine: list = []
     import numpy as np
     _tm = os.environ.get("DT_DECODE_TIMING") == "1"
-    _opt1 = os.environ.get("DT_DECODE_SHM") == "1"
+    _opt1 = True
     _tail_split = (
         _opt1
         and vae.use_tiling
@@ -2018,15 +2026,6 @@ def _shard_decode(vae, verbose=print):
         del clip, all_rows, sub_rows
 
     _t2 = time.perf_counter()
-    if os.environ.get("DT_DECODE_SHM") != "1":
-      got = {}
-      for i, clip in zip(todo, clips):
-        start = i * tokens_chunk_size
-        del start
-        for j in range(int(token_drop > 0) + 1):
-          frame_start = j * chunk_num_frames
-          chunk = clip[:, :, frame_start:frame_start + chunk_num_frames]
-          mine.append((i, j, chunk[:, :, vae.frame_pre_padding:].to("cpu")))
     if os.environ.get("DT_DECODE_TIMING") == "1":
       verbose(f"  [dec-time] rank {rank} to host {time.perf_counter() - _t2:.1f}s",
               flush=True)
@@ -2037,41 +2036,34 @@ def _shard_decode(vae, verbose=print):
     # diverge, and the next request then hangs; identical work on every
     # rank rules that out. Assembly is host CPU work.
     _t3 = time.perf_counter()
-    if os.environ.get("DT_DECODE_SHM") == "1":
-      # Exchange via /dev/shm instead of gloo's all_gather_object, which
-      # pickles ~1 GB per rank over TCP loopback (7.5-14 s per rank, slower
-      # than the decode itself). Every rank still reads everything.
-      import numpy as np
-      dist.barrier(group=group)
-      if assemble:
-        from concurrent.futures import ThreadPoolExecutor
-        names = [n for n in os.listdir(base)
-                 if n.endswith(".npy") and ".tmp." not in n and not n.startswith("tail_")]
-        def _load_one(name):
-          ij, dt = name[:-4].split(".", 1)
-          i, j = (int(x) for x in ij.split("_"))
-          t = torch.from_numpy(np.load(f"{base}/{name}"))
-          if dt == "torch.bfloat16":
-            t = t.view(torch.bfloat16)
-          return (i, j), t
-        with ThreadPoolExecutor(max_workers=8) as ex:
-          for k_ij, t_val in ex.map(_load_one, names):
-            got[k_ij] = t_val
-      dist.barrier(group=group)          # delete only after everyone has read
-      # Each rank deletes its own files, so no single rank lags into the
-      # next request. The directory itself is kept for reuse.
-      for i, j, _ in mine:
-        for dt_cand in ("torch.bfloat16", "torch.float32", "torch.float16"):
-          try:
-            os.remove(f"{base}/{i}_{j}.{dt_cand}.npy")
-          except FileNotFoundError:
-            pass
-    else:
-      boxes = [None] * world
-      dist.all_gather_object(boxes, mine, group=group)
-      for box in boxes:
-        for i, j, t in box:
-          got[(i, j)] = t
+    # Exchange via /dev/shm instead of gloo's all_gather_object, which
+    # pickles ~1 GB per rank over TCP loopback (7.5-14 s per rank, slower
+    # than the decode itself). Every rank still reads everything.
+    import numpy as np
+    dist.barrier(group=group)
+    if assemble:
+      from concurrent.futures import ThreadPoolExecutor
+      names = [n for n in os.listdir(base)
+               if n.endswith(".npy") and ".tmp." not in n and not n.startswith("tail_")]
+      def _load_one(name):
+        ij, dt = name[:-4].split(".", 1)
+        i, j = (int(x) for x in ij.split("_"))
+        t = torch.from_numpy(np.load(f"{base}/{name}"))
+        if dt == "torch.bfloat16":
+          t = t.view(torch.bfloat16)
+        return (i, j), t
+      with ThreadPoolExecutor(max_workers=8) as ex:
+        for k_ij, t_val in ex.map(_load_one, names):
+          got[k_ij] = t_val
+    dist.barrier(group=group)          # delete only after everyone has read
+    # Each rank deletes its own files, so no single rank lags into the
+    # next request. The directory itself is kept for reuse.
+    for i, j, _ in mine:
+      for dt_cand in ("torch.bfloat16", "torch.float32", "torch.float16"):
+        try:
+          os.remove(f"{base}/{i}_{j}.{dt_cand}.npy")
+        except FileNotFoundError:
+          pass
     if os.environ.get("DT_DECODE_TIMING") == "1":
       verbose(f"  [dec-time] rank {rank} gather {time.perf_counter() - _t3:.1f}s",
               flush=True)

@@ -34,7 +34,6 @@ done
 export TORCH_TPU_SLICEBUILDER_ADDRESSES=$(for j in 0 1 2 3 4 5 6 7; do printf "localhost:%d," $((BASE + j)); done | sed 's/,$//')
 # torch_tpu environments usually lack torchvision; diffusers only needs a few names from it.
 export PYTHONPATH=$R/compat/torchvision_stub${PYTHONPATH:+:$PYTHONPATH}
-export DT_SPMD_SAFE=1 DT_DECODE_SHM=1 DT_OURS_BQ=2048 DT_OURS_BKV=4096
 # A prompt that crosses into a new text bucket compiles its DiT program in the
 # background once the text tower starts streaming its layers (the copies wait
 # in C++, so the compile does not slow the encoder through the GIL): 768p
