@@ -85,7 +85,8 @@ def register(seq: int, bq: int, bkv: int, fixed_m: bool):
     # c834: the runtime-length sparse kernel with a 4096 kv block was
     # pathological on ref2va 768p (21.1 s a sparse step vs 5.6), as the dense
     # one was (c804); use the kv-length block size (`DT_OURS_KV_BKV`).
-    bkv = int(os.environ.get("DT_OURS_KV_BKV", "2048"))
+    from diffusers_tpu.backends.ours_splash_tt import kv_bkv
+    bkv = kv_bkv(seq)
   key = (seq, layout, bq, bkv, fixed_m, qk_fp8)
   if key in _REGISTERED:
     STATE["op"], STATE["op_key"], STATE["seq"] = _REGISTERED[key], key, seq

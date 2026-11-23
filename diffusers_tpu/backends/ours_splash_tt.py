@@ -72,15 +72,22 @@ def _op_for(bq: int, bkv: int, fixed_m: bool):
   # pathologically slow on long sequences (768p ref2va, 118k rows: 363 ms
   # against 89.6 without kv_len); a 2048 kv block is 94.3 ms (single-chip
   # sweep, 11-21). `DT_OURS_KV_BKV` overrides.
-  bkv_kv = int(os.environ.get("DT_OURS_KV_BKV", "2048"))
-
-  def fn_kv(query: jax.Array, key: jax.Array, value: jax.Array,
-            kv_len: jax.Array) -> jax.Array:
-    return csa.attention(
-        query, key, value, scale=None, block_q=bq,
-        block_kv=bkv_kv, block_kv_compute=bkv_kv,
-        use_fixed_m=fixed_m, qk_fp8=QK_FP8, kv_len=kv_len[0])
-  op_kv = torch.tpu.pallas.jax_op(name + "_kvlen", fn_kv)
+  # c860/c861 (single chip, bq 2048, fixed-m): the 4096 block is as fast as
+  # the unmasked kernel while the last kv block is short (S % 4096 in
+  # 1..2560: 63.4 vs 63.2 ms at 98k rows; t2va 768p 69.7 vs 69.3) and 4x
+  # slow once it is nearly full or exactly full (S % 4096 = 0 or >= 2872);
+  # 2048 is always 4-5% slower than unmasked. Both variants are registered
+  # and `kv_bkv(S)` picks per shape (static at trace). `DT_OURS_KV_BKV` pins one.
+  def mk_kv(bkv_kv):
+    def fn_kv(query: jax.Array, key: jax.Array, value: jax.Array,
+              kv_len: jax.Array) -> jax.Array:
+      return csa.attention(
+          query, key, value, scale=None, block_q=bq,
+          block_kv=bkv_kv, block_kv_compute=bkv_kv,
+          use_fixed_m=fixed_m, qk_fp8=QK_FP8, kv_len=kv_len[0])
+    return torch.tpu.pallas.jax_op(name + f"_kvlen{bkv_kv}", fn_kv)
+  op_kv = mk_kv(2048)
+  op_kv4 = mk_kv(4096)
   if os.environ.get("DT_OURS_FAKE", "1") == "1":
     # jax_op's default fake kernel runs a full, uncached jax.export of the
     # kernel every time Dynamo traces a call, only to read the output shape.
@@ -90,12 +97,22 @@ def _op_for(bq: int, bkv: int, fixed_m: bool):
     def _fake(query, key, value):
       return torch.empty_like(query, memory_format=torch.contiguous_format)
 
-    @op_kv.register_fake
-    def _fake_kv(query, key, value, kv_len):
-      return torch.empty_like(query, memory_format=torch.contiguous_format)
+    for o in (op_kv, op_kv4):
+      o.register_fake(lambda query, key, value, kv_len:
+                      torch.empty_like(query, memory_format=torch.contiguous_format))
   _REGISTERED[key] = op
   _REGISTERED[key + ("kv",)] = op_kv
+  _REGISTERED[key + ("kv4",)] = op_kv4
   return op
+
+
+def kv_bkv(seq: int) -> int:
+  """Kv block for the runtime-length kernel at `seq` keys (see `_op_for`)."""
+  pin = os.environ.get("DT_OURS_KV_BKV")
+  if pin:
+    return int(pin)
+  r = seq % 4096
+  return 4096 if 0 < r <= 2560 else 2048
 
 
 def install(verbose=print, fixed_m: bool = True) -> bool:
@@ -106,6 +123,7 @@ def install(verbose=print, fixed_m: bool = True) -> bool:
   try:
     op = _op_for(BQ, BKV, fixed_m)   # the only config used; register before compiling
     op_kv = _REGISTERED[(BQ, BKV, fixed_m, QK_FP8, "kv")]
+    op_kv4 = _REGISTERED[(BQ, BKV, fixed_m, QK_FP8, "kv4")]
   except Exception as exc:  # noqa: BLE001
     verbose(f"  [ours] registration failed: {type(exc).__name__}: "
             f"{' '.join(str(exc).split())[:160]}", flush=True)
@@ -144,7 +162,8 @@ def install(verbose=print, fixed_m: bool = True) -> bool:
       value = torch.where(keep, value, torch.zeros((), dtype=value.dtype, device=value.device))
       if SPARSE_OP is not None and query.shape[-2] == SPARSE_SEQ:
         return SPARSE_OP(query, key, value, kv).transpose(1, 2)
-      return op_kv(query, key, value, kv).transpose(1, 2)
+      okv = op_kv4 if kv_bkv(key.shape[-2]) == 4096 else op_kv
+      return okv(query, key, value, kv).transpose(1, 2)
     if TRIPWIRE and max(query.shape) > 1000:   # skip the 56-token text refiner
       m = None if attn_mask is None else tuple(attn_mask.shape)
       raise RuntimeError(
