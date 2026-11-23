@@ -79,8 +79,7 @@ def _exp2(x: jax.Array) -> jax.Array:
   return jnp.exp2(x)
 
 
-import os as _os
-EXP_BF16 = _os.environ.get("DT_EXP_BF16") == "1"
+# Tried: exp2 in bf16 inside the fixed-m body (lossy; not adopted, 11-01).
 
 
 # Tried: folding RoPE into this kernel. Slower (23.20 vs 22.04 ms per call
@@ -222,16 +221,8 @@ def _flash_attention_kernel(
       # rescale — plain accumulate at scale 2^-m. Read it from scalar
       # prefetch, not m_scratch: the scratch tile is (NUM_SUBLANES, bq)
       # f32 and only row 0 carries information.
-      if EXP_BF16:
-        # Lossy option (DT_EXP_BF16=1): compute exp2 in bf16. At ~1e11 exps
-        # per block the EUP can outlast the matmuls, and s is cast to bf16
-        # for the PV matmul anyway; only the l sum loses precision.
-        s_cast = _exp2((qk - (mk_ref[0, h] - fixed_m_bound.FIXED_M_RECENTER))
-                       .astype(jnp.bfloat16))
-        s_curr = s_cast.astype(float32)
-      else:
-        s_curr = _exp2(qk - (mk_ref[0, h] - fixed_m_bound.FIXED_M_RECENTER))
-        s_cast = s_curr.astype(jnp.bfloat16)
+      s_curr = _exp2(qk - (mk_ref[0, h] - fixed_m_bound.FIXED_M_RECENTER))
+      s_cast = s_curr.astype(jnp.bfloat16)
       # l comes from an f32 VPU reduce, not the textbook "append a ones
       # row to V and read l out of the PV matmul": s never leaves VREGs,
       # so the reduce is register work rather than a pass over the tile,

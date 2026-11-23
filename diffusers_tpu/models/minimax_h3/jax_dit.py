@@ -93,46 +93,9 @@ PAD_SEQUENCE_TO = int(os.environ.get("DT_PAD_SEQUENCE_TO", "0"))
 _STREAM = os.environ.get("DT_STREAM_SHARD", "")
 
 
-# DT_CMM=1: hand-written collective matmul for the qkv and first FF
-# projections. Instead of all-gathering the sequence-sharded `x` before a
-# column-sharded matmul, the shards of `x` are rotated around the ring in
-# a shard_map and each is multiplied as it arrives, interleaving ppermute
-# with compute. Mathematically identical to the full matmul.
-CMM = os.environ.get("DT_CMM") == "1"
-
-
-def _cmm(x, weights):
-  """`[x @ w.T for w in weights]`, x sharded on sequence, w on output dim.
-
-  `w` is sharded `P("tp", None)`. The output is sharded on its last axis,
-  the same layout the partitioner would produce.
-  """
-  import jax
-  import jax.numpy as jnp
-  from jax.sharding import PartitionSpec as P
-
-  def local(xl, *wl):
-    n = jax.lax.axis_size("tp")
-    me = jax.lax.axis_index("tp")
-    sl = xl.shape[1]
-    accs = [jnp.zeros((xl.shape[0], sl * n, w.shape[0]), xl.dtype) for w in wl]
-    xc = xl
-    perm = [(j, (j + 1) % n) for j in range(n)]
-    for step in range(n):          # unrolled so XLA can overlap the next transfer with this matmul
-      src = (me - step) % n        # xc currently holds shard `src`
-      nxt = jax.lax.ppermute(xc, "tp", perm) if step + 1 < n else None
-      for a_i, w in enumerate(wl):
-        y = jax.lax.dot_general(xc, w, (((2,), (1,)), ((), ())))
-        accs[a_i] = jax.lax.dynamic_update_slice(accs[a_i], y.astype(xl.dtype),
-                                                 (0, src * sl, 0))
-      xc = nxt
-    return tuple(accs)
-
-  outs = jax.shard_map(
-      local, in_specs=(P(None, "tp", None),) + (P("tp", None),) * len(weights),
-      out_specs=(P(None, None, "tp"),) * len(weights), check_vma=False)(x, *weights)
-  return list(outs)
-
+# A hand-written collective matmul for the qkv and first FF projections
+# (x rotated around the ring by ppermute, multiplied as it arrives) was no
+# faster here (c419: 7.42 s either way) and was removed in the 11-23 cleanup.
 
 def _tp_size():
   """Size of the `tp` axis of the mesh in context (1 without one)."""
@@ -354,11 +317,7 @@ def _build_modules():
         q, k, v = (t.swapaxes(0, 1).reshape((b, n * c) + shape[2:])[:, :s_]
                    for t in jax.lax.map(one, (xs, cs, ss)))
       else:
-        if CMM and rope is not None and x.shape[1] % _tp_size() == 0:
-          qx, kx, vx = _cmm(x, [self.to_q.weight[...], self.to_k.weight[...],
-                                self.to_v.weight[...]])
-        else:
-          qx, kx, vx = self.to_q(x), self.to_k(x), self.to_v(x)
+        qx, kx, vx = self.to_q(x), self.to_k(x), self.to_v(x)
         q = self.norm_q(qx.reshape(shape))
         k = self.norm_k(kx.reshape(shape))
         v = vx.reshape(shape)
@@ -451,10 +410,7 @@ def _build_modules():
           return self.out(value * jax.nn.silu(gate))
         ys = jax.lax.map(one, xs)
         return ys.swapaxes(0, 1).reshape(x.shape[0], n * FF_CHUNK, -1)[:, :x.shape[1]]
-      if CMM and x.shape[1] % _tp_size() == 0 and x.shape[1] > 50000:   # skip the token refiner
-        (y,) = _cmm(x, [self.proj.weight[...]])
-      else:
-        y = self.proj(x)
+      y = self.proj(x)
       tp = getattr(self, "swiglu_tp", 1)
       if tp > 1:
         yr = y.reshape(*y.shape[:-1], tp, 2, -1)
