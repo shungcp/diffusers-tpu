@@ -45,9 +45,6 @@ export DT_DIT_PRECOMPILE=${DT_DIT_PRECOMPILE-1} DT_DIT_PRECOMPILE_START=${DT_DIT
 # One file per program for all ranks; names hash shapes, versions, DT_* settings and sources.
 # DT_AOT_PERSIST= (empty) turns it off.
 export DT_AOT_PERSIST=${DT_AOT_PERSIST-$HOME/.cache/diffusers_tpu/aot_programs}
-# Lossy runs compile a dense and a sparse DiT; call each compiled artifact directly so they do not
-# share one Dynamo frame cache. Lossless runs do not need it (and are ~2 s faster without).
-case " $* " in *" --sparse-window "*) export DT_AOT_CALL_ART=1 ;; esac
 exec "${PYTHON:-python}" -m torch.distributed.run --nproc_per_node 8 --master_port $((BASE + 10)) \
   -m diffusers_tpu.backends.torchtpu_h3 --workflow "$WF" --runs 2 \
   --num-frames 345 --max-duration 15 --height 768 --width 1344 --steps 20 --vae-clip 0 \

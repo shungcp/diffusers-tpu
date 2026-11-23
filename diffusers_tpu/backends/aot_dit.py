@@ -261,7 +261,7 @@ class AotBlocks:
         fn = _fresh_function(fn, len(self._cache))
         compiled = torch.compile(fn, backend="tpu",
                                  fullgraph=True, dynamic=self._dynamic)
-        # The artifact is only called with `DT_AOT_CALL_ART=1`; otherwise the
+        # The artifact is called only to load a saved program; otherwise the
         # `torch.compile` wrapper compiles the same graph again on its first
         # call. And `aot_compile` never hits the AOTAutograd cache: the key
         # includes the backend id `__compiled_fn_<n>_<uuid4>`, new in every
@@ -314,11 +314,10 @@ class AotBlocks:
       self._cache[key] = hit
     self._compiled, self._art = hit
     self._key = key
-    # `DT_AOT_CALL_ART=1`: call this artifact directly, bypassing the
-    # `torch.compile` wrapper. The wrapper picks a program from Dynamo's
-    # frame cache, which is shared by all instances of the same function and
-    # ignores KEY_EXTRA, so it can pick the dense program for a sparse step.
-    # The artifact checks its own guards and raises on mismatch.
+    # The artifact is called directly (bypassing the `torch.compile`
+    # wrapper) only when there is no wrapper or the program was loaded from
+    # disk. Dense and sparse programs of the same shapes no longer collide in
+    # the wrapper's frame cache: each program has its own function object.
     if self._art is not None and (_use_artifact() or self._compiled is None
                                   or os.environ.get("DT_AOT_PERSIST")):
       return self._art(block, *args, **kwargs)

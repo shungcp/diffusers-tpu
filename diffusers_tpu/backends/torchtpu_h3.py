@@ -208,6 +208,21 @@ def parse_args():
                       "With one block per program, ~16%% of the denoise "
                       "is launch overhead (~25 ms per launch, 50 blocks "
                       "x steps) and each block's all-reduce is exposed.")
+  p.add_argument("--text-cache", type=int, default=None,
+                 help="Keep the text conditioning of the last N prompts "
+                      "(default 8, 0 = off; same as DT_TEXT_CACHE).")
+  p.add_argument("--ref-cache", type=int, default=None,
+                 help="Keep the encoded latents of the last N reference "
+                      "images (default 8, 0 = off; same as DT_REF_CACHE).")
+  p.add_argument("--post-attn-pipe", action="store_true",
+                 help="Split to_out -> all_reduce -> norm2 -> FFN -> "
+                      "all_reduce into two slabs whose all-reduces overlap "
+                      "the other slab's compute (DT_POST_ATTN_PIPE=1). Helps "
+                      "on v7x-8 (768p 32.1 -> 29.5 s); no gain on v6e-8.")
+  p.add_argument("--kv-block", type=int, default=None,
+                 help="Force the kv block of the runtime-length attention "
+                      "kernel (default: 4096 when seq %% 4096 is 1..2560, "
+                      "else 2048; same as DT_OURS_KV_BKV).")
   p.add_argument("--text-bucket", type=int, default=256,
                  help="Pad the text rows (DiT and text tower) to a multiple "
                       "of N so prompts of similar length share compiled "
@@ -328,6 +343,14 @@ _TEXT_BUCKET = {"n": 0}
 def main():
   args = parse_args()
   _TEXT_BUCKET["n"] = args.text_bucket
+  # Command-line forms of the remaining tuning knobs; the environment
+  # variables they set are what the modules read.
+  for flag, env in ((args.text_cache, "DT_TEXT_CACHE"), (args.ref_cache, "DT_REF_CACHE"),
+                    (args.kv_block, "DT_OURS_KV_BKV")):
+    if flag is not None:
+      os.environ[env] = str(flag)
+  if args.post_attn_pipe:
+    os.environ["DT_POST_ATTN_PIPE"] = "1"
   if args.qk_fp8:
     os.environ["DT_OURS_QK_FP8"] = "1"
   if not args.no_auto_env:
