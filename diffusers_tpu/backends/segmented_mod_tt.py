@@ -107,10 +107,10 @@ def install(transformer, verbose=print) -> bool:
     *head_runs, (_, _, bulk) = runs
     if not head_runs:
       return fn(x, bulk)
-    # `DT_SEGMOD_CAT=1`: compute each run separately and concatenate.
-    # The default recomputes the head and writes it back; cheap for t2va
-    # (head ~1% of rows, 146.4 -> ~143 s) but slower than the gather for
-    # ref2va (head ~13%, ~188 -> ~205 s).
+    # Recompute the head and write it back: cheap for t2va (head ~1% of
+    # rows, 146.4 -> ~143 s) but slower than the gather for ref2va (head
+    # ~13%, ~188 -> ~205 s). Per-run concatenation and a head-only gather
+    # were tried and dropped (11-23 flag cleanup).
     if _use_where(runs):
       pos = torch.arange(x.shape[1], device=x.device)[None, :, None]
       xc = x.float() if os.environ.get("DT_SEGMOD_F32") == "1" else x
@@ -118,17 +118,6 @@ def install(transformer, verbose=print) -> bool:
       for s, e, i in head_runs:
         out = torch.where((pos >= s) & (pos < e), fn(xc, i), out)
       return out.to(x.dtype)
-    if os.environ.get("DT_SEGMOD_CAT") == "1":
-      return torch.cat([fn(x[:, s:e], i) for s, e, i in runs], dim=1)
-    # `DT_SEGMOD_HEAD=1`: gather per row only over the H head rows; the last
-    # run (video rows) still broadcasts one parameter row. Two ops per
-    # modulation regardless of run count; ref2va has 6 runs (some only a few
-    # rows), where per-run slicing adds ~30 tiny ops per block.
-    if os.environ.get("DT_SEGMOD_HEAD") == "1":
-      H = head_runs[-1][1]
-      idx = torch.tensor([i for s, e, i in head_runs for _ in range(e - s)],
-                         dtype=torch.long, device=x.device)
-      return torch.cat([fn(x[:, :H], idx), fn(x[:, H:], bulk)], dim=1)
     out = fn(x, bulk)
     head = torch.cat([fn(x[:, s:e], i) for s, e, i in head_runs], dim=1)
     return out.index_copy(

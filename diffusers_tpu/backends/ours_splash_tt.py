@@ -32,7 +32,7 @@ BQ = int(os.environ.get("DT_OURS_BQ", "2048"))
 BKV = int(os.environ.get("DT_OURS_BKV", "2048"))
 # Shorter sequences (e.g. the 56-token text refiner) use generic SDPA; they
 # are negligible in the profile and would otherwise need their own op.
-MIN_SEQ = int(os.environ.get("DT_OURS_MIN_SEQ", "2048"))
+MIN_SEQ = 2048
 # `DT_OURS_TRIPWIRE=1`: raise as soon as the main sequence reaches dispatch,
 # reporting shapes and tracing state. Debug aid to confirm the op is used.
 TRIPWIRE = os.environ.get("DT_OURS_TRIPWIRE") == "1"

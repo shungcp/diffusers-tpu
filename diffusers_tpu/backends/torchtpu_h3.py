@@ -520,8 +520,6 @@ def main():
       AotBlocks(list(_vae_blocks)).install()
       print(f"  [aot-vae] {len(_vae_blocks)} decoder layers via AotBlocks",
             flush=True)
-  if os.environ.get("DT_DECODE_TILE_BATCH"):
-    _batch_decode_tiles(pipe.vae, int(os.environ["DT_DECODE_TILE_BATCH"]))
   if args.shard_decode:
     # Replaces --host-decode: same loop, chunks split across ranks and
     # gathered on the host. 90.8 s on one chip -> 23.0 s on 8 ranks,
@@ -1851,43 +1849,6 @@ def _hbm_snapshot(stage, pipe=None, verbose=print):
 
 
 
-def _batch_decode_tiles(vae, batch, verbose=print):
-  """Decode `_decode_clip`'s spatial tiles `batch` at a time along the batch dim.
-
-  The stock path decodes each tile (28 per clip at 768x1344) separately;
-  batching tiles took the native JAX pipeline's 345-frame decode from
-  12.8 to 7.7 s. Slicing, `post_quant_conv` and `_stitch_tiles` are unchanged.
-  """
-  import torch
-
-  if not vae.use_tiling:
-    return
-
-  def decode_clip(z):
-    ratio = vae.spatial_compression_ratio
-    height, width = z.shape[-2] * ratio, z.shape[-1] * ratio
-    ys, yl, yo = vae._split_tiles(height, vae.tile_sample_min_height,
-                                  vae.tile_sample_min_overlap_height)
-    xs, xl, xo = vae._split_tiles(width, vae.tile_sample_min_width,
-                                  vae.tile_sample_min_overlap_width)
-    tiles = [z[..., i // ratio:i // ratio + il // ratio,
-               j // ratio:j // ratio + jl // ratio]
-             for i, il in zip(ys, yl) for j, jl in zip(xs, xl)]
-    outs = []
-    for s0 in range(0, len(tiles), batch):
-      group = tiles[s0:s0 + batch]
-      n = len(group)
-      group = group + [group[-1]] * (batch - n)     # pad the last group to avoid a recompile
-      out = vae.decoder(vae.post_quant_conv(torch.cat(group, dim=0)))
-      outs += list(out[:n].split(1, dim=0))
-    ncol = len(xs)
-    rows = [outs[r * ncol:(r + 1) * ncol] for r in range(len(ys))]
-    return vae._stitch_tiles(rows, yo, xo)
-
-  vae._decode_clip = decode_clip
-  verbose(f"  [decode] decoding tiles in batches of {batch}", flush=True)
-
-
 def _shard_decode(vae, verbose=print):
   """Split the VAE decode's chunks across ranks and reassemble on the host.
 
@@ -2235,7 +2196,7 @@ def _shard_decode(vae, verbose=print):
     if rank0_only:
       # torchrun pins every rank to one thread; with the other ranks idle,
       # rank 0 can use the host.
-      torch.set_num_threads(int(os.environ.get("DT_DECODE_THREADS", 32)))
+      torch.set_num_threads(32)
     # Step 3: blend and trim exactly as `_host_decode` does, in order.
     decoded_chunks = []
     overlap = None
@@ -2479,9 +2440,7 @@ def _generate(pipe, args, reference):
   # frames to PIL on every rank contends for host memory bandwidth and
   # slows ranks down. `_write` converts to uint8 with the same formula as
   # `numpy_to_pil`, so written frames are byte-identical.
-  # `DT_OUTPUT_PIL=1` restores the old behaviour.
-  if os.environ.get("DT_OUTPUT_PIL") != "1":
-    kwargs["output_type"] = "np"
+  kwargs["output_type"] = "np"
   if reference is not None:
     from diffusers.modular_pipelines.minimax_h3 import MiniMaxH3ImageReference
 
