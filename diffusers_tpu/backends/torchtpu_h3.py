@@ -560,6 +560,8 @@ def main():
                and os.environ.get("DT_RESIDENT_TEXT", "1") == "1")
   if args.free_text_after and not _res_text:
     _free_text_after_encode(pipe)
+  elif _res_text:
+    _free_text_after_encode(pipe, park=False)
   if args.dump_latents and int(os.environ.get('RANK', 0)) == 0:
     _dump_latents(pipe, args.dump_latents)
   if args.vae_on_demand:
@@ -1020,8 +1022,13 @@ def _report_steps():
   return " ".join(out)
 
 
-def _free_text_after_encode(pipe, verbose=print):
+def _free_text_after_encode(pipe, verbose=print, park=True):
   """Move the text encoder back to the host right after encoding.
+
+  `park=False` (text encoder resident, e.g. v7x `--no-offload --shard-text`):
+  only the conditioning cache and the `--text-bucket` padding below apply;
+  before 11-23 the resident path got neither and recompiled the text tower
+  for every prompt length (found on the v7x-8).
 
   Its non-layer modules (including the vision tower) otherwise stay on the
   chip for the whole request although ref2va only uses them once, which can
@@ -1143,7 +1150,7 @@ def _free_text_after_encode(pipe, verbose=print):
       g = torch.Generator().manual_seed(int(os.environ.get("DT_EMB_NOISE_SEED", "0")))
       nz = torch.randn(tuple(out.shape), generator=g, device="cpu")
       out = (out.float() * (1 + eps * nz.to(out.device))).to(out.dtype)
-    if True:
+    if park:
       n = 0
       # Move each storage once and record sharing as `gid` for `_restore`.
       seen: dict = {}
