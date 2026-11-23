@@ -30,10 +30,6 @@ def _setup_env():
   # add of both branches, inside the FF projection's prologue. 4736x3552
   # denoise 2.94 -> 2.88 s.
   os.environ.setdefault("DT_SEGMOD_F32", "1")
-  # VAE decoder: attention as two matmuls and a softmax, FF kept 2-D (see
-  # where they are applied). 4736x3552 decode 0.131 -> 0.075 s.
-  os.environ.setdefault("DT_VAE_MATH_ATTN", "1")
-  os.environ.setdefault("DT_VAE_FF_2D", "1")
   from .torchtpu_h3 import _auto_env
   _auto_env()
   _ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
@@ -195,18 +191,18 @@ def main():
   ).install()
   say(f"  DiT loaded & sharded on TPU ({time.perf_counter() - t0:.1f}s)", flush=True)
 
-  if os.environ.get("DT_VAE_MATH_ATTN") == "1":
-    # The decoder's attention (16 heads x 64, 512 rows a tile) written out as
-    # two matmuls and a softmax for XLA to fuse, instead of the SDPA kernel.
-    import diffusers.models.autoencoders.autoencoder_kl_minimax_h3_image as vae_mod
+  # VAE decoder: attention written out as two matmuls and a softmax (16 heads
+  # x 64, 512 rows a tile) for XLA to fuse, instead of the SDPA kernel, and
+  # the FF kept 2-D (below). 4736x3552 decode 0.131 -> 0.075 s.
+  import diffusers.models.autoencoders.autoencoder_kl_minimax_h3_image as vae_mod
 
-    def _math_attn(query, key, value, attn_mask=None, **_):
-      q, k, v = (t.transpose(1, 2) for t in (query, key, value))
-      s = (q @ k.transpose(-1, -2)).float() * (q.shape[-1] ** -0.5)
-      p = torch.softmax(s, dim=-1).to(v.dtype)
-      return (p @ v).transpose(1, 2)
+  def _math_attn(query, key, value, attn_mask=None, **_):
+    q, k, v = (t.transpose(1, 2) for t in (query, key, value))
+    s = (q @ k.transpose(-1, -2)).float() * (q.shape[-1] ** -0.5)
+    p = torch.softmax(s, dim=-1).to(v.dtype)
+    return (p @ v).transpose(1, 2)
 
-    vae_mod.dispatch_attention_fn = _math_attn
+  vae_mod.dispatch_attention_fn = _math_attn
 
   # -- 3. Load 2D Image VAE & Compile 24-layer ViT Decoder -------------------
   t0 = time.perf_counter()
@@ -215,14 +211,13 @@ def main():
   ).eval()
   vae.requires_grad_(False)
   vae.to(device)
-  if os.environ.get("DT_VAE_FF_2D") == "1":
-    # A decoder tile is 261 rows, not a multiple of 8, so every 3-D view of
-    # a (16 * 261, n) matmul result is a relayout copy; the SwiGLU between
-    # the two FF matmuls stays 2-D and only the FF output is reshaped back.
-    for block in vae.decoder.transformer_blocks:
-      def _ff_2d(x, _ff=block.ff, _fwd=block.ff.forward):
-        return _fwd(x.reshape(-1, x.shape[-1])).reshape(*x.shape[:-1], -1)
-      block.ff.forward = _ff_2d
+  # A decoder tile is 261 rows, not a multiple of 8, so every 3-D view of a
+  # (16 * 261, n) matmul result is a relayout copy; the SwiGLU between the two
+  # FF matmuls stays 2-D and only the FF output is reshaped back.
+  for block in vae.decoder.transformer_blocks:
+    def _ff_2d(x, _ff=block.ff, _fwd=block.ff.forward):
+      return _fwd(x.reshape(-1, x.shape[-1])).reshape(*x.shape[:-1], -1)
+    block.ff.forward = _ff_2d
   vae_aot = aot_dit.AotBlocks(
       vae.decoder.transformer_blocks, dynamic=False, group=args.aot_vae_group, verbose=say
   ).install()
@@ -279,39 +274,38 @@ def main():
   _vis_fns = {}
   _vis_meta_cache = {}
 
-  if os.environ.get("DT_VIS_COMPILE", "1") == "1":
-    from transformers.models.qwen3_vl import modeling_qwen3_vl as _m_qwen
-    if not getattr(_m_qwen.Qwen3VLVisionAttention, "_tpu_fused_patched", False):
-      def _vis_attn_fwd(self_, hidden_states, cu_seqlens=None,
-                        position_embeddings=None, max_seqlen=None, **kwargs):
-        del max_seqlen, kwargs
-        seq_length = hidden_states.shape[0]
-        q, k, v = (self_.qkv(hidden_states)
-                   .reshape(seq_length, 3, self_.num_heads, -1)
-                   .permute(1, 0, 2, 3).unbind(0))
-        cos, sin = position_embeddings
-        q, k = _m_qwen.apply_rotary_pos_emb_vision(q, k, cos, sin)
-        q = q.transpose(0, 1).unsqueeze(0)
-        k = k.transpose(0, 1).unsqueeze(0)
-        v = v.transpose(0, 1).unsqueeze(0)
-        lengths = getattr(self_, "_static_lengths", None)
-        if lengths is None and cu_seqlens is not None and cu_seqlens.shape[0] > 2:
-          lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-        if not lengths or len(lengths) == 1:
-          out = torch.nn.functional.scaled_dot_product_attention(
-              q, k, v, scale=self_.scaling)
-        else:
-          out = torch.cat([
-              torch.nn.functional.scaled_dot_product_attention(
-                  qc, kc, vc, scale=self_.scaling)
-              for qc, kc, vc in zip(
-                  q.split(lengths, dim=2),
-                  k.split(lengths, dim=2),
-                  v.split(lengths, dim=2))
-          ], dim=2)
-        return self_.proj(out.transpose(1, 2).reshape(seq_length, -1))
-      _m_qwen.Qwen3VLVisionAttention.forward = _vis_attn_fwd
-      _m_qwen.Qwen3VLVisionAttention._tpu_fused_patched = True
+  from transformers.models.qwen3_vl import modeling_qwen3_vl as _m_qwen
+  if not getattr(_m_qwen.Qwen3VLVisionAttention, "_tpu_fused_patched", False):
+    def _vis_attn_fwd(self_, hidden_states, cu_seqlens=None,
+                      position_embeddings=None, max_seqlen=None, **kwargs):
+      del max_seqlen, kwargs
+      seq_length = hidden_states.shape[0]
+      q, k, v = (self_.qkv(hidden_states)
+                 .reshape(seq_length, 3, self_.num_heads, -1)
+                 .permute(1, 0, 2, 3).unbind(0))
+      cos, sin = position_embeddings
+      q, k = _m_qwen.apply_rotary_pos_emb_vision(q, k, cos, sin)
+      q = q.transpose(0, 1).unsqueeze(0)
+      k = k.transpose(0, 1).unsqueeze(0)
+      v = v.transpose(0, 1).unsqueeze(0)
+      lengths = getattr(self_, "_static_lengths", None)
+      if lengths is None and cu_seqlens is not None and cu_seqlens.shape[0] > 2:
+        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+      if not lengths or len(lengths) == 1:
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, scale=self_.scaling)
+      else:
+        out = torch.cat([
+            torch.nn.functional.scaled_dot_product_attention(
+                qc, kc, vc, scale=self_.scaling)
+            for qc, kc, vc in zip(
+                q.split(lengths, dim=2),
+                k.split(lengths, dim=2),
+                v.split(lengths, dim=2))
+        ], dim=2)
+      return self_.proj(out.transpose(1, 2).reshape(seq_length, -1))
+    _m_qwen.Qwen3VLVisionAttention.forward = _vis_attn_fwd
+    _m_qwen.Qwen3VLVisionAttention._tpu_fused_patched = True
 
   class _VisPrologueDone(Exception):
     pass
@@ -378,13 +372,8 @@ def main():
     pv = vision_kwargs["pixel_values"].to(device, text_encoder.dtype)
     grid = vision_kwargs["image_grid_thw"].to(device)
     embeds = m.get_input_embeddings()(ids)
-    if os.environ.get("DT_VIS_COMPILE", "1") == "1":
-      img, deep_feats = _run_compiled_vision(m.visual, pv, grid)
-      img = img.to(embeds.device, embeds.dtype)
-    else:
-      feats = m.get_image_features(pv, grid, return_dict=True)
-      img = torch.cat(feats.pooler_output, dim=0).to(embeds.device, embeds.dtype)
-      deep_feats = feats.deepstack_features
+    img, deep_feats = _run_compiled_vision(m.visual, pv, grid)
+    img = img.to(embeds.device, embeds.dtype)
     mark()
     mask, _ = m.get_placeholder_mask(ids, inputs_embeds=embeds, image_features=img)
     embeds = embeds.masked_scatter(mask, img)
@@ -418,22 +407,16 @@ def main():
       token_ids = tokenizer(args.prompt, add_special_tokens=False)["input_ids"][:4096]
       tags = np.ones((len(token_ids),), dtype=np.int64)
       with torch.no_grad():
-        if os.environ.get("DT_TEXT_COMPILE", "1") == "1":
-          p_embeds = compiled_text(token_ids)
-          if os.environ.get("DT_TEXT_CHECK") == "1":
-            ref = get_qwen3vl_prompt_embeds(
-                text_encoder, processor, token_ids, {},
-                text_encoder_layer=50, device=device, dtype=dtype)
-            d = (p_embeds.float() - ref.float()).abs()
-            a_, b_ = p_embeds.float().flatten(), ref.float().flatten()
-            say(f"  [text-check] cos {float((a_ @ b_) / (a_.norm() * b_.norm())):.6f}", flush=True)
-            say(f"  [text-check] compiled vs eager: max|d| {float(d.max()):.3g}, "
-                f"mean|d| {float(d.mean()):.3g}, |ref| {float(ref.float().abs().mean()):.3g}", flush=True)
-        else:
-          p_embeds = get_qwen3vl_prompt_embeds(
+        p_embeds = compiled_text(token_ids)
+        if os.environ.get("DT_TEXT_CHECK") == "1":
+          ref = get_qwen3vl_prompt_embeds(
               text_encoder, processor, token_ids, {},
-              text_encoder_layer=50, device=device, dtype=dtype
-          )
+              text_encoder_layer=50, device=device, dtype=dtype)
+          d = (p_embeds.float() - ref.float()).abs()
+          a_, b_ = p_embeds.float().flatten(), ref.float().flatten()
+          say(f"  [text-check] cos {float((a_ @ b_) / (a_.norm() * b_.norm())):.6f}", flush=True)
+          say(f"  [text-check] compiled vs eager: max|d| {float(d.max()):.3g}, "
+              f"mean|d| {float(d.mean()):.3g}, |ref| {float(ref.float().abs().mean()):.3g}", flush=True)
       return p_embeds, tags, [], []
 
     _tt = [time.perf_counter()]
@@ -465,16 +448,12 @@ def main():
         "image_grid_thw": vision["image_grid_thw"].to(device=device),
     }
     with torch.no_grad():
-      if os.environ.get("DT_TEXT_COMPILE", "1") == "1":
-        p_embeds = compiled_text_vision(token_ids, vkw, _mark)
-        if os.environ.get("DT_TEXT_CHECK") == "1":
-          ref = get_qwen3vl_prompt_embeds(
-              text_encoder, processor, token_ids, vkw, text_encoder_layer=50, device=device, dtype=dtype)
-          a_, b_ = p_embeds.float().flatten(), ref.float().flatten()
-          say(f"  [text-check] cos {float((a_ @ b_) / (a_.norm() * b_.norm())):.6f}", flush=True)
-      else:
-        p_embeds = get_qwen3vl_prompt_embeds(
+      p_embeds = compiled_text_vision(token_ids, vkw, _mark)
+      if os.environ.get("DT_TEXT_CHECK") == "1":
+        ref = get_qwen3vl_prompt_embeds(
             text_encoder, processor, token_ids, vkw, text_encoder_layer=50, device=device, dtype=dtype)
+        a_, b_ = p_embeds.float().flatten(), ref.float().flatten()
+        say(f"  [text-check] cos {float((a_ @ b_) / (a_.norm() * b_.norm())):.6f}", flush=True)
     _mark()
     if os.environ.get("DT_TEXT_TIMING") == "1":
       say("  [text-timing] " + " ".join(f"{b - a:.3f}" for a, b in zip(_tt, _tt[1:])), flush=True)
@@ -492,7 +471,7 @@ def main():
     h, w = x.shape[-2:]
     ys, yl, yo = vae._split_tiles(h, vae.tile_sample_min_height, vae.tile_sample_min_overlap_height)
     xs, xl, xo = vae._split_tiles(w, vae.tile_sample_min_width, vae.tile_sample_min_overlap_width)
-    if not vae.use_tiling or os.environ.get("DT_ENC_COMPILE", "1") != "1":
+    if not vae.use_tiling:
       return vae.encode(x, return_dict=False)[0]
     tiles = torch.cat([x[..., i:i + li, j:j + lj] for i, li in zip(ys, yl) for j, lj in zip(xs, xl)])
     key = tuple(tiles.shape)
@@ -709,7 +688,7 @@ def main():
     )
     if prof_ctx is not None:
       prof_ctx.__exit__(None, None, None)
-    if world > 1 and os.environ.get("DT_RUN_BARRIER", "1") == "1":
+    if world > 1:
       # The ranks finish a request at different times when one of them is
       # still compiling (the first request): rank 3 entered the next one
       # 0.84 s after rank 6, and the first collective made every rank wait
