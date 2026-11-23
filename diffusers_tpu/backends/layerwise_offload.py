@@ -55,10 +55,7 @@ def _stage_h2d(tensor: "torch.Tensor", device) -> "torch.Tensor":
   buffer (`TPU_PREMAPPED_BUFFER_SIZE`) sized to the working set this cuts
   cold-start H2D from ~43 s to ~31 s; with a too-small premapped region the
   slower D2H cancels the gain. Output is bitwise identical.
-  `DT_OFFLOAD_PLAIN_H2D=1` uses the plain `.to()` path.
   """
-  if os.environ.get("DT_OFFLOAD_PLAIN_H2D") == "1":
-    return tensor.to(device)
   if not tensor.is_pinned():
     tensor = tensor.contiguous().pin_memory()
   flat = tensor.reshape(-1)
@@ -134,9 +131,6 @@ class LayerwiseOffloadManager:
           "this build does not provide."
       )
     self._forward_hooks: list[object] = []
-    # layer index -> in-flight `TransferFuture`s, when
-    # `DT_PREFETCH_ASYNC=1`. Empty on the sync path.
-    self._pending: dict[int, list] = {}
     # layer index -> list of (parameter, host buffer in device layout, shape).
     # The shape is kept here because a released parameter's `.data` is a
     # zero-element placeholder, so `tensor.shape` no longer describes it.
@@ -341,17 +335,11 @@ class LayerwiseOffloadManager:
       dsts.append(staged)
     timing = os.environ.get("DT_OFFLOAD_TIMING") == "1"
     t0 = time.perf_counter() if timing else 0.0
-    # `DT_PREFETCH_ASYNC=1` issues the copies without waiting; `await_layer`
-    # blocks on them later. The sync path is ~10x slower during denoising
-    # than on an idle device, either from HBM contention or from queueing
-    # behind pending compute; async issue lets the host continue meanwhile.
-    if os.environ.get("DT_PREFETCH_ASYNC") == "1":
-      futures = [batch_transfer_h2d(srcs, dsts)
-                 for srcs, dsts in batches.values()]
-      self._pending.setdefault(layer_idx, []).extend(futures)
-    else:
-      for srcs, dsts in batches.values():
-        batch_transfer_h2d_sync(srcs, dsts)
+    # An async variant (issue now, wait in `await_layer`) was correct but no
+    # faster (the sync path's slowness during denoising is DMA plus waiting,
+    # not issue overhead) and was removed in the 11-23 flag cleanup.
+    for srcs, dsts in batches.values():
+      batch_transfer_h2d_sync(srcs, dsts)
     if timing:
       # Accumulate prefetch bandwidth and batching stats; print every 50 calls.
       nb = sum(h.numel() * h.element_size() for _, _, h, _, _ in copies)
@@ -382,12 +370,6 @@ class LayerwiseOffloadManager:
     for (module, attr, host, _, is_param), staged in zip(copies, device_tensors):
       self._put(module, attr, staged, is_param)
     self._resident[layer_idx] = device_tensors
-
-  def await_layer(self, layer_idx: int) -> None:
-    """Blocks until `layer_idx`'s async copies have landed."""
-    pending = getattr(self, "_pending", {}).pop(layer_idx, None)
-    if pending:
-      await_all(pending)
 
   def release_layer(self, layer_idx: int) -> None:
     # Pinned layers stay resident. When full residency does not fit, pinning
@@ -433,9 +415,6 @@ class LayerwiseOffloadManager:
         for ahead in range(1, self.prefetch_size + 1):
           if idx + ahead < self.num_layers:
             self.prefetch_layer(idx + ahead)
-        # Wait only for `idx`; lookahead copies land under this block's
-        # compute.
-        self.await_layer(idx)
         return None
 
       return _hook
