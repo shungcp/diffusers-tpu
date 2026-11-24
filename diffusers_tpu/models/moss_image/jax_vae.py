@@ -167,9 +167,12 @@ def make_decoder(vae_dir, mesh=None, dtype=jnp.float32, batch_norm_eps=1e-4):
   # way. `DT_MOSS_VAE_VMEM_KIB=0` keeps the global value.
   import os
   kib = int(os.environ.get("DT_MOSS_VAE_VMEM_KIB", 16384))
+  # A TPU compile option: other backends reject it (the CPU check below).
+  options = ({"xla_tpu_scoped_vmem_limit_kib": kib}
+             if kib and jax.default_backend() == "tpu" else None)
   fn = jax.jit(functools.partial(decode, mesh=mesh, dtype=dtype,
                                  batch_norm_eps=batch_norm_eps),
-               compiler_options={"xla_tpu_scoped_vmem_limit_kib": kib} if kib else None)
+               compiler_options=options)
   return params, fn
 
 

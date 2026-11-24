@@ -16,6 +16,10 @@ diffusers_tpu/
     qwen3_vl/         Qwen3-VL text and vision towers in flax (shared by models that use them)
     minimax_h3/       MiniMax-H3: JAX DiT/VAE/pipeline/server, torchax runner
     moss_image/       MOSS-Image: torchax DiT core and one-program step, JAX VAE decoder
+    dac/              the DAC audio VAE decoder in JAX (shared by the OpenMOSS audio models)
+    moss_soundeffect/ MOSS-SoundEffect-v2: JAX audio DiT and step, prompt cleaning, pipeline
+    wan_vae/          the Wan2.1 video VAE in JAX, whole clip or chunked in time (shared)
+    mova/             MOVA: JAX video experts + audio tower + bridge, TI2VA pipeline
 ```
 
 ## Recommended order for a new diffusers model

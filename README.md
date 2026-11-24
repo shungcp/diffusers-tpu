@@ -4,9 +4,9 @@ Fast inference for open diffusion models on Cloud TPU, built on top of [huggingf
 
 基于 [huggingface/diffusers](https://github.com/huggingface/diffusers),在 Cloud TPU 上高速运行开源扩散模型。
 
-Four models are supported today: **MiniMax-H3** (video + audio), **MiniMax-H3-Image** (image and image editing), **Qwen-Image-2.1** (image) and **MOSS-Image** (image, torchax backend).
+Six models are supported today: **MiniMax-H3** (video + audio), **MiniMax-H3-Image** (image and image editing), **Qwen-Image-2.1** (image), **MOSS-Image** (image, torchax backend), **MOSS-SoundEffect-v2** (text-to-audio, JAX) and **MOVA** (image + text to video with audio, JAX).
 
-目前支持四个模型:**MiniMax-H3**(视频 + 音频)、**MiniMax-H3-Image**(图像与图像编辑)、**Qwen-Image-2.1**(图像)和 **MOSS-Image**(图像,torchax 后端)。
+目前支持六个模型:**MiniMax-H3**(视频 + 音频)、**MiniMax-H3-Image**(图像与图像编辑)、**Qwen-Image-2.1**(图像)、**MOSS-Image**(图像,torchax 后端)、**MOSS-SoundEffect-v2**(文生音效,JAX)和 **MOVA**(图 + 文生成带同步音频的视频,JAX)。
 
 MiniMax-H3 also runs with the six-step **Pika-H3-Flex** adapters.
 
@@ -30,9 +30,15 @@ Newest first. Each entry links a date to what changed.
 
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-24** — **MOVA-360p** (OpenMOSS image + text to video with synchronized audio: two 14B Wan2.2-style video experts, a 1.3B audio tower, a cross-modal bridge, UMT5-XXL, the Wan2.1 VAE and DAC): 352x640, 193 frames (8 s), 50 steps, CFG 5. On a v6e-4 a clip takes **164.1 s** end to end (3.25 s a step; both experts resident, 24.1 GiB peak a chip; the video layers run sequence parallel: whole weights all-gathered layer by layer, Ulysses all-to-all around the self-attention, instead of three all-reduces of the residual stream a layer under tensor parallelism, 4.22 s a step); on a v6e-8, with the CFG branches on two groups of four chips, **91.2 s** (1.79 s a step) against 9.0 s a step on an H100 with offload (official README). Everything but the text encoder is native JAX (the UMT5 is transformers' own through torchax); in float32 the pipeline matches the official code (frames within 2/255, audio SNR 45.8 dB after 4 steps), in bfloat16 its error is that of the official bfloat16 run. The Wan2.1 VAE (`models/wan_vae/`) is shared and can run chunked in time with the official cache semantics ([usage](#run-mova--运行-mova)).
+
+  **2026-11-24** — 支持 **MOVA-360p**(OpenMOSS 图 + 文生成带同步音频的视频:两个 14B Wan2.2 式视频专家、1.3B 音频塔、跨模态桥接、UMT5-XXL、Wan2.1 VAE、DAC):352x640、193 帧(8 秒)、50 步、CFG 5。v6e-4 上一条端到端 **164.1 秒**(每步 3.25 秒;两个专家常驻、每 chip 峰值 24.1 GiB;视频层序列并行:权重逐层 all-gather 成整份,自注意力前后各一次 Ulysses all-to-all,代替张量并行下每层三次残差流 all-reduce(每步 4.22 秒));v6e-8 上 CFG 两支各占 4 chip,**91.2 秒**(每步 1.79 秒),官方 README 中 H100(offload)每步 9.0 秒。除文本编码器外全部为原生 JAX(UMT5 用 transformers 自带实现经 torchax);fp32 下与官方代码一致(4 步后帧差 ≤ 2/255、音频 SNR 45.8 dB),bf16 下误差与官方 bf16 同级。Wan2.1 VAE(`models/wan_vae/`)为公共模块,可按官方缓存语义分时间块运行。
 - **2026-11-24** — torch_tpu, three fixes, all with the same frames by default. (1) The Pika sampler read each step's sigma from the chip, so the host waited for all queued work before it could enqueue the next step; it now reads a host copy: Pika ref2va 480x832x121 on a v6e-8 9.2 -> **8.0 s** (text-to-video unchanged at 3.8 s). (2) With the text encoder resident (`--no-offload --shard-text`, v7x), a request in a new text bucket waited the full 60 s timeout for the background DiT compile to start: ref2va 480p 82.9 -> **25.9 s** on a v7x-8. (3) The 2-slab post-attention pipeline (`--post-attn-pipe`) now also runs in the text-bucket path: 768p text-to-video 95.8 -> **87.8 s** on a v7x-8 (off by default; no gain on a v6e-8). (2) and (3) were found and measured on the v7x-8.
 
   **2026-11-24** — torch_tpu 三处修复,默认配置输出逐位不变。(1) Pika 采样器每步从 chip 读 sigma,主机要等排队的计算全部完成才能发下一步;改读主机副本:v6e-8 上 Pika 参考图生视频 480x832x121 9.2 -> **8.0 秒**(文生视频不变,3.8 秒)。(2) 文本编码器常驻时(`--no-offload --shard-text`,v7x),换到新文本桶的请求要白等 60 秒超时,后台 DiT 编译才开始:v7x-8 上 ref2va 480p 82.9 -> **25.9 秒**。(3) 两段注意力后流水(`--post-attn-pipe`)现在也用于分桶路径:v7x-8 上 768p 文生视频 95.8 -> **87.8 秒**(默认关;v6e-8 上无收益)。(2)(3) 由 v7x-8 那边发现并实测。
+- **2026-11-22** — **MOSS-SoundEffect-v2** (OpenMOSS text-to-audio: a 1.3B Wan-layout audio DiT, the DAC VAE and Qwen3-1.7B): 100 steps with CFG 4, 48 kHz. On a v6e-4 a 10 s clip takes **0.95 s** end to end (the CFG branches on two pairs of chips, each pair splitting the 1,500-row sequence: 9.5 ms a step), 1.2 s on 2 chips and 2.1 s on one; four one-chip replicas serve **0.58 s** a clip. The DiT and the DAC decoder are native JAX and the text encoder is the stock transformers Qwen3 through torchax, so none of the official code or its pins is needed; in float32 the whole pipeline matches the official code step by step (waveform SNR 95 dB after 10 steps, 89 dB after 100). The DAC decoder (`models/dac/`) is shared, for MOVA and OmniVAE next ([usage](#run-moss-soundeffect-v2--运行-moss-soundeffect-v2)).
+
+  **2026-11-22** — 支持 **MOSS-SoundEffect-v2**(OpenMOSS 文生音效:1.3B Wan 结构音频 DiT、DAC VAE、Qwen3-1.7B):100 步、CFG 4、48 kHz。v6e-4 上 10 秒音频端到端 **0.95 秒**(CFG 两支各占两个 chip,每对 chip 切分 1500 行序列:每步 9.5 ms),2 chip 1.2 秒,单 chip 2.1 秒;四个单 chip 副本吞吐每条 **0.58 秒**。DiT 与 DAC 解码器为原生 JAX,文本编码器是 transformers 自带的 Qwen3 经 torchax 运行,不需要官方代码及其依赖版本;fp32 下整条流程与官方代码逐步一致(10 步后波形 SNR 95 dB,100 步后 89 dB)。DAC 解码器(`models/dac/`)为公共模块,接下来给 MOVA 和 OmniVAE 复用。
 - **2026-11-22** — torch_tpu text-length buckets, on by default (`--text-bucket 256`; `0` turns it off and is bit-identical to before). A new prompt length used to recompile the DiT programs (27–34 s at 768p) and, in lossy runs, the sparse attention program (another 24 s). Text rows are now padded to a multiple of 256 and masked by the true length at run time, and the target video rows move to the front of the packed sequence, so the video starts at row 0 for every prompt: each block broadcasts one modulation row over the video (what `--seg-mod` did, which baked text-dependent rows into the program), and the sparse block table no longer depends on the text. 768x1344x345, 20 steps, v6e-8, a new prompt in a seen bucket: text-to-video **152.6 -> 128.3 s** lossless, **89.4 -> 42.4 s** lossy; reference-to-video **191.3 -> 166.9 s**, **103.2 -> 59.1 s**; Pika 480p text-to-video 33.5 -> **8.1 s**; a restarted process with saved programs serves a new prompt at steady-state speed (lossy 70.0 -> **41.6 s**). Steady state within 2%. Not bit-identical to the unbucketed path (shapes and summation order change); DINO near the semantics-free 1e-3 perturbation floor and judged visually equivalent over 18 prompt/seed pairs (6 prompts). Also: `--text-layers 51` now applies to the default text path (13 of 64 Qwen3-VL layers were streamed and run for nothing; bit-identical, 0.3–0.8 s a request), and `torchtpu_h3` writes the soundtrack (`*_audio.npy`) beside the frames.
 
   **2026-11-22** — torch_tpu 文本长度分桶,默认开启(`--text-bucket 256`;设为 `0` 关闭,与此前逐位一致)。此前提示词长度一变就要重编 DiT 程序(768p 27–34 秒),有损模式还要再编一次稀疏注意力程序(再 24 秒)。现在文本行补齐到 256 的倍数、运行时按真实长度屏蔽,并把目标视频行移到打包序列最前面,视频对任何提示词都从第 0 行开始:每个 block 对视频行广播一行调制参数(`--seg-mod` 的做法,但它把随文本变化的行段写死进程序),稀疏块表也不再随文本变化。768x1344x345、20 步、v6e-8,同一桶内的新提示词:文生视频无损 **152.6 -> 128.3 秒**、有损 **89.4 -> 42.4 秒**;参考图生视频 **191.3 -> 166.9 秒**、**103.2 -> 59.1 秒**;Pika 480p 文生视频 33.5 -> **8.1 秒**;进程重启后(程序已存盘)新提示词即为稳态速度(有损 70.0 -> **41.6 秒**)。稳态差异在 2% 以内。与不分桶不逐位一致(形状与求和顺序变化);DINO 接近无语义 1e-3 扰动的噪声地板,18 组提示词/种子(6 条提示词)肉眼对比画质相当。另外:`--text-layers 51` 现在对默认文本路径生效(Qwen3-VL 64 层里 13 层此前白白流式拷贝和计算;逐位一致,每请求 0.3–0.8 秒);`torchtpu_h3` 同时写出音轨(`*_audio.npy`)。
@@ -412,6 +418,21 @@ Resident serving of new prompts (`--requests`): on v6e, 4.05 s a request on 4 ch
 
 常驻服务(`--requests`,每条新提示词):v6e 上 4 chip 每条 4.05 秒,8 chip 2.43 秒(v7x 4 device **2.89 秒**,8 device **2.71 秒**);4 chip 上 `--replicas 2`(两份模型各 2 chip)每张 2.85 秒(v7x 4 device **2.50 秒**,8 device 两份 4-device 模型每张 **1.52 秒**);8 chip 上 `--replicas 4` 吞吐最高,v6e-8 每张 1.46 秒(延迟 5.8 秒),v7x-8 每张 **1.28 秒**(延迟 5.12 秒)。社区 8 步 DMD 适配器(`--dmd`,无 CFG):1024x1024 v6e-4 0.48 秒、v6e-8 0.46 秒、v7x-8 **0.38 秒**(v7x-8 上 2048x2048 **1.58 秒**)。新图像尺寸的文本、去噪、解码三个程序并行编译(解码器与去噪一步只按形状编译,与文本编码器同时进行;解码器用 16 MiB scoped VMEM):8 chip、空缓存时首个请求 1024x1024 74.6 -> **40 秒**,2048x2048 87.4 -> **55 秒**。
 
+### MOSS-SoundEffect-v2 — 100 steps, CFG 4, a 10 s clip
+
+v6e-4, warm, end to end (prompt encoding, 100 steps, decode). The model always denoises a 30 s latent (1,500 frames) and crops, so the time does not depend on the requested length. OpenMOSS publishes no speed numbers.
+
+v6e-4,暖请求,端到端(提示词编码、100 步、解码)。模型总是按 30 秒的 latent(1500 帧)去噪再裁剪,所以耗时与请求的时长无关。OpenMOSS 未公布速度。
+
+| | 1 chip | 2 chips / 2 chip | 4 chips / 4 chip | 4 one-chip replicas / 4 个单 chip 副本 |
+|---|---|---|---|---|
+| per clip / 每条 | 2.1 s | 1.2 s | **0.95 s** | **0.58 s** (throughput / 吞吐) |
+| per step / 每步 | 21 ms | 11.2 ms | 9.5 ms | |
+
+The second mesh axis splits the sequence, not the heads (`--split seq`, the default): each chip keeps the whole model, computes its half of the rows and gathers the keys and values (two small all-gathers a block). Splitting the heads (tensor parallelism, `--split heads`) costs two all-reduces of the whole residual stream a block and is slower than 2 chips (16.9 ms a step).
+
+第二个 mesh 轴切分序列而不是头(`--split seq`,默认):每个 chip 保留完整模型,计算一半的行,并 gather 键和值(每个 block 两次小的 all-gather)。按头切(张量并行,`--split heads`)每个 block 要对整条残差流做两次 all-reduce,比 2 chip 还慢(每步 16.9 ms)。
+
 ---
 
 ## Setup / 安装
@@ -572,6 +593,35 @@ hf download OpenMOSS-Team/MOSS-Image-SFT --include "transformer/*" --include "sc
 hf download lodestones/MOSS-Image-SFT-8-steps-dmd generator.safetensors
 bash scripts/run_moss_image.sh --dmd --prompt "..."
 ```
+
+---
+
+## Run MOVA / 运行 MOVA
+
+```bash
+hf download OpenMOSS-Team/MOVA-360p
+bash scripts/run_mova.sh --image ref.jpg --prompt "A man in a blue blazer speaks in a quiet room ..."   # 352x640, 8 s, all chips
+bash scripts/run_mova.sh --image ref.jpg --prompt "..." --cfg 2      # 8 chips: CFG branches on two groups of 4
+```
+
+The reference image is center-cropped to 352x640 as in the official script. Output: H.264 + AAC (48 kHz) mp4. `--frames`, `--steps`, `--cfg-scale`, `--seed` as in the official CLI.
+
+参考图按官方脚本居中裁剪到 352x640。输出 H.264 + AAC(48 kHz)mp4。`--frames`、`--steps`、`--cfg-scale`、`--seed` 与官方一致。
+
+---
+
+## Run MOSS-SoundEffect-v2 / 运行 MOSS-SoundEffect-v2
+
+```bash
+hf download OpenMOSS-Team/MOSS-SoundEffect-v2.0
+bash scripts/run_moss_soundeffect.sh --prompt "Rain on a tin roof, distant thunder" --seconds 10     # all chips
+bash scripts/run_moss_soundeffect.sh --prompt "清晨小鸟叽叽喳喳地叫着" --seconds 8 --chips 1
+bash scripts/run_moss_soundeffect.sh --requests reqs.jsonl --replicas 4 --out out   # {"prompt", "seconds", "seed", "tag"} per line
+```
+
+Prompts are cleaned like the official prompter (`ftfy` + HTML unescaping + whitespace); `ftfy` is not a dependency here, so its default fixes (full-width punctuation, curly quotes, ligatures, control characters, NFC) are reproduced except mojibake repair. The DAC `.pth` is read with `torch.load(weights_only=True)`: it holds a state dict and its constructor arguments only.
+
+提示词按官方 prompter 清洗(`ftfy` + HTML 反转义 + 空白归一);这里不依赖 `ftfy`,复现了它默认的各项修正(全角标点、弯引号、连字、控制字符、NFC),只有乱码修复除外。DAC 的 `.pth` 用 `torch.load(weights_only=True)` 读取:里面只有 state dict 和构造参数。
 
 ---
 
