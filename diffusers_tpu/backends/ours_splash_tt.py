@@ -110,6 +110,10 @@ def kv_bkv(seq: int) -> int:
   pin = os.environ.get("DT_OURS_KV_BKV")
   if pin:
     return int(pin)
+  # v7x-8: 4096 was faster than 2048 at all 21 lengths swept (5-7.6%), with
+  # no slow remainders; the rule below is from v6e-8.
+  if os.environ.get("TORCH_TPU_TOPOLOGY") == "2,2,1,2":
+    return 4096
   r = seq % 4096
   return 4096 if 0 < r <= 2560 else 2048
 

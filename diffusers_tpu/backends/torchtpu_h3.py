@@ -214,11 +214,19 @@ def parse_args():
   p.add_argument("--ref-cache", type=int, default=None,
                  help="Keep the encoded latents of the last N reference "
                       "images (default 8, 0 = off; same as DT_REF_CACHE).")
-  p.add_argument("--post-attn-pipe", action="store_true",
+  p.add_argument("--post-attn-pipe", action=argparse.BooleanOptionalAction,
+                 default=None,
                  help="Split to_out -> all_reduce -> norm2 -> FFN -> "
                       "all_reduce into two slabs whose all-reduces overlap "
-                      "the other slab's compute (DT_POST_ATTN_PIPE=1). Helps "
-                      "on v7x-8 (768p 32.1 -> 29.5 s); no gain on v6e-8.")
+                      "the other slab's compute. Default: on for v7x-8 "
+                      "(768p t2va 92.7 -> 85.6 s), off elsewhere (no gain "
+                      "on v6e-8).")
+  p.add_argument("--vae-enc-tile", action=argparse.BooleanOptionalAction,
+                 default=None,
+                 help="Encode the reference in overlapping tiles. Default: "
+                      "off for v7x-8, which has the HBM to encode it whole "
+                      "(ref2va 480p, new reference, 9.7 -> 6.6 s); on "
+                      "elsewhere (whole-frame encode runs out of HBM on v6e).")
   p.add_argument("--kv-block", type=int, default=None,
                  help="Force the kv block of the runtime-length attention "
                       "kernel (default: 4096 when seq %% 4096 is 1..2560, "
@@ -352,12 +360,21 @@ def main():
                     (args.kv_block, "DT_OURS_KV_BKV")):
     if flag is not None:
       os.environ[env] = str(flag)
-  if args.post_attn_pipe:
-    os.environ["DT_POST_ATTN_PIPE"] = "1"
   if args.qk_fp8:
     os.environ["DT_OURS_QK_FP8"] = "1"
   if not args.no_auto_env:
     _auto_env()
+  # Defaults that depend on the chip; set after `_auto_env` names the topology.
+  v7x = os.environ.get("TORCH_TPU_TOPOLOGY") == "2,2,1,2"
+  if args.post_attn_pipe is None:
+    env = os.environ.get("DT_POST_ATTN_PIPE")
+    args.post_attn_pipe = v7x if env is None else env == "1"
+  if args.vae_enc_tile is None:
+    args.vae_enc_tile = not v7x
+  if args.post_attn_pipe:
+    os.environ["DT_POST_ATTN_PIPE"] = "1"
+  if not args.vae_enc_tile:
+    os.environ["DT_VAE_ENC_NO_TILE"] = "1"
   print(args, flush=True)
   # `kill -USR1 <pid>` dumps every thread's Python stack for this rank, for
   # diagnosing stalls (py-spy cannot attach to Python 3.14 processes).
@@ -1601,7 +1618,17 @@ def _fix_reference_encode():
         pixel_std, device=pixels.device).view(1, -1, 1, 1, 1)
 
     scaled = (pixels.to(torch.float32).div(255.0) - p_mean) / p_std
-    posterior = vae.encode(scaled, return_dict=False)[0]
+    # `--no-vae-enc-tile` (default on v7x-8): encode the reference frame in
+    # one pass instead of overlapping tiles; fewer, larger programs.
+    no_tile = os.environ.get("DT_VAE_ENC_NO_TILE") == "1"
+    was = getattr(vae, "use_tiling", False)
+    if no_tile:
+      vae.use_tiling = False
+    try:
+      posterior = vae.encode(scaled, return_dict=False)[0]
+    finally:
+      if no_tile:
+        vae.use_tiling = was
     latents = posterior.sample(
         generator=torch.Generator().manual_seed(encode_seed))
     latents = latents.to(torch.float16).float().cpu()

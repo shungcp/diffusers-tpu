@@ -68,7 +68,7 @@ Rank 0 writes one copy that every rank loads (the per-rank copies differed only 
 > **Why `Opt-2` (`DT_RESIDENT_TEXT=1`) is disabled on `v6e-8`**:
 > Unlike `v7x-8` (95 GiB HBM per TensorCore device), each `v6e` chip has 32 GiB HBM. Keeping the `7.3 GiB` sharded Text Encoder resident alongside the `7.5 GiB` sharded DiT and VAE leaves insufficient HBM headroom for the `103,989`-token `768p` denoising activations, so `torchtpu_h3.py` enables `DT_RESIDENT_TEXT` automatically only on `v7x` (`TORCH_TPU_TOPOLOGY == "2,2,1,2"`).
 
-> **`DT_POST_ATTN_PIPE=1` on `v6e-8`**: the two-slab post-attention pipeline (`52aba21`) runs out of HBM in the first 768p request (`RuntimeProgramAllocationFailure`), and the process then hangs instead of exiting; keep it off on `v6e`. On `v6e` the in-graph all-reduce is synchronous, so the slabs would not overlap anyway.
+> **Two-slab post-attention pipeline (`--post-attn-pipe`) on `v6e-8`**: an early version (`52aba21`) ran out of HBM in the first 768p request. The current one, in the text-bucket path, runs at 768p but gains nothing (t2va 124.6 / 123.1 s vs 124.8 / 122.7 s without, 2026-11-24): the in-graph all-reduce is synchronous on `v6e`, so the slabs do not overlap. It is off by default on `v6e` and on by default on `v7x-8`.
 
 ## 4. MiniMax-H3-Image on `v6e-8` / `v6e-8` 上的 MiniMax-H3-Image
 
