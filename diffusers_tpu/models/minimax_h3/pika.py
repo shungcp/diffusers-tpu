@@ -55,6 +55,10 @@ def pika_scheduler(base, manifest: dict, shift_key: str, seed: int):
       s = float(manifest["sampling"][shift_key])
       ladder = (s * q / (1 + (s - 1) * q)).astype(np.float32)
       super().set_timesteps(device=device, sigmas=torch.from_numpy(ladder))
+      # Host copy of the schedule, read once here before any step is queued:
+      # `float(self.sigmas[i])` on the chip waited each step for all queued
+      # work to finish before the host could enqueue the next step.
+      self._sig_host = self.sigmas.detach().cpu().tolist()
       self._gen = torch.Generator().manual_seed(seed + 1)
 
     def step(self, model_output, timestep, sample, return_dict=True):
@@ -62,7 +66,7 @@ def pika_scheduler(base, manifest: dict, shift_key: str, seed: int):
         self._step_index = (self.index_for_timestep(timestep)
                             if self._begin_index is None else self._begin_index)
       i = self._step_index
-      sigma, nxt = float(self.sigmas[i]), float(self.sigmas[i + 1])
+      sigma, nxt = self._sig_host[i], self._sig_host[i + 1]
       x0 = sample.float() + sigma * model_output.float()
       if nxt > 0.0:
         eps = torch.randn(x0.shape, generator=self._gen, dtype=torch.float32,
