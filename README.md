@@ -33,6 +33,9 @@ Newest first. Each entry links a date to what changed.
 - **2026-11-24** — **MOVA-360p** (OpenMOSS image + text to video with synchronized audio: two 14B Wan2.2-style video experts, a 1.3B audio tower, a cross-modal bridge, UMT5-XXL, the Wan2.1 VAE and DAC): 352x640, 193 frames (8 s), 50 steps, CFG 5. On a v6e-4 a clip takes **164.1 s** end to end (3.25 s a step; both experts resident, 24.1 GiB peak a chip; the video layers run sequence parallel: whole weights all-gathered layer by layer, Ulysses all-to-all around the self-attention, instead of three all-reduces of the residual stream a layer under tensor parallelism, 4.22 s a step); on a v6e-8, with the CFG branches on two groups of four chips, **91.2 s** (1.79 s a step) against 9.0 s a step on an H100 with offload (official README). Everything but the text encoder is native JAX (the UMT5 is transformers' own through torchax); in float32 the pipeline matches the official code (frames within 2/255, audio SNR 45.8 dB after 4 steps), in bfloat16 its error is that of the official bfloat16 run. The Wan2.1 VAE (`models/wan_vae/`) is shared and can run chunked in time with the official cache semantics ([usage](#run-mova--运行-mova)).
 
   **2026-11-24** — 支持 **MOVA-360p**(OpenMOSS 图 + 文生成带同步音频的视频:两个 14B Wan2.2 式视频专家、1.3B 音频塔、跨模态桥接、UMT5-XXL、Wan2.1 VAE、DAC):352x640、193 帧(8 秒)、50 步、CFG 5。v6e-4 上一条端到端 **164.1 秒**(每步 3.25 秒;两个专家常驻、每 chip 峰值 24.1 GiB;视频层序列并行:权重逐层 all-gather 成整份,自注意力前后各一次 Ulysses all-to-all,代替张量并行下每层三次残差流 all-reduce(每步 4.22 秒));v6e-8 上 CFG 两支各占 4 chip,**91.2 秒**(每步 1.79 秒),官方 README 中 H100(offload)每步 9.0 秒。除文本编码器外全部为原生 JAX(UMT5 用 transformers 自带实现经 torchax);fp32 下与官方代码一致(4 步后帧差 ≤ 2/255、音频 SNR 45.8 dB),bf16 下误差与官方 bf16 同级。Wan2.1 VAE(`models/wan_vae/`)为公共模块,可按官方缓存语义分时间块运行。
+- **2026-11-24** — torch_tpu defaults on a TPU v7x-8: the two-slab post-attention pipeline is on (`--no-post-attn-pipe` turns it off) and the runtime-length attention kernel uses kv block 4096 at every length. 768p steady state 93.0 -> **85.1 s** text-to-video lossless, 29.9 -> **26.9 s** lossy, 105.0 -> **96.2 s** reference-to-video lossless, 35.2 -> **31.9 s** lossy (DINO against the old default within the run-to-run noise floor). v6e-8 output is unchanged. The reference is still encoded in tiles, as released; `--no-vae-enc-tile` is faster on v7x but changes the latents. Measured on the v7x-8.
+
+  **2026-11-24** — v7x-8 上 torch_tpu 的默认配置:默认开启两段注意力后流水(`--no-post-attn-pipe` 关闭),运行时长度注意力 kernel 在所有长度上用 kv 块 4096。768p 稳态:文生视频无损 93.0 -> **85.1 秒**、有损 29.9 -> **26.9 秒**,参考图生视频无损 105.0 -> **96.2 秒**、有损 35.2 -> **31.9 秒**(与旧默认的 DINO 在运行间噪声地板以内)。v6e-8 输出不变。参考图仍按发布方式分块编码;`--no-vae-enc-tile` 在 v7x 上更快,但会改变潜变量。数据在 v7x-8 上测得。
 - **2026-11-24** — torch_tpu, three fixes, all with the same frames by default. (1) The Pika sampler read each step's sigma from the chip, so the host waited for all queued work before it could enqueue the next step; it now reads a host copy: Pika ref2va 480x832x121 on a v6e-8 9.2 -> **8.0 s** (text-to-video unchanged at 3.8 s). (2) With the text encoder resident (`--no-offload --shard-text`, v7x), a request in a new text bucket waited the full 60 s timeout for the background DiT compile to start: ref2va 480p 82.9 -> **25.9 s** on a v7x-8. (3) The 2-slab post-attention pipeline (`--post-attn-pipe`) now also runs in the text-bucket path: 768p text-to-video 95.8 -> **87.8 s** on a v7x-8 (off by default; no gain on a v6e-8). (2) and (3) were found and measured on the v7x-8.
 
   **2026-11-24** — torch_tpu 三处修复,默认配置输出逐位不变。(1) Pika 采样器每步从 chip 读 sigma,主机要等排队的计算全部完成才能发下一步;改读主机副本:v6e-8 上 Pika 参考图生视频 480x832x121 9.2 -> **8.0 秒**(文生视频不变,3.8 秒)。(2) 文本编码器常驻时(`--no-offload --shard-text`,v7x),换到新文本桶的请求要白等 60 秒超时,后台 DiT 编译才开始:v7x-8 上 ref2va 480p 82.9 -> **25.9 秒**。(3) 两段注意力后流水(`--post-attn-pipe`)现在也用于分桶路径:v7x-8 上 768p 文生视频 95.8 -> **87.8 秒**(默认关;v6e-8 上无收益)。(2)(3) 由 v7x-8 那边发现并实测。
@@ -163,14 +166,14 @@ Software: jax 0.12.0.1, libtpu 0.0.52 (torch_tpu moved from 0.0.51 on 2026-11-12
 
 | | JAX | torchax | torch_tpu |
 |---|---|---|---|
-| text-to-video, lossless / 文生视频,无损 | **110.0 s** | 110.0 s | 118.9 s |
-| text-to-video, lossy / 文生视频,有损 | **34.0 s** | 34.8 s | 38.6 s |
-| reference-to-video, lossless / 参考图生视频,无损 | **139.2 s** | 186.7 s | 161.8 s |
-| reference-to-video, lossy / 参考图生视频,有损 | **51.2 s** | 51.6 s | 60.9 s |
+| text-to-video, lossless / 文生视频,无损 | **110.0 s** | 110.0 s | 124.0 s |
+| text-to-video, lossy / 文生视频,有损 | **34.0 s** | 34.8 s | 39.5 s |
+| reference-to-video, lossless / 参考图生视频,无损 | **139.2 s** | 186.7 s | 164.9 s |
+| reference-to-video, lossy / 参考图生视频,有损 | **51.2 s** | 51.6 s | 57.7 s |
 
-JAX times include decoding the audio; the two lossless JAX numbers were measured before it was added (about 0.1 s more).
+JAX times include decoding the audio; the two lossless JAX numbers were measured before it was added (about 0.1 s more). torch_tpu was measured on 2026-11-23 with text buckets on (the default). Steady-state times vary by about 3% between boots of the same machine; compare runs from one boot.
 
-JAX 的时间包含音频解码;两个无损 JAX 数字是加入音频解码之前测的(会多约 0.1 秒)。
+JAX 的时间包含音频解码;两个无损 JAX 数字是加入音频解码之前测的(会多约 0.1 秒)。torch_tpu 测于 2026-11-23,文本分桶开启(默认)。同一台机器不同开机之间稳态时间约有 3% 波动;比较请用同一次开机的结果。
 
 "Lossy" skips a DiT call while the timestep embedding barely changes, and lets each video frame attend only to nearby frames.
 
@@ -183,6 +186,23 @@ The visual quality stays close to lossless; check it on your own prompts before 
 The resident server keeps the model on the chips between requests: 34.0 s (text) and 47.5 s (reference) per lossy request.
 
 常驻服务在请求之间把模型保留在 chip 上:每个有损请求 34.0 秒(文生)和 47.5 秒(参考图生)。
+
+#### A new prompt / 新提示词
+
+The table above is steady state: the same prompt again, everything compiled. A prompt of a new length changes the packed sequence; whether that recompiles depends on the entry point. Text-to-video, 768x1344x345, 20 steps, v6e-8:
+
+上表是稳态(同一提示词再来一次,程序都已编好)。新长度的提示词会改变打包序列,是否重新编译取决于入口。文生视频,768x1344x345,20 步,v6e-8:
+
+| | lossless / 无损 | lossy / 有损 | compile / 编译 |
+|---|---|---|---|
+| torch_tpu, same process / 同进程 | 126.4 s (152.6 s before text buckets / 分桶前) | 41.8 s (89.4 s) | none within a 256-token bucket; a new bucket compiles in the background / 同一 256 token 桶内不编译,跨桶在后台编译 |
+| JAX server, same process / JAX 服务端,同进程 | 107.9 s | 34.3 s | none within a bucket / 桶内不编译 |
+| JAX CLI, new process / JAX 命令行,新进程 | 107.6 s + 105.5 s load and compile before the request / 请求前加载与编译 | — | every process / 每个进程 |
+| torchax, new process / torchax,新进程 | 111.0 s + 535.6 s warm-up compile / 预热编译 | — | every process / 每个进程 |
+
+Reference-to-video on torch_tpu, same process: 191.3 -> 166.7 s lossless, 103.2 -> 60.6 s lossy.
+
+torch_tpu 参考图生视频同进程:无损 191.3 -> 166.7 秒,有损 103.2 -> 60.6 秒。
 
 ### Qwen-Image-2.1 — 1024x1024
 
@@ -402,6 +422,23 @@ Measured 2026-11-04, before the audio decode and the faster video decode; 8-devi
 ² `--pallas-ffn` (a sequence-tiled Pallas SwiGLU FFN kernel) is opt-in. It was slower than XLA on 1 and 2 devices and on long sequences, and where it is faster (8 devices, 480x832, 141 frames: 0.2 s) the output drifts (DINO 0.943). ² `--pallas-ffn`(序列分块 Pallas SwiGLU FFN kernel)需要手动开启。它在 1、2 个 device 和长序列上比 XLA 慢;唯一更快的场景(8 个 device、480x832、141 帧,快 0.2 秒)输出会漂移(DINO 0.943)。
 
 ³ On a v7x-8 (8 devices), `torchax` lossless text-to-video takes 128.5 s. ³ 在 v7x-8(8 个 device)上,`torchax` 无损文生视频为 128.5 秒。
+
+#### torch_tpu on a v7x-8 — 768x1344, 345 frames, 20 steps / v7x-8 上的 torch_tpu
+
+Measured 2026-11-24 with the v7x-8 defaults (two-slab post-attention pipeline, kv block 4096; bf16, text buckets on), same settings as the v6e-8 table above. "Steady" repeats the prompt; "new prompt" is a new length in the same 256-token bucket, same process.
+
+测于 2026-11-24,使用 v7x-8 默认配置(两段注意力后流水、kv 块 4096;bf16,文本分桶开启),设置与上面 v6e-8 的表相同。"稳态"是同一提示词再来一次;"新提示词"是同一进程里同一 256 token 桶内的新长度。
+
+| | steady / 稳态 | new prompt / 新提示词 | v6e-8 steady / v6e-8 稳态 |
+|---|---|---|---|
+| text-to-video, lossless / 文生视频,无损 | **85.1 s** | 88.6 s | 124.0 s |
+| text-to-video, lossy / 文生视频,有损 | **26.9 s** | 30.6 s | 39.5 s |
+| reference-to-video, lossless / 参考图生视频,无损 | **96.2 s** | 101.1 s | 164.9 s |
+| reference-to-video, lossy / 参考图生视频,有损 | **31.9 s** | 37.6 s | 57.7 s |
+
+The JAX server (bf16, `--block-kv 4096`) on the same v7x-8 takes 88.0 s lossless and 28.3 s lossy for text-to-video. Without the pipeline (`--no-post-attn-pipe`) torch_tpu takes 93.0 / 29.9 / 105.0 / 35.2 s.
+
+同一台 v7x-8 上 JAX 服务端(bf16,`--block-kv 4096`)文生视频无损 88.0 秒、有损 28.3 秒。关掉流水(`--no-post-attn-pipe`)时 torch_tpu 为 93.0 / 29.9 / 105.0 / 35.2 秒。
 
 ### MOSS-Image — 50 steps, CFG 3, torchax backend
 
