@@ -294,6 +294,9 @@ def parse_args():
   p.add_argument("--profile", default="",
                  help="Take an xprof trace of the last run into this "
                       "directory.")
+  p.add_argument("--profile-host", action="store_true",
+                 help="With --profile, also record the host (Python stacks, "
+                      "torch ops) to see what the chip waits for.")
   p.add_argument("--resident-blocks", type=int, default=0,
                  help="Keep this many of the fifty blocks on the chip "
                       "for the whole request instead of streaming "
@@ -755,7 +758,8 @@ def main():
     from torch_tpu._internal import profiler as tt_prof
 
     prof_ctx = tt_prof.profile(
-        activities=[tt_prof.ProfilerActivity.TPU],
+        activities=[tt_prof.ProfilerActivity.TPU]
+        + ([tt_prof.ProfilerActivity.CPU] if args.profile_host else []),
         on_trace_ready=tt_prof.xprof_trace_handler(dir_name=args.profile),
     )
 
