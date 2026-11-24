@@ -227,7 +227,7 @@ def parse_args():
                       "MiniMax-H3 was released with tiled encoding; "
                       "--no-vae-enc-tile encodes the frame whole, which is "
                       "faster on v7x-8 (ref2va 480p, new reference, 9.7 -> "
-                      "6.6 s) but changes the latents (relative L2 32-45%) "
+                      "6.6 s) but changes the latents (relative L2 20-24%, GroupNorm statistics over a tile vs the whole frame) "
                       "and runs out of HBM on v6e.")
   p.add_argument("--kv-block", type=int, default=None,
                  help="Force the kv block of the runtime-length attention "
