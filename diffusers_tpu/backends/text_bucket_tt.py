@@ -41,6 +41,12 @@ BULK: dict = {"V": 0, "i": None}
 # the per-row gather (8.91 vs 8.10 s a step, c813); keep the gather then.
 _MIN_BULK = 0.95
 _orig_block = None
+_LAYOUT: dict = {}
+
+
+def _fixed_slots() -> bool:
+  # `DT_FIXED_TSLOTS=0`/`pad` give steps different timestep indices.
+  return os.environ.get("DT_FIXED_TSLOTS", "1") == "1"
 
 
 def _pipe_slab_split(seq_len: int, bulk_v: int) -> int:
@@ -220,30 +226,61 @@ def install(transformer, n: int, verbose=print) -> bool:
               attention_kwargs=None, return_dict=True):
     seq = position_ids.shape[0]
     n_txt = encoder_hidden_states.shape[1]
+    # The layout depends only on the request's row description (the same
+    # tensors every step) and, with fixed timestep slots, on per-step indices
+    # that are identical on every step; built once a request instead of
+    # copying to the host -- a sync that drained the queued step -- every step.
+    key = tuple(id(t) for t in (position_ids, token_tags, text_indices, video_indices,
+                                audio_indices, encoder_hidden_states))
     dev = position_ids.device
-    # The packed layout is rebuilt on the host: every op below has a shape
-    # that follows the prompt length, so on the chip each new length compiled
-    # its own small eager programs (c886: 33 a new prompt). The tensors are
-    # small; they go back to the chip once at the end. Values are unchanged.
-    position_ids, token_tags, timestep_indices = (
-        position_ids.cpu(), token_tags.cpu(), timestep_indices.cpu())
-    text_indices, video_indices, audio_indices = (
-        text_indices.cpu(), video_indices.cpu(), audio_indices.cpu())
-    # Video run (the last run of equal modulation index) to the front.
-    ai = timestep_indices * h3.MINIMAX_H3_MODALITY_NUM + token_tags
-    chg = (ai[1:] != ai[:-1]).nonzero()
-    s_last = int(chg[-1]) + 1 if chg.numel() else 0
-    cpu = torch.device("cpu")   # explicit: the caller runs under `with torch.device("tpu")`
-    perm = torch.cat([torch.arange(s_last, seq, device=cpu), torch.arange(0, s_last, device=cpu)])
-    inv = torch.empty_like(perm)
-    inv[perm] = torch.arange(seq, device=cpu)
-    position_ids = position_ids.index_select(0, perm)
-    token_tags = token_tags.index_select(0, perm)
-    timestep_indices = timestep_indices.index_select(0, perm)
-    text_indices = inv.index_select(0, text_indices).to(text_indices.dtype)
-    video_indices = inv.index_select(0, video_indices).to(video_indices.dtype)
-    audio_indices = inv.index_select(0, audio_indices).to(audio_indices.dtype)
-    n_bulk = seq - s_last
+    if _LAYOUT.get("key") == key and _fixed_slots():
+      (position_ids, token_tags, timestep_indices, text_indices, video_indices,
+       audio_indices, encoder_hidden_states, n_bulk) = _LAYOUT["val"]
+    else:
+      src = (position_ids, token_tags, text_indices, video_indices, audio_indices,
+             encoder_hidden_states)
+      # The packed layout is rebuilt on the host: every op below has a shape
+      # that follows the prompt length, so on the chip each new length compiled
+      # its own small eager programs (c886: 33 a new prompt). The tensors are
+      # small; they go back to the chip once at the end. Values are unchanged.
+      position_ids, token_tags, timestep_indices = (
+          position_ids.cpu(), token_tags.cpu(), timestep_indices.cpu())
+      text_indices, video_indices, audio_indices = (
+          text_indices.cpu(), video_indices.cpu(), audio_indices.cpu())
+      # Video run (the last run of equal modulation index) to the front.
+      ai = timestep_indices * h3.MINIMAX_H3_MODALITY_NUM + token_tags
+      chg = (ai[1:] != ai[:-1]).nonzero()
+      s_last = int(chg[-1]) + 1 if chg.numel() else 0
+      cpu = torch.device("cpu")   # explicit: the caller runs under `with torch.device("tpu")`
+      perm = torch.cat([torch.arange(s_last, seq, device=cpu), torch.arange(0, s_last, device=cpu)])
+      inv = torch.empty_like(perm)
+      inv[perm] = torch.arange(seq, device=cpu)
+      position_ids = position_ids.index_select(0, perm)
+      token_tags = token_tags.index_select(0, perm)
+      timestep_indices = timestep_indices.index_select(0, perm)
+      text_indices = inv.index_select(0, text_indices).to(text_indices.dtype)
+      video_indices = inv.index_select(0, video_indices).to(video_indices.dtype)
+      audio_indices = inv.index_select(0, audio_indices).to(audio_indices.dtype)
+      n_bulk = seq - s_last
+
+      extra = -(-n_txt // n) * n - n_txt
+      if extra:
+        ehs = encoder_hidden_states.cpu()
+        encoder_hidden_states = torch.cat(
+            [ehs, ehs.new_zeros((ehs.shape[0], extra, ehs.shape[2]))], dim=1).to(dev)
+        text_indices = torch.cat([text_indices, torch.arange(
+            seq, seq + extra, dtype=text_indices.dtype, device=cpu)])
+        position_ids = torch.cat([position_ids, position_ids[-1:].expand(extra, -1)])
+        token_tags = torch.cat([token_tags, token_tags.new_ones(extra)])
+        t_text = timestep_indices.index_select(0, text_indices[:1])
+        timestep_indices = torch.cat([timestep_indices, t_text.expand(extra)])
+      position_ids, token_tags, timestep_indices = (
+          position_ids.to(dev), token_tags.to(dev), timestep_indices.to(dev))
+      text_indices, video_indices, audio_indices = (
+          text_indices.to(dev), video_indices.to(dev), audio_indices.to(dev))
+      _LAYOUT["key"], _LAYOUT["src"] = key, src   # `src` keeps the ids from being reused
+      _LAYOUT["val"] = (position_ids, token_tags, timestep_indices, text_indices,
+                        video_indices, audio_indices, encoder_hidden_states, n_bulk)
     try:
       from diffusers_tpu.backends import sparse_attn_tt as _sp
       lay = _sp.STATE.get("layout")
@@ -257,22 +294,6 @@ def install(transformer, n: int, verbose=print) -> bool:
       verbose(f"  [text-bucket] video run {n_bulk} of {seq} rows "
               f"({100 * n_bulk / seq:.1f}%): "
               f"{'broadcast' if BULK['V'] else 'per-row gather'}", flush=True)
-
-    extra = -(-n_txt // n) * n - n_txt
-    if extra:
-      ehs = encoder_hidden_states.cpu()
-      encoder_hidden_states = torch.cat(
-          [ehs, ehs.new_zeros((ehs.shape[0], extra, ehs.shape[2]))], dim=1).to(dev)
-      text_indices = torch.cat([text_indices, torch.arange(
-          seq, seq + extra, dtype=text_indices.dtype, device=cpu)])
-      position_ids = torch.cat([position_ids, position_ids[-1:].expand(extra, -1)])
-      token_tags = torch.cat([token_tags, token_tags.new_ones(extra)])
-      t_text = timestep_indices.index_select(0, text_indices[:1])
-      timestep_indices = torch.cat([timestep_indices, t_text.expand(extra)])
-    position_ids, token_tags, timestep_indices = (
-        position_ids.to(dev), token_tags.to(dev), timestep_indices.to(dev))
-    text_indices, video_indices, audio_indices = (
-        text_indices.to(dev), video_indices.to(dev), audio_indices.to(dev))
     kv = torch.tensor([seq], dtype=torch.int32, device=dev)
     sequence_length = position_ids.shape[0]
 
