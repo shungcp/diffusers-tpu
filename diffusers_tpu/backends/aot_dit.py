@@ -123,6 +123,7 @@ def _persist_salt():
                  "diffusers_tpu.backends.aot_dit",
                  "diffusers_tpu.backends.ours_splash_tt",
                  "diffusers_tpu.backends.segmented_mod_tt",
+                 "diffusers_tpu.backends.text_bucket_tt",
                  "diffusers.models.transformers.transformer_minimax_h3_image",
                  "diffusers_tpu.backends.tp_h3",
                  "diffusers_tpu.backends.fixed_tslots",

@@ -43,36 +43,129 @@ _MIN_BULK = 0.95
 _orig_block = None
 
 
+def _pipe_slab_split(seq_len: int, bulk_v: int) -> int:
+  """Pick 4096-aligned (256-fallback) Slab 0 length for 2-slab pipeline.
+
+  For `bulk_v > 0` (`text_bucket_tt` moves target video rows to `[0, bulk_v)`
+  and everything else to `[bulk_v, seq_len)`), clamping `S0 <= bulk_v` keeps
+  Slab 0 100% pure video rows (broadcast modulation only, zero `index_copy`).
+  """
+  half = seq_len // 2
+  hi = bulk_v if bulk_v > 0 else seq_len - 1
+  bound = min(half, hi)
+  s0 = (bound // 4096) * 4096
+  if s0 <= 0 or s0 >= seq_len:
+    s0 = (bound // 256) * 256
+  if s0 <= 0:
+    s0 = max(1, bound)
+  return s0
+
+
 def _install_block(transformer, verbose):
   import diffusers.models.transformers.transformer_minimax_h3 as h3
+  from diffusers_tpu.backends.tp_h3 import init_parallel
   bcls = h3.MiniMaxH3TransformerBlock
+  F_linear = torch.nn.functional.linear
 
   def block_forward(self, hidden_states, temb, adaln_indices, rotary_emb,
                     attention_mask=None):
     V = BULK["V"]
-    if V <= 0:
+    S = hidden_states.shape[1]
+    group_name = getattr(init_parallel, "group_name", None)
+    use_pipe = (os.environ.get("DT_POST_ATTN_PIPE") == "1"
+                and group_name is not None
+                and torch.compiler.is_compiling()
+                and getattr(self.attn, "_dt_skip_to_out", False)
+                and S >= 16384)
+    if V <= 0 and not use_pipe:
       return _orig_block(self, hidden_states, temb, adaln_indices, rotary_emb,
                          attention_mask)
     (shift_msa, scale_msa, gate_msa,
      shift_mlp, scale_mlp, gate_mlp) = self.adaln_proj(temb)
-    bulk = adaln_indices[:1]
-    tail = adaln_indices[V:]
-    tail_pos = torch.arange(V, hidden_states.shape[1], device=hidden_states.device)
-    pick = lambda p: p.index_select(0, bulk)
-    # The tail's parameter rows as a one-hot matmul: exact (one nonzero term)
-    # and on the MXU, unlike a per-row gather with runtime indices.
-    oh = torch.nn.functional.one_hot(tail, scale_msa.shape[0]).to(scale_msa.dtype)
-    tsel = lambda p: oh @ p
 
-    def mod(x, scale, shift):
-      out = x * (1.0 + pick(scale)) + pick(shift)
-      t = x[:, V:] * (1.0 + tsel(scale)) + tsel(shift)
-      return out.index_copy(1, tail_pos, t)
+    if V > 0:
+      bulk = adaln_indices[:1]
+      tail = adaln_indices[V:]
+      tail_pos = torch.arange(V, S, device=hidden_states.device)
+      pick = lambda p: p.index_select(0, bulk)
+      # The tail's parameter rows as a one-hot matmul: exact (one nonzero term)
+      # and on the MXU, unlike a per-row gather with runtime indices.
+      oh = torch.nn.functional.one_hot(tail, scale_msa.shape[0]).to(scale_msa.dtype)
+      tsel = lambda p: oh @ p
 
-    def res(r, gate, y):
-      out = r + pick(gate) * y
-      t = r[:, V:] + tsel(gate) * y[:, V:]
-      return out.index_copy(1, tail_pos, t)
+      def mod(x, scale, shift):
+        out = x * (1.0 + pick(scale)) + pick(shift)
+        t = x[:, V:] * (1.0 + tsel(scale)) + tsel(shift)
+        return out.index_copy(1, tail_pos, t)
+
+      def res(r, gate, y):
+        out = r + pick(gate) * y
+        t = r[:, V:] + tsel(gate) * y[:, V:]
+        return out.index_copy(1, tail_pos, t)
+
+    if use_pipe:
+      S0 = _pipe_slab_split(S, V)
+      if V > 0:
+        norm_in = mod(self.norm1(hidden_states), scale_msa, shift_msa)
+        tail_off = V - S0
+        tail_len = S - V
+        tail_pos1 = torch.arange(tail_off, S - S0, device=hidden_states.device)
+        res0 = lambda r, g, y: r + pick(g) * y
+        mod0 = lambda x, sc, sh: x * (1.0 + pick(sc)) + pick(sh)
+
+        def res1(r, g, y):
+          out = r + pick(g) * y
+          if tail_len > 0:
+            t = r[:, tail_off:] + tsel(g) * y[:, tail_off:]
+            return out.index_copy(1, tail_pos1, t)
+          return out
+
+        def mod1(x, sc, sh):
+          out = x * (1.0 + pick(sc)) + pick(sh)
+          if tail_len > 0:
+            t = x[:, tail_off:] * (1.0 + tsel(sc)) + tsel(sh)
+            return out.index_copy(1, tail_pos1, t)
+          return out
+      else:
+        norm_in = (self.norm1(hidden_states)
+                   * (1.0 + scale_msa.index_select(0, adaln_indices))
+                   + shift_msa.index_select(0, adaln_indices))
+        i0, i1 = adaln_indices[:S0], adaln_indices[S0:]
+        res0 = lambda r, g, y: r + g.index_select(0, i0) * y
+        mod0 = lambda x, sc, sh: x * (1.0 + sc.index_select(0, i0)) + sh.index_select(0, i0)
+        res1 = lambda r, g, y: r + g.index_select(0, i1) * y
+        mod1 = lambda x, sc, sh: x * (1.0 + sc.index_select(0, i1)) + sh.index_select(0, i1)
+
+      attn_out = self.attn(norm_in, rotary_emb, attention_mask)
+      to_out_lin = self.attn.to_out[0]
+      ff_in_act = self.ff.net[0]
+      ff_out_lin = self.ff.net[2]
+      a0, a1 = attn_out[:, :S0], attn_out[:, S0:]
+      r0, r1 = hidden_states[:, :S0], hidden_states[:, S0:]
+
+      u0 = F_linear(a0, to_out_lin.weight, to_out_lin.bias)
+      ar1_0 = torch.ops._c10d_functional.all_reduce(u0, "sum", group_name)
+
+      u1 = F_linear(a1, to_out_lin.weight, to_out_lin.bias)
+      ar1_1 = torch.ops._c10d_functional.all_reduce(u1, "sum", group_name)
+
+      u0 = torch.ops._c10d_functional.wait_tensor(ar1_0)
+      h0 = res0(r0, gate_msa, u0)
+      n0 = mod0(self.norm2(h0), scale_mlp, shift_mlp)
+      f0 = F_linear(ff_in_act(n0), ff_out_lin.weight, ff_out_lin.bias)
+      ar2_0 = torch.ops._c10d_functional.all_reduce(f0, "sum", group_name)
+
+      u1 = torch.ops._c10d_functional.wait_tensor(ar1_1)
+      h1 = res1(r1, gate_msa, u1)
+      n1 = mod1(self.norm2(h1), scale_mlp, shift_mlp)
+      f1 = F_linear(ff_in_act(n1), ff_out_lin.weight, ff_out_lin.bias)
+      ar2_1 = torch.ops._c10d_functional.all_reduce(f1, "sum", group_name)
+
+      f0 = torch.ops._c10d_functional.wait_tensor(ar2_0)
+      out0 = res0(h0, gate_mlp, f0)
+      f1 = torch.ops._c10d_functional.wait_tensor(ar2_1)
+      out1 = res1(h1, gate_mlp, f1)
+      return torch.cat([out0, out1], dim=1)
 
     h = res(hidden_states, gate_msa,
             self.attn(mod(self.norm1(hidden_states), scale_msa, shift_msa),
@@ -86,12 +179,15 @@ def _install_block(transformer, verbose):
   # patching the class alone does not reach the compiled programs (c819).
   n_fix = 0
   for b in transformer.transformer_blocks:
+    if getattr(b, "attn", None) is not None:
+      b.attn._dt_skip_to_out = True
     if "_aot_fwd" in b.__dict__:
       b.__dict__["_aot_fwd"] = block_forward
       n_fix += 1
   from diffusers_tpu.backends.aot_dit import AotBlocks
   AotBlocks.KEY_EXTRA.append(lambda: ("bulkV", BULK["V"]))
-  verbose(f"  [text-bucket] video run broadcast in {n_fix} blocks", flush=True)
+  pipe_msg = " (+ 2-slab post-attn pipe)" if os.environ.get("DT_POST_ATTN_PIPE") == "1" else ""
+  verbose(f"  [text-bucket] video run broadcast in {n_fix} blocks{pipe_msg}", flush=True)
 
 
 def install(transformer, n: int, verbose=print) -> bool:

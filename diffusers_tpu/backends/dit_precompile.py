@@ -61,6 +61,11 @@ def install(aot, text_model, transformer=None) -> bool:
     _say("  [precompile] off: segment-wise modulation bakes value-derived runs "
          "into the program")
     return False
+  def _release_go(*_a, **_k):
+    go = _S.pop("go", None)
+    if go is not None:
+      go.set()
+
   orig_run = aot._run
 
   def run(block, args, kwargs, group=False):
@@ -69,6 +74,7 @@ def install(aot, text_model, transformer=None) -> bool:
              + tuple(f() for f in aot.KEY_EXTRA))
       ev = _S["pending"].get(key)
       if ev is not None:
+        _release_go()
         t0 = time.perf_counter()
         ev.wait()
         _S["pending"].pop(key, None)
@@ -145,11 +151,13 @@ def install(aot, text_model, transformer=None) -> bool:
     orig_pf = LayerwiseOffloadManager.prefetch_layer
 
     def prefetch_layer(self, *a, **k):
-      go = _S.pop("go", None)
-      if go is not None:
-        go.set()
+      _release_go()
       return orig_pf(self, *a, **k)
     LayerwiseOffloadManager.prefetch_layer = prefetch_layer
+    # Resident text encoders (e.g. v7x `--no-offload --shard-text`) do not
+    # stream layers via LayerwiseOffloadManager; release `go` when text_model
+    # finishes so `build()` never idles for the full 60 s wait timeout.
+    text_model.register_forward_hook(_release_go)
   _say("  [precompile] DiT program for a new text length is built while the "
        "text encoder runs")
   return True

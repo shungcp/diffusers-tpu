@@ -236,6 +236,7 @@ def install(verbose=print, fixed_m: bool = True) -> bool:
     _idx = torch.arange(half)
     _rot_cpu[_idx + half, _idx] = -1
     _rot_cpu[_idx, _idx + half] = 1
+    from diffusers_tpu.backends.tp_h3 import init_parallel as _init_parallel
     _rot_tpu = _rot_cpu.to("tpu") if bhsd_mode == "full" else None
 
     def _bhsd_call(self, attn, hidden_states, rotary_emb=None, attention_mask=None):
@@ -279,7 +280,11 @@ def install(verbose=print, fixed_m: bool = True) -> bool:
           dropout_p=0.0, is_causal=False, _already_bhsd=True,
       )
       out = out.flatten(2, 3).type_as(query)
-      if os.environ.get("DT_POST_ATTN_PIPE") == "1" and out.shape[1] >= 16384:
+      if (os.environ.get("DT_POST_ATTN_PIPE") == "1"
+          and out.shape[1] >= 16384
+          and torch.compiler.is_compiling()
+          and getattr(attn, "_dt_skip_to_out", False)
+          and getattr(_init_parallel, "group_name", None) is not None):
         return out
       out = attn.to_out[0](out)
       out = attn.to_out[1](out)

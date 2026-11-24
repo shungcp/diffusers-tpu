@@ -245,6 +245,9 @@ def install(transformer, verbose=print) -> bool:
           ff_output, lambda x, i: gate_mlp[i] * x, "mlp")
     return hidden_states
 
+  for b in blocks:
+    if getattr(b, "attn", None) is not None:
+      b.attn._dt_skip_to_out = True
   cls.forward = forward
   verbose("  [segmod] block modulation is now segment-wise (no per-row gather)",
           flush=True)
