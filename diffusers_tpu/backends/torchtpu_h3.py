@@ -371,10 +371,9 @@ def main():
   if args.post_attn_pipe is None:
     env = os.environ.get("DT_POST_ATTN_PIPE")
     args.post_attn_pipe = v7x if env is None else env == "1"
-  if args.post_attn_pipe:
-    os.environ["DT_POST_ATTN_PIPE"] = "1"
-  if not args.vae_enc_tile:
-    os.environ["DT_VAE_ENC_NO_TILE"] = "1"
+  # The flags win over anything inherited from the environment.
+  os.environ["DT_POST_ATTN_PIPE"] = "1" if args.post_attn_pipe else "0"
+  os.environ["DT_VAE_ENC_NO_TILE"] = "0" if args.vae_enc_tile else "1"
   print(args, flush=True)
   # `kill -USR1 <pid>` dumps every thread's Python stack for this rank, for
   # diagnosing stalls (py-spy cannot attach to Python 3.14 processes).
