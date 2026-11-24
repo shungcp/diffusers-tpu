@@ -12,7 +12,7 @@ configuration. Prefer the command-line flags where one exists.
 | `DT_TEXT_CACHE` | 8 | `--text-cache` | Text conditionings kept for repeated prompts (0 = off) |
 | `DT_REF_CACHE` | 8 | `--ref-cache` | Encoded reference latents kept for repeated references (0 = off) |
 | `DT_POST_ATTN_PIPE` | on for v7x-8, else off | `--[no-]post-attn-pipe` | Two-slab all-reduce/compute overlap; helps on v7x-8, not on v6e-8 |
-| `DT_VAE_ENC_NO_TILE` | 1 on v7x-8, else 0 | `--[no-]vae-enc-tile` | Encode the reference frame whole instead of in tiles (needs v7x's HBM) |
+| `DT_VAE_ENC_NO_TILE` | 0 | `--no-vae-enc-tile` | Encode the reference frame whole instead of in tiles: faster on v7x-8 but not the released behaviour (latents differ 32-45%) |
 | `DT_OURS_KV_BKV` | 4096 on v7x-8, by length elsewhere | `--kv-block` | Kv block of the runtime-length attention kernel |
 | `DT_OURS_BQ` / `DT_OURS_BKV` | 2048 / 4096 | | Attention q / kv blocks |
 | `DT_OURS_QK_FP8` | off | | Q and K in float8 inside the attention kernel (lossy) |

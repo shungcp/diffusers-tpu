@@ -222,11 +222,13 @@ def parse_args():
                       "(768p t2va 92.7 -> 85.6 s), off elsewhere (no gain "
                       "on v6e-8).")
   p.add_argument("--vae-enc-tile", action=argparse.BooleanOptionalAction,
-                 default=None,
-                 help="Encode the reference in overlapping tiles. Default: "
-                      "off for v7x-8, which has the HBM to encode it whole "
-                      "(ref2va 480p, new reference, 9.7 -> 6.6 s); on "
-                      "elsewhere (whole-frame encode runs out of HBM on v6e).")
+                 default=True,
+                 help="Encode the reference in overlapping tiles (default). "
+                      "MiniMax-H3 was released with tiled encoding; "
+                      "--no-vae-enc-tile encodes the frame whole, which is "
+                      "faster on v7x-8 (ref2va 480p, new reference, 9.7 -> "
+                      "6.6 s) but changes the latents (relative L2 32-45%) "
+                      "and runs out of HBM on v6e.")
   p.add_argument("--kv-block", type=int, default=None,
                  help="Force the kv block of the runtime-length attention "
                       "kernel (default: 4096 when seq %% 4096 is 1..2560, "
@@ -369,8 +371,6 @@ def main():
   if args.post_attn_pipe is None:
     env = os.environ.get("DT_POST_ATTN_PIPE")
     args.post_attn_pipe = v7x if env is None else env == "1"
-  if args.vae_enc_tile is None:
-    args.vae_enc_tile = not v7x
   if args.post_attn_pipe:
     os.environ["DT_POST_ATTN_PIPE"] = "1"
   if not args.vae_enc_tile:
@@ -1618,8 +1618,8 @@ def _fix_reference_encode():
         pixel_std, device=pixels.device).view(1, -1, 1, 1, 1)
 
     scaled = (pixels.to(torch.float32).div(255.0) - p_mean) / p_std
-    # `--no-vae-enc-tile` (default on v7x-8): encode the reference frame in
-    # one pass instead of overlapping tiles; fewer, larger programs.
+    # `--no-vae-enc-tile`: encode the reference frame in one pass instead of
+    # overlapping tiles. Not the released behaviour (see the flag's help).
     no_tile = os.environ.get("DT_VAE_ENC_NO_TILE") == "1"
     was = getattr(vae, "use_tiling", False)
     if no_tile:
