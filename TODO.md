@@ -48,6 +48,14 @@ Measured, judged not worth the complexity at the time, and left here for anyone 
 
   **按行 DMA 做行 gather(vllm-torchtpu fused EP MoE v3 的思路)。** 结果正确,但 v6e 上 1.5 万行时比 XLA gather 慢 6 倍(每行发起约 0.28 µs);只适合解码那样的小批量。
 
+- **Read the expert-sorted rows inside the grouped matmul (no separate gather).** The two row gathers around the experts cost ~1.0 ms a MoE layer at 15k rows on a v6e chip (floor ~0.4 ms). tokamax's `gmm_fuser` cannot fuse a gather (jax 0.12 fuser rules; contiguous LHS slices), so this needs our own kernel; tokamax's SparseCore `ragged_gather` is the other option, untested on v6e. At most ~0.4% of a 768p step.
+
+  **在分组矩阵乘内部按索引读按专家排好的行(去掉单独的 gather)。** 专家前后两次行 gather 在 v6e 单 chip 1.5 万行时每层约 1.0 ms(下限约 0.4 ms)。tokamax 的 `gmm_fuser` 融不了 gather(jax 0.12 fuser 规则;LHS 是连续切片),得自己写 kernel;另一条路是 tokamax 的 SparseCore `ragged_gather`,v6e 上没测。最多占 768p 一步的约 0.4%。
+
+- **gmm_v2 tile_m 512.** As tokamax's gmm_v2 does: 0.81 -> 0.73 ms per expert pair at 13,008 rows, bit-identical, but end to end at 768p within noise (denoise 104.7 vs 104.9 s), so not adopted.
+
+  **gmm_v2 tile_m 改 512。** 照 tokamax 的 gmm_v2:13,008 行时每对专家矩阵乘 0.81 → 0.73 ms,输出逐位相同;但 768p 端到端在噪声内(去噪 104.7 对 104.9 秒),未采用。
+
 ## How these were found / 怎么找到的
 
 Host stalls show up as chip idle time between XLA ops in an xprof trace (`--profile`); `--profile-host` adds the CPU activity to the torch_tpu profiler, which records the host's Python stacks in the same trace, which names the work the chip is waiting for. Removing two per-step host syncs this way gave Pika ref2va 480p 9.2 -> 8.0 s (2026-11-24).
