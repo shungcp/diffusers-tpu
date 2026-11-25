@@ -495,8 +495,8 @@ def _build_modules():
       residual = x
       h = apply(self.norm2(x),
                 lambda t, i: t * (1.0 + rows(scale_mlp, i)) + rows(shift_mlp, i))
-      ff = _constrain(self.ff(_constrain(h, None, None, None)),
-                      None, "tp", None)
+      h_ff = h if getattr(self.ff, "seq_sharded_input", False) else _constrain(h, None, None, None)
+      ff = _constrain(self.ff(h_ff), None, "tp", None)
       return residual + apply(ff, lambda t, i: t * rows(gate_mlp, i))
 
   class TokenRefinerBlock(nnx.Module):

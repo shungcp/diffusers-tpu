@@ -191,6 +191,9 @@ def parse_args():
                   help="With DT_WEIGHT_CACHE: build the text tower and DiT caches "
                        "and exit. Runs on the CPU too (JAX_PLATFORMS=cpu), so the "
                        "int8 conversion can happen on any big-memory machine.")
+  ap.add_argument("--moe", default="",
+                  help="Agnes-Video-H3-MoE snapshot (or its HF cache dir): replace "
+                       "DiT blocks 15-34's FFN with its shared + 8-expert top-1 MoE.")
   ap.add_argument("--pallas-ffn", action="store_true",
                   help="Use sequence-tiled Pallas SwiGLU FFN megakernel (DT_PALLAS_FFN=1).")
   ap.add_argument("--dense-attention", action="store_true",
@@ -673,6 +676,15 @@ def main():
 
   print(f"prompt: {ids.shape[1]} tokens -> {tuple(prompt_embeds.shape)}",
         flush=True)
+  if os.environ.get("DT_EMB_NOISE"):
+    # Diagnosis only (as in jax_server): multiply the text embedding by
+    # (1 + eps * N(0,1)) to measure how far a semantics-free perturbation
+    # moves the video -- the noise floor for comparing two implementations.
+    _eps = float(os.environ["DT_EMB_NOISE"])
+    _key = jax.random.PRNGKey(int(os.environ.get("DT_EMB_NOISE_SEED", "0")))
+    _e32 = prompt_embeds.astype(jnp.float32)
+    prompt_embeds = (_e32 * (1 + _eps * jax.random.normal(_key, _e32.shape))).astype(prompt_embeds.dtype)
+    print(f"  [emb-noise] eps={_eps}", flush=True)
 
   if args.init_text:
     # Debug aid: substitute another backend's text embedding to separate
@@ -872,6 +884,16 @@ def main():
   if (args.pallas_ffn or os.environ.get("DT_PALLAS_FFN") == "1"
       or os.environ.get("DT_SWIGLU_INTERLEAVE") == "1"):
     dit.interleave_swiglu_weights(transformer, mesh=mesh)
+  if args.moe:
+    from . import agnes_moe
+    if args.runs > 1 and _small_hbm and not args.decode_chunk_batch:
+      # The experts add ~2.9 GiB a chip; with the DiT kept through decode
+      # the automatic decode batch no longer fits (short by 50 MB, c908).
+      # 4 chunks a call fit and decode as fast as dense's default (0.6 s;
+      # 1 chunk: 1.0 s, c915).
+      args.decode_chunk_batch = 4
+      os.environ["DT_DECODE_CHUNK_BATCH"] = "4"
+    agnes_moe.install(transformer, args.moe, os.path.join(snapshot, trunk), mesh)
   if host is not None:
     _, _probe = nnx.split(transformer)
     _leaves = jax.tree.leaves(_probe)

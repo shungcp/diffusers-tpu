@@ -20,6 +20,12 @@ configuration. Most have a command-line flag; prefer it.
 | `DT_STREAM_SHARD` | per pipeline | Residual-stream layout (`whole` / `seq`) |
 | `DT_FULL_LANE_ROPE`, `DT_PAD_SEQUENCE_TO` | from flags | Set by `--full-lane-rope`, `--pad-sequence-to` |
 | `DT_DECODE_CHUNK_BATCH`, `DT_DECODE_TILE_SHARD` | from flags | Video decode batching / tile sharding |
+| `DT_MOE_DP` | auto | Agnes MoE: experts replicated on every device (auto: HBM >= 64 GiB, i.e. v7x); 0 = tensor parallel |
+| `DT_MOE_RING`, `DT_MOE_GMM` | 1, 1 | Agnes MoE tensor parallel: ring reduce-scatter (0 = one psum); gmm_v2 (0 = `jax.lax.ragged_dot`) |
+| `DT_MOE_EP` (`DT_MOE_EP_SLABS`, `DT_MOE_EP_BACKEND`) | off | Agnes MoE expert parallel (one expert a device, ragged all-to-all; loses to skewed routing) |
+| `DT_MOE_FP8` | off | Agnes MoE DP: experts in float8 W8A8 (halves their HBM) |
+| `DT_MOE_FAST_LOAD` | 1 | Agnes MoE: threaded LoRA merge at load (bit-identical; 0 = serial) |
+| `DT_MOE_*_TILE_*` | tuned | gmm_v2 tiles for the EP / DP paths |
 
 ## Memory and compile tuning / 内存与编译调参
 
@@ -33,7 +39,8 @@ configuration. Most have a command-line flag; prefer it.
 
 | Variable | Meaning |
 |---|---|
-| `DT_EMB_NOISE=<eps>` (`DT_EMB_NOISE_SEED`) | Perturb the text conditioning to measure the noise floor (server) |
+| `DT_EMB_NOISE=<eps>` (`DT_EMB_NOISE_SEED`) | Perturb the text conditioning to measure the noise floor (server, jax_pipeline) |
+| `DT_MOE_HIST=1` | Agnes MoE expert parallel: print rows per expert per layer |
 | `DT_PAD_ROW_FILL=randn` | Fill padded text rows with noise (bucket leak check, server) |
 | `DT_DUMP_BLOCKS=<dir>`, `DT_DUMP_BLOCK_CALL`, `DT_DUMP_COND`, `DT_TEXT_DUMP`, `DT_TEXT_DIAG`, `DT_ENC_CHECK` | Dumps and checks for layer-by-layer comparisons |
 | `DT_SERVER_STEP_TIMES`, `DT_SERVER_TEXT_PROFILE=<dir>`, `DT_DECODE_TIMING`, `DT_CLOCK_LEAVES` | Timing and profiles |

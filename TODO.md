@@ -34,6 +34,20 @@ Measured, judged not worth the complexity at the time, and left here for anyone 
 
   **v6e 上的两段注意力后流水(无收益)。** `--post-attn-pipe` 让每块的 all-reduce 与另一段的计算重叠:v7x-8 上 768p 95.8 -> 87.8 秒,v6e-8 上不变(124.6 / 123.1 对 124.8 / 122.7 秒),所以默认关。
 
+## JAX, Agnes-Video-H3-MoE
+
+- **Hide the MoE input all-gather on v6e-8 (768p: ~121 ms a step).** Tensor parallel over the experts' width needs every token on every chip, and unlike the dense FFN (XLA collective matmul) the all-gather in front of the MoE layer is exposed. Rotating the input blocks around the same ring as the reduce-scatter was slower (two permutes in one direction did not overlap). On v7x-8 DP-8 avoids it.
+
+  **在 v6e-8 上藏住 MoE 前面的 all-gather(768p 每步约 121 ms)。** 按专家宽度做张量并行要求每个 chip 看到所有 token;稠密 FFN 由 XLA collective matmul 藏住通信,MoE 层前面的 all-gather 是暴露的。把输入块放进同一个环里轮转反而更慢(两路同方向 permute 没有重叠)。v7x-8 上 DP-8 不需要它。
+
+- **Expert parallel for a model with balanced routing.** `DT_MOE_EP=1` (ragged all-to-all, one expert a device) was 1.4–2x faster than tensor parallel per layer with even routing, but Agnes's routing (mean max/avg 4.2x) makes it slower end to end.
+
+  **路由均衡的模型可用专家并行。** `DT_MOE_EP=1`(ragged all-to-all,每 device 一个专家)在路由均匀时单层比张量并行快 1.4–2 倍,但 Agnes 的路由(最忙专家平均是均值的 4.2 倍)让它端到端更慢。
+
+- **Row gather as per-row DMA (vllm-torchtpu's fused EP MoE v3 idea).** Correct but 6x slower than XLA's gather at 15k rows on v6e (issue-bound at ~0.28 µs a row); suits decode-size batches only.
+
+  **按行 DMA 做行 gather(vllm-torchtpu fused EP MoE v3 的思路)。** 结果正确,但 v6e 上 1.5 万行时比 XLA gather 慢 6 倍(每行发起约 0.28 µs);只适合解码那样的小批量。
+
 ## How these were found / 怎么找到的
 
 Host stalls show up as chip idle time between XLA ops in an xprof trace (`--profile`); `--profile-host` adds the CPU activity to the torch_tpu profiler, which records the host's Python stacks in the same trace, which names the work the chip is waiting for. Removing two per-step host syncs this way gave Pika ref2va 480p 9.2 -> 8.0 s (2026-11-24).

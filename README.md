@@ -33,6 +33,9 @@ Newest first. Each entry links a date to what changed.
 - **2026-11-24** — **MOVA-360p** (OpenMOSS image + text to video with synchronized audio: two 14B Wan2.2-style video experts, a 1.3B audio tower, a cross-modal bridge, UMT5-XXL, the Wan2.1 VAE and DAC): 352x640, 193 frames (8 s), 50 steps, CFG 5. On a v6e-4 a clip takes **164.1 s** end to end (3.25 s a step; both experts resident, 24.1 GiB peak a chip; the video layers run sequence parallel: whole weights all-gathered layer by layer, Ulysses all-to-all around the self-attention, instead of three all-reduces of the residual stream a layer under tensor parallelism, 4.22 s a step); on a v6e-8, with the CFG branches on two groups of four chips, **91.2 s** (1.79 s a step) against 9.0 s a step on an H100 with offload (official README). Everything but the text encoder is native JAX (the UMT5 is transformers' own through torchax); in float32 the pipeline matches the official code (frames within 2/255, audio SNR 45.8 dB after 4 steps), in bfloat16 its error is that of the official bfloat16 run. The Wan2.1 VAE (`models/wan_vae/`) is shared and can run chunked in time with the official cache semantics ([usage](#run-mova--运行-mova)).
 
   **2026-11-24** — 支持 **MOVA-360p**(OpenMOSS 图 + 文生成带同步音频的视频:两个 14B Wan2.2 式视频专家、1.3B 音频塔、跨模态桥接、UMT5-XXL、Wan2.1 VAE、DAC):352x640、193 帧(8 秒)、50 步、CFG 5。v6e-4 上一条端到端 **164.1 秒**(每步 3.25 秒;两个专家常驻、每 chip 峰值 24.1 GiB;视频层序列并行:权重逐层 all-gather 成整份,自注意力前后各一次 Ulysses all-to-all,代替张量并行下每层三次残差流 all-reduce(每步 4.22 秒));v6e-8 上 CFG 两支各占 4 chip,**91.2 秒**(每步 1.79 秒),官方 README 中 H100(offload)每步 9.0 秒。除文本编码器外全部为原生 JAX(UMT5 用 transformers 自带实现经 torchax);fp32 下与官方代码一致(4 步后帧差 ≤ 2/255、音频 SNR 45.8 dB),bf16 下误差与官方 bf16 同级。Wan2.1 VAE(`models/wan_vae/`)为公共模块,可按官方缓存语义分时间块运行。
+- **2026-11-25** — **Agnes-Video-H3-MoE** on the JAX backend (`--moe <snapshot>`): DiT blocks 15–34 of MiniMax-H3 use its shared + 8-expert top-1 feed-forward (experts copied from the dense FFN, rank-64 LoRA merged at load; the other 30 blocks stay dense). Checked against the released algorithm on one layer (fp32 on the CPU, relative error 6e-7). The real routing is very skewed (in most layers one expert takes 55–80% of the tokens), so the layer is split so that skew does not matter: on a v6e-8 every expert's width over the 8 chips, with megablox `gmm_v2` and a hand-written ring reduce-scatter overlapping the next block's compute; on a v7x-8 the experts replicated on every device (DP-8, no communication). 480x832, 124 frames, 50 steps, per request resident: v6e-8 **26.4 s** (dense MiniMax-H3 27.5 s), v7x-8 **17.5 s** (dense 19.8 s); 768x1344x345, 20 steps: v6e-8 110.2 s (dense 104.3 s), v7x-8 **79.2 s** (dense 80.0 s). The weights are Agnes-AI's, under the MiniMax H3 Community License; this repository only loads them. The v7x-8 work was done on the v7x-8.
+
+  **2026-11-25** — JAX 后端支持 **Agnes-Video-H3-MoE**(`--moe <快照>`):MiniMax-H3 DiT 第 15–34 块换成它的共享 + 8 专家 top-1 前馈(专家从稠密 FFN 拷出,rank-64 LoRA 在加载时合并;其余 30 块仍是稠密)。单层与发布算法对照(CPU fp32,相对误差 6e-7)。真实路由极不均(多数层一个专家拿走 55–80% 的 token),所以切分方式选成不受偏斜影响:v6e-8 上每个专家的宽度切到 8 个 chip,用 megablox `gmm_v2`,跨 chip 求和写成与下一块计算重叠的环形 reduce-scatter;v7x-8 上专家在每个 device 各放一份(DP-8,无通信)。480x832、124 帧、50 步、常驻每请求:v6e-8 **26.4 秒**(稠密 MiniMax-H3 27.5 秒),v7x-8 **17.5 秒**(稠密 19.8 秒);768x1344x345、20 步:v6e-8 110.2 秒(稠密 104.3 秒),v7x-8 **79.2 秒**(稠密 80.0 秒)。权重属于 Agnes-AI,按 MiniMax H3 Community License 发布;本仓库只负责加载。v7x-8 部分由 v7x-8 那边完成并实测。
 - **2026-11-24** — torch_tpu defaults on a TPU v7x-8: the two-slab post-attention pipeline is on (`--no-post-attn-pipe` turns it off) and the runtime-length attention kernel uses kv block 4096 at every length. 768p steady state 93.0 -> **85.1 s** text-to-video lossless, 29.9 -> **26.9 s** lossy, 105.0 -> **96.2 s** reference-to-video lossless, 35.2 -> **31.9 s** lossy (DINO against the old default at or near the run-to-run noise floor). v6e-8 output is unchanged. The reference is still encoded in tiles, as released; `--no-vae-enc-tile` is faster on v7x but changes the latents. Measured on the v7x-8.
 
   **2026-11-24** — v7x-8 上 torch_tpu 的默认配置:默认开启两段注意力后流水(`--no-post-attn-pipe` 关闭),运行时长度注意力 kernel 在所有长度上用 kv 块 4096。768p 稳态:文生视频无损 93.0 -> **85.1 秒**、有损 29.9 -> **26.9 秒**,参考图生视频无损 105.0 -> **96.2 秒**、有损 35.2 -> **31.9 秒**(与旧默认的 DINO 在运行间噪声地板附近)。v6e-8 输出不变。参考图仍按发布方式分块编码;`--no-vae-enc-tile` 在 v7x 上更快,但会改变潜变量。数据在 v7x-8 上测得。
@@ -557,6 +560,18 @@ python scripts/frames_to_mp4.py out out/*_frames.npy
 ```
 
 ---
+
+### Agnes-Video-H3-MoE
+
+Download `Agnes-AI/Agnes-Video-H3-MoE` next to `MiniMaxAI/MiniMax-H3` and pass its snapshot (or its HF cache directory) to the JAX pipeline. The split is picked from the chip's HBM (`DT_MOE_DP=auto`); `DT_MOE_DP=0/1`, `DT_MOE_EP=1`, `DT_MOE_RING=0` and `DT_MOE_FP8=1` override it.
+
+下载 `Agnes-AI/Agnes-Video-H3-MoE`(与 `MiniMaxAI/MiniMax-H3` 放在同一缓存),把它的快照(或 HF 缓存目录)传给 JAX 管线。切分方式按 chip 的 HBM 自动选择(`DT_MOE_DP=auto`);`DT_MOE_DP=0/1`、`DT_MOE_EP=1`、`DT_MOE_RING=0`、`DT_MOE_FP8=1` 可以覆盖。
+
+```bash
+hf download Agnes-AI/Agnes-Video-H3-MoE
+python -m diffusers_tpu.models.minimax_h3.jax_pipeline --height 480 --width 832 --num-frames 124 --steps 50 \
+  --moe $HF_HOME/hub/models--Agnes-AI--Agnes-Video-H3-MoE --prompt "..." --runs 2
+```
 
 ## Run Qwen-Image-2.1 / 运行 Qwen-Image-2.1
 
