@@ -4,9 +4,9 @@ Fast inference for open diffusion models on Cloud TPU, built on top of [huggingf
 
 基于 [huggingface/diffusers](https://github.com/huggingface/diffusers),在 Cloud TPU 上高速运行开源扩散模型。
 
-Six models are supported today: **MiniMax-H3** (video + audio), **MiniMax-H3-Image** (image and image editing), **Qwen-Image-2.1** (image), **MOSS-Image** (image, torchax backend), **MOSS-SoundEffect-v2** (text-to-audio, JAX) and **MOVA** (image + text to video with audio, JAX).
+Seven models are supported today: **MiniMax-H3** (video + audio), **MiniMax-H3-Image** (image and image editing), **Qwen-Image-2.1** (image), **MOSS-Image** (image, torchax backend), **MOSS-SoundEffect-v2** (text-to-audio, JAX), **MOVA** (image + text to video with audio, JAX) and **MAGI-2-preview** (113.93B Multi-Head Latent MoE video + audio + 1080p refiner, JAX / torchax / torch_tpu).
 
-目前支持六个模型:**MiniMax-H3**(视频 + 音频)、**MiniMax-H3-Image**(图像与图像编辑)、**Qwen-Image-2.1**(图像)、**MOSS-Image**(图像,torchax 后端)、**MOSS-SoundEffect-v2**(文生音效,JAX)和 **MOVA**(图 + 文生成带同步音频的视频,JAX)。
+目前支持七个模型:**MiniMax-H3**(视频 + 音频)、**MiniMax-H3-Image**(图像与图像编辑)、**Qwen-Image-2.1**(图像)、**MOSS-Image**(图像,torchax 后端)、**MOSS-SoundEffect-v2**(文生音效,JAX)、**MOVA**(图 + 文生成带同步音频的视频,JAX)和 **MAGI-2-preview**(113.93B 多头潜空间 MoE 音视频生成 + 1080p 超分,JAX / torchax / torch_tpu 三后端)。
 
 MiniMax-H3 also runs with the six-step **Pika-H3-Flex** adapters.
 
@@ -30,6 +30,9 @@ Newest first. Each entry links a date to what changed.
 
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-26** — **MAGI-2-preview** (Sand.ai 113.93B / 5.95B active Multi-Head Latent MoE Stage 1 DiT + 4-stream mHC + Attention Sink, Qwen3.5-27B text encoder, Stage 2 1080p Refiner DiT, TurboVAED / Wan2.2-TI2V-5B video VAE, and AutoencoderOobleck stereo audio VAE) across all three backends on TPU v7x-8 ([usage](#run-magi-2-preview--运行-magi-2-preview)). Stage 1 uses Ulysses CP=8 + EP=8 (32 local experts/head/chip) with Pallas Splash+Sink (`V7_SPEC`), MegaCore Dual-TC `gmm_v2` (`fuse_act="swigluoai"`, BF16 and W8A8 E4M3 FP8), and Tokamax Pallas 4-stream mHC (exact global-max col-then-row Sinkhorn). On v7x-8 (10 s audio+video, CFG=2): **Native JAX** runs `272p BF16` at **0.960 s/step**, `540p BF16` 100-step E2E at **3.415 s/step** (67.7 GiB peak HBM), `540p FP8` at **3.430 s/step** (42.7 GiB HBM, PSNR 20.83 dB), and Stage 2 `1080p` (`1088x1920 @ 25 fps`) 5-step Refiner at **87.35 s/step**; **torchax** matches Native JAX within <0.6% (`272p BF16` **0.960 s/step**, `540p BF16` **3.728 s/step**, `540p FP8` **3.745 s/step**, `video rel_l2 = 1.7–2.2e-2`, plus E2V/I2V verified); **torch_tpu** (`torchrun --nproc_per_node 8`, `spmd_safe` + single-chip Pallas `jax_op` + on-TPU FP8 quant streaming in ~25 s) reaches **0.923 s/step** (`272p BF16`), **0.829 s/step** (`272p FP8`, 100-step E2E in **83.7 s**), **3.331 s/step** (`540p BF16`), and **3.248 s/step** (`540p FP8`, `video rel_l2 = 1.98–2.31e-2` vs Native JAX).
+
+  **2026-11-26** — TPU v7x-8 全面支持 **MAGI-2-preview**(Sand.ai 113.93B / 5.95B 激活多头潜空间 MoE 一阶段 DiT + 4 流 mHC + Attention Sink、Qwen3.5-27B 文本编码器、二阶段 1080p Refiner DiT、TurboVAED / Wan2.2 视频 VAE 与 AutoencoderOobleck 立体声音频 VAE),覆盖原生 JAX、torchax、torch_tpu 三个后端([用法](#run-magi-2-preview--运行-magi-2-preview))。一阶段采用 Ulysses CP=8 + EP=8(每卡每头 32 本地专家),结合 Pallas Splash+Sink(`V7_SPEC`)、MegaCore Dual-TC `gmm_v2`(支持 BF16 与 W8A8 E4M3 FP8)与 Tokamax Pallas 4 流 mHC(精确全局最大值列先行后 Sinkhorn)。v7x-8 实测(10 秒音视频,CFG=2):**原生 JAX** `272p BF16` **0.960 秒/步**,`540p BF16` 100 步端到端 **3.415 秒/步**(峰值 HBM 67.7 GiB),`540p FP8` **3.430 秒/步**(42.7 GiB,PSNR 20.83 dB),二阶段 `1080p`(`1088x1920 @ 25 fps`)5 步 Refiner **87.35 秒/步**;**torchax** 与原生 JAX 开销 <0.6%(`272p BF16` **0.960 秒/步**,`540p BF16` **3.728 秒/步**,`540p FP8` **3.745 秒/步**,`video rel_l2 = 1.7–2.2e-2`,已完成 I2V 端到端验证);**torch_tpu**(`torchrun --nproc_per_node 8`、`spmd_safe` + 单卡 Pallas `jax_op` + TPU 端就地 FP8 流式加载 ~25 秒)达到 `272p BF16` **0.923 秒/步**、`272p FP8` **0.829 秒/步**(100 步端到端去噪 **83.7 秒**)、`540p BF16` **3.331 秒/步**、`540p FP8` **3.248 秒/步**(40 层对齐原生 JAX `video rel_l2 = 1.98–2.31e-2`)。
 - **2026-11-24** — **MOVA-360p** (OpenMOSS image + text to video with synchronized audio: two 14B Wan2.2-style video experts, a 1.3B audio tower, a cross-modal bridge, UMT5-XXL, the Wan2.1 VAE and DAC): 352x640, 193 frames (8 s), 50 steps, CFG 5. On a v6e-4 a clip takes **164.1 s** end to end (3.25 s a step; both experts resident, 24.1 GiB peak a chip; the video layers run sequence parallel: whole weights all-gathered layer by layer, Ulysses all-to-all around the self-attention, instead of three all-reduces of the residual stream a layer under tensor parallelism, 4.22 s a step); on a v6e-8, with the CFG branches on two groups of four chips, **91.2 s** (1.79 s a step) against 9.0 s a step on an H100 with offload (official README). Everything but the text encoder is native JAX (the UMT5 is transformers' own through torchax); in float32 the pipeline matches the official code (frames within 2/255, audio SNR 45.8 dB after 4 steps), in bfloat16 its error is that of the official bfloat16 run. The Wan2.1 VAE (`models/wan_vae/`) is shared and can run chunked in time with the official cache semantics ([usage](#run-mova--运行-mova)).
 
   **2026-11-24** — 支持 **MOVA-360p**(OpenMOSS 图 + 文生成带同步音频的视频:两个 14B Wan2.2 式视频专家、1.3B 音频塔、跨模态桥接、UMT5-XXL、Wan2.1 VAE、DAC):352x640、193 帧(8 秒)、50 步、CFG 5。v6e-4 上一条端到端 **164.1 秒**(每步 3.25 秒;两个专家常驻、每 chip 峰值 24.1 GiB;视频层序列并行:权重逐层 all-gather 成整份,自注意力前后各一次 Ulysses all-to-all,代替张量并行下每层三次残差流 all-reduce(每步 4.22 秒));v6e-8 上 CFG 两支各占 4 chip,**91.2 秒**(每步 1.79 秒),官方 README 中 H100(offload)每步 9.0 秒。除文本编码器外全部为原生 JAX(UMT5 用 transformers 自带实现经 torchax);fp32 下与官方代码一致(4 步后帧差 ≤ 2/255、音频 SNR 45.8 dB),bf16 下误差与官方 bf16 同级。Wan2.1 VAE(`models/wan_vae/`)为公共模块,可按官方缓存语义分时间块运行。
@@ -725,6 +728,41 @@ The adapter is merged into the weights while loading, so the denoising step cost
 The adapters are released under the MiniMax H3 Community License by Pika Labs.
 
 这两个适配器由 Pika Labs 以 MiniMax H3 社区许可证发布。
+
+---
+
+## Run MAGI-2-preview / 运行 MAGI-2-preview
+
+Sand.ai's 113.93B (5.95B active) Multi-Head Latent MoE audio+video model with 4-stream mHC, Attention Sink, Qwen3.5-27B text encoder, Stage 2 1080p Refiner, TurboVAED / Wan2.2 video VAE, and AutoencoderOobleck stereo audio VAE. Official resolution presets are `272p` (`256x448`, 12.5 fps), `540p` (`512x896`, 12.5 fps), and `1080p` (`1088x1920`, 25 fps via Stage 2 Refiner).
+
+Sand.ai 113.93B(5.95B 激活)多头潜空间 MoE 音视频生成模型,包含 4 流 mHC、Attention Sink、Qwen3.5-27B 文本编码器、二阶段 1080p Refiner、TurboVAED / Wan2.2 视频 VAE 与 AutoencoderOobleck 立体声音频 VAE。官方分辨率预设为 `272p`(`256x448`,12.5 fps)、`540p`(`512x896`,12.5 fps)与 `1080p`(`1088x1920`,二阶段 Refiner 25 fps)。
+
+```bash
+hf download sand-ai/MAGI-2-preview --local-dir /path/to/magi2_preview_weights
+export MAGI2_CKPT_ROOT=/path/to/magi2_preview_weights
+
+# Priority 1: Native JAX (T2V / I2V, 272p / 540p / 1080p, optional --fp8)
+bash scripts/run_magi2_jax.sh 540p --prompt "A red fox trotting through snow at golden hour"
+bash scripts/run_magi2_jax.sh 540p --fp8 --prompt "..."
+bash scripts/run_magi2_jax.sh 1080p --prompt "..."                          # Stage 1 (540p) + Stage 2 Refiner (1080p)
+bash scripts/run_magi2_jax.sh i2v 540p --image ref.png --prompt "..."
+
+# Priority 2: torchax (PyTorch DiT traced through JAX/shard_map/lax.scan)
+bash scripts/run_magi2_torchax.sh 540p --fp8 --prompt "..."
+
+# Priority 3: torch_tpu (8-process torchrun, 1/chip, spmd_safe + Pallas jax_op)
+bash scripts/run_magi2_torchtpu.sh --mode bench --resolution 540p --fp8
+bash scripts/run_magi2_torchtpu.sh --mode denoise --resolution 540p --fp8 --steps 100 \
+  --text-embeds-cache prompt_embeds.npz
+```
+
+| MAGI-2-preview 113.93B on TPU v7x-8 (10 s, CFG=2) | Native JAX | torchax | torch_tpu |
+|---|---|---|---|
+| `272p BF16` (`S=29,664`) | `0.960 s/step` | `0.960 s/step` | **`0.923 s/step`** |
+| `272p FP8-W8A8` | — | `0.963 s/step` | **`0.829 s/step`** |
+| `540p BF16` (`S=115,680`) | `3.723 s/step` (`3.415 s` E2E) | `3.728 s/step` | **`3.331 s/step`** |
+| `540p FP8-W8A8` | `3.430 s/step` (`42.7 GiB` HBM) | `3.745 s/step` | **`3.248 s/step`** |
+| Stage 2 `1080p` Refiner (`1088x1920 @ 25 fps`, 5 steps) | `87.35 s/step` (`23.8 GiB` HBM) | — | — |
 
 ---
 
