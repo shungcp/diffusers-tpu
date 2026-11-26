@@ -4,9 +4,9 @@ Fast inference for open diffusion models on Cloud TPU, built on top of [huggingf
 
 基于 [huggingface/diffusers](https://github.com/huggingface/diffusers),在 Cloud TPU 上高速运行开源扩散模型。
 
-Six models are supported today: **MiniMax-H3** (video + audio), **MiniMax-H3-Image** (image and image editing), **Qwen-Image-2.1** (image), **MOSS-Image** (image, torchax backend), **MOSS-SoundEffect-v2** (text-to-audio, JAX) and **MOVA** (image + text to video with audio, JAX).
+Seven models are supported today: **MiniMax-H3** (video + audio), **MiniMax-H3-Image** (image and image editing), **Qwen-Image-2.1** (image), **MOSS-Image** (image, torchax backend), **MOSS-SoundEffect-v2** (text-to-audio, JAX), **MOVA** (image + text to video with audio, JAX) and **OmniVAE T2AV** (text to video with audio, JAX).
 
-目前支持六个模型:**MiniMax-H3**(视频 + 音频)、**MiniMax-H3-Image**(图像与图像编辑)、**Qwen-Image-2.1**(图像)、**MOSS-Image**(图像,torchax 后端)、**MOSS-SoundEffect-v2**(文生音效,JAX)和 **MOVA**(图 + 文生成带同步音频的视频,JAX)。
+目前支持七个模型:**MiniMax-H3**(视频 + 音频)、**MiniMax-H3-Image**(图像与图像编辑)、**Qwen-Image-2.1**(图像)、**MOSS-Image**(图像,torchax 后端)、**MOSS-SoundEffect-v2**(文生音效,JAX)、**MOVA**(图 + 文生成带同步音频的视频,JAX)和 **OmniVAE T2AV**(文生带同步音频的视频,JAX)。
 
 MiniMax-H3 also runs with the six-step **Pika-H3-Flex** adapters.
 
@@ -30,6 +30,9 @@ Newest first. Each entry links a date to what changed.
 
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-25** — **OmniVAE T2AV** (OpenMOSS `OpenMOSS-Team/OmniVAE`, final configuration `t2av_recon_distill_avclip`: two 1B Z-Image towers for video and audio joined by 18 cross-attention bridges, Qwen3.5-0.8B, decoded by OmniVAE's Wan2.2-style video decoder and its DAC audio decoder): 256x256, 121 frames (5 s) with 48 kHz audio, 50 steps, the release evaluation's dual CFG (3 forwards a step, scales 4). On a v6e-4 a clip takes **4.90 s** end to end (95 ms a step; 17.6 s on one chip), the simple CFG of the official CLI 61 ms a step; on a v6e-8 **3.73 s** (72 ms a step; simple CFG 49 ms). The model is small (2.6B) and has 15 heads, so every chip keeps all weights and the video rows are split over the chips: each chip holds its quarter of the video tokens plus a copy of the caption, keys are gathered for self-attention, and video-to-audio bridge attention merges per-chip partial softmaxes. In float32 the pipeline matches the official code step by step (latents within 6e-6 after 4 steps, both CFG modes; video decoder 3e-7, audio 122 dB); in bfloat16 its error is that of the official bfloat16 run. RoPE runs rotate-half on q / k columns regrouped per head (exact). Two differences from the official code's intent, both following what it actually runs: the scheduler shift is 3 for video and audio (the code's 5 / 3 never reaches the scheduler), and the prompt template is drawn with the seed, without the duration suffix. The Wan2.2 decoder (`models/wan_vae/jax_wan22_vae.py`) is shared ([usage](#run-omnivae--运行-omnivae)).
+
+  **2026-11-25** — 支持 **OmniVAE T2AV**(OpenMOSS `OpenMOSS-Team/OmniVAE`,最终配置 `t2av_recon_distill_avclip`:视频、音频两个 1B Z-Image 塔,由 18 个交叉注意力桥连接,Qwen3.5-0.8B 文本编码器,用 OmniVAE 的 Wan2.2 式视频解码器和 DAC 音频解码器解码):256x256、121 帧(5 秒)加 48 kHz 音频,50 步,发布评测用的 dual CFG(每步 3 次前向,各尺度 4)。v6e-4 上一条端到端 **4.90 秒**(每步 95 毫秒;单 chip 17.6 秒),官方 CLI 的 simple CFG 每步 61 毫秒;v6e-8 上 **3.73 秒**(每步 72 毫秒;simple CFG 49 毫秒)。模型小(2.6B)且只有 15 个头,所以每个 chip 持有整份权重,视频行切分到各 chip:每个 chip 放自己那 1/4 视频 token 和一份 caption,自注意力 gather key,视频到音频的桥接注意力合并各 chip 的部分 softmax。fp32 下整条流程与官方逐步一致(两种 CFG 4 步后 latent 误差 ≤ 6e-6;视频解码器 3e-7,音频 122 dB);bf16 下误差与官方 bf16 同级。RoPE 改为 rotate-half(按头重排 q / k 列,精确等价)。与官方代码"意图"不同、但与其实际运行一致的两处:调度器 shift 视频、音频都是 3(代码里的 5 / 3 没有真正设到调度器上);提示词模板按种子选取,不加时长后缀。Wan2.2 解码器(`models/wan_vae/jax_wan22_vae.py`)为公共模块。
 - **2026-11-24** — **MOVA-360p** (OpenMOSS image + text to video with synchronized audio: two 14B Wan2.2-style video experts, a 1.3B audio tower, a cross-modal bridge, UMT5-XXL, the Wan2.1 VAE and DAC): 352x640, 193 frames (8 s), 50 steps, CFG 5. On a v6e-4 a clip takes **164.1 s** end to end (3.25 s a step; both experts resident, 24.1 GiB peak a chip; the video layers run sequence parallel: whole weights all-gathered layer by layer, Ulysses all-to-all around the self-attention, instead of three all-reduces of the residual stream a layer under tensor parallelism, 4.22 s a step); on a v6e-8, with the CFG branches on two groups of four chips, **91.2 s** (1.79 s a step) against 9.0 s a step on an H100 with offload (official README). Everything but the text encoder is native JAX (the UMT5 is transformers' own through torchax); in float32 the pipeline matches the official code (frames within 2/255, audio SNR 45.8 dB after 4 steps), in bfloat16 its error is that of the official bfloat16 run. The Wan2.1 VAE (`models/wan_vae/`) is shared and can run chunked in time with the official cache semantics ([usage](#run-mova--运行-mova)).
 
   **2026-11-24** — 支持 **MOVA-360p**(OpenMOSS 图 + 文生成带同步音频的视频:两个 14B Wan2.2 式视频专家、1.3B 音频塔、跨模态桥接、UMT5-XXL、Wan2.1 VAE、DAC):352x640、193 帧(8 秒)、50 步、CFG 5。v6e-4 上一条端到端 **164.1 秒**(每步 3.25 秒;两个专家常驻、每 chip 峰值 24.1 GiB;视频层序列并行:权重逐层 all-gather 成整份,自注意力前后各一次 Ulysses all-to-all,代替张量并行下每层三次残差流 all-reduce(每步 4.22 秒));v6e-8 上 CFG 两支各占 4 chip,**91.2 秒**(每步 1.79 秒),官方 README 中 H100(offload)每步 9.0 秒。除文本编码器外全部为原生 JAX(UMT5 用 transformers 自带实现经 torchax);fp32 下与官方代码一致(4 步后帧差 ≤ 2/255、音频 SNR 45.8 dB),bf16 下误差与官方 bf16 同级。Wan2.1 VAE(`models/wan_vae/`)为公共模块,可按官方缓存语义分时间块运行。
@@ -645,6 +648,23 @@ hf download OpenMOSS-Team/MOSS-Image-SFT --include "transformer/*" --include "sc
 hf download lodestones/MOSS-Image-SFT-8-steps-dmd generator.safetensors
 bash scripts/run_moss_image.sh --dmd --prompt "..."
 ```
+
+---
+
+## Run OmniVAE / 运行 OmniVAE
+
+```bash
+hf download OpenMOSS-Team/OmniVAE --local-dir omnivae_release \
+  --include "models/dit/t2av/t2av_recon_distill_avclip/*" "models/vae/audio_video/recon_distill_avclip/*" \
+            "models/vae/audio_only/recon_distill_avclip_ft_decoder/*" "models/text_encoder/*"   # ~17 GB of the 96 GB bundle
+export OMNIVAE_RELEASE_ROOT=$PWD/omnivae_release
+bash scripts/run_omnivae.sh --prompt "A dog barks twice at a passing bicycle on a quiet street."   # all chips, dual CFG
+bash scripts/run_omnivae.sh --prompt "..." --cfg-mode simple --seed 7
+```
+
+Output: H.264 + AAC (48 kHz) mp4. `--frames`, `--height`, `--width`, `--steps`, `--guidance`, `--template` (T2AV template index) as needed.
+
+输出 H.264 + AAC(48 kHz)mp4。可按需设置 `--frames`、`--height`、`--width`、`--steps`、`--guidance`、`--template`(T2AV 模板序号)。
 
 ---
 

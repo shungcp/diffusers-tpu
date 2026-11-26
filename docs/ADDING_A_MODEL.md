@@ -18,8 +18,9 @@ diffusers_tpu/
     moss_image/       MOSS-Image: torchax DiT core and one-program step, JAX VAE decoder
     dac/              the DAC audio VAE decoder in JAX (shared by the OpenMOSS audio models)
     moss_soundeffect/ MOSS-SoundEffect-v2: JAX audio DiT and step, prompt cleaning, pipeline
-    wan_vae/          the Wan2.1 video VAE in JAX, whole clip or chunked in time (shared)
+    wan_vae/          Wan2.1 video VAE (whole clip or chunked in time) and Wan2.2 decoder in JAX (shared)
     mova/             MOVA: JAX video experts + audio tower + bridge, TI2VA pipeline
+    omnivae/          OmniVAE T2AV: JAX Z-Image video / audio towers + bridges, Qwen3.5 text, pipeline
 ```
 
 ## Recommended order for a new diffusers model

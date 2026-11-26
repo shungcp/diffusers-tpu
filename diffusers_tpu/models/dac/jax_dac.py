@@ -40,11 +40,20 @@ def _fold_weight_norm(state, prefix):
 
 
 def load_state(path):
-  """(state_dict as numpy, kwargs) from a DAC ``.pth``, read without
-  unpickling code: the file holds ``{"state_dict", "metadata"}`` only."""
+  """(state_dict as numpy, kwargs) from a DAC ``.pth`` (``{"state_dict",
+  "metadata"}``) or an OmniVAE ``state_dict.pt`` (``{"model_state_dict",
+  "config", ...}``), read without unpickling code (``weights_only``)."""
   import torch
 
-  blob = torch.load(path, weights_only=True, map_location="cpu")
+  blob = torch.load(path, weights_only=True, map_location="cpu", mmap=True)
+  if "model_state_dict" in blob:  # an OmniVAE checkpoint: ``audio_vae.*`` + its training config
+    pre = "audio_vae."
+    state = {k[len(pre):]: v.float().numpy() for k, v in blob["model_state_dict"].items()
+             if k.startswith(pre) and (".decoder." in k or "post_quant_conv" in k or
+                                       k.startswith(pre + "decoder.") or k.startswith(pre + "post_quant_conv"))}
+    audio = blob["config"]["model"]["audio"]
+    return state, {"decoder_rates": list(audio["decoder_rates"]), "latent_dim": audio["latent_dim"],
+                   "decoder_dim": audio["decoder_dim"], "sample_rate": audio["sample_rate"]}
   state = {k: v.float().numpy() for k, v in blob["state_dict"].items()}
   return state, dict(blob["metadata"]["kwargs"])
 
