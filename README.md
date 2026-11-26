@@ -4,9 +4,9 @@ Fast inference for open diffusion models on Cloud TPU, built on top of [huggingf
 
 基于 [huggingface/diffusers](https://github.com/huggingface/diffusers),在 Cloud TPU 上高速运行开源扩散模型。
 
-Seven models are supported today: **MiniMax-H3** (video + audio), **MiniMax-H3-Image** (image and image editing), **Qwen-Image-2.1** (image), **MOSS-Image** (image, torchax backend), **MOSS-SoundEffect-v2** (text-to-audio, JAX), **MOVA** (image + text to video with audio, JAX) and **OmniVAE T2AV** (text to video with audio, JAX).
+Eight models are supported today: **MiniMax-H3** (video + audio), **MiniMax-H3-Image** (image and image editing), **Qwen-Image-2.1** (image), **MOSS-Image** (image, torchax backend), **MOSS-SoundEffect-v2** (text-to-audio, JAX), **MOVA** (image + text to video with audio, JAX), **OmniVAE T2AV** (text to video with audio, JAX) and **VideoGym-LTX-2.3** (image + text to video, LTX-2.3, JAX).
 
-目前支持七个模型:**MiniMax-H3**(视频 + 音频)、**MiniMax-H3-Image**(图像与图像编辑)、**Qwen-Image-2.1**(图像)、**MOSS-Image**(图像,torchax 后端)、**MOSS-SoundEffect-v2**(文生音效,JAX)、**MOVA**(图 + 文生成带同步音频的视频,JAX)和 **OmniVAE T2AV**(文生带同步音频的视频,JAX)。
+目前支持八个模型:**MiniMax-H3**(视频 + 音频)、**MiniMax-H3-Image**(图像与图像编辑)、**Qwen-Image-2.1**(图像)、**MOSS-Image**(图像,torchax 后端)、**MOSS-SoundEffect-v2**(文生音效,JAX)、**MOVA**(图 + 文生成带同步音频的视频,JAX)、**OmniVAE T2AV**(文生带同步音频的视频,JAX)和 **VideoGym-LTX-2.3**(图 + 文生视频,LTX-2.3,JAX)。
 
 MiniMax-H3 also runs with the six-step **Pika-H3-Flex** adapters.
 
@@ -30,6 +30,9 @@ Newest first. Each entry links a date to what changed.
 
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-26** — **VideoGym-LTX-2.3** (OpenMOSS `OpenMOSS-Team/VideoGym-LTX-2.3`: LTX-2.3's 22B audio-video DiT post-trained for visual reasoning puzzles, with Gemma-3-12B, the text connectors, the LTX-2 video VAE, the audio VAE and vocoder): image + text to video at the model card's settings, 768x512 (the 512x512 puzzle centered on a black canvas), 129 frames at 24 fps, 30 steps, CFG 3 with spatio-temporal guidance and guidance rescale 0.7. On a v6e-8 a clip takes **15.4 s** end to end (0.47 s a step; 27.6 GiB peak a chip). The DiT and the connectors are native JAX, Gemma-3 and the VAEs run through torchax; in bfloat16 the pipeline's error against the official float32 run is that of the official bfloat16 run (latents 1.8e-2 vs 2.2e-2 after 3 steps, frames 46.6 vs 45.1 dB). The 6,528 video tokens are few and the 44 GB of weights many, so the blocks run sequence parallel instead of tensor parallel (which all-reduces the residual stream four times a block: 1.26 s a forward against 0.39 s): each chip keeps 1/8 of the rows, 20 blocks stay whole on every chip and the other 28 are all-gathered block by block, the self-attention goes through Ulysses all-to-alls and the video-to-audio attention merges per-chip partial softmaxes. Each step is one forward over four rows (negative, positive, positive with STG, positive with the audio/video attentions off): the last row is diffusers' default audio modality guidance (audio CFG 7, modality 3), which the audio, and through it the video, follow ([usage](#run-videogym-ltx-23--运行-videogym-ltx-23)).
+
+  **2026-11-26** — 支持 **VideoGym-LTX-2.3**(OpenMOSS `OpenMOSS-Team/VideoGym-LTX-2.3`:LTX-2.3 的 22B 音视频 DiT 在视觉推理谜题上做的后训练,配 Gemma-3-12B、文本 connectors、LTX-2 视频 VAE、音频 VAE 与 vocoder):按模型卡设置图 + 文生视频,768x512(512x512 谜题居中、两侧黑边),129 帧 24 fps,30 步,CFG 3 加时空引导(STG)与 guidance rescale 0.7。v6e-8 上一条端到端 **15.4 秒**(每步 0.47 秒;每 chip 峰值 27.6 GiB)。DiT 与 connectors 为原生 JAX,Gemma-3 和各 VAE 经 torchax 运行;bf16 下对官方 fp32 的误差与官方 bf16 同级(3 步后 latent 1.8e-2 对 2.2e-2,帧 46.6 对 45.1 dB)。视频只有 6528 个 token 而权重有 44 GB,所以各块用序列并行而不是张量并行(张量并行每块要对残差流做四次 all-reduce:每次前向 1.26 秒,序列并行 0.39 秒):每个 chip 持有 1/8 的行,20 个块在每个 chip 上整份常驻,其余 28 个逐块 all-gather,自注意力走 Ulysses all-to-all,视频到音频的注意力合并各 chip 的部分 softmax。每步一次前向、四行(负、正、正 + STG、正且关掉音视频互注意力):最后一行是 diffusers 默认的音频模态引导(音频 CFG 7、modality 3),音频以及通过它的视频都与之一致。
 - **2026-11-26** — **MOVA-720p**: same architecture and configs as MOVA-360p, only the weights differ, so it runs with `--repo OpenMOSS-Team/MOVA-720p`. At the official 1280x720, 193 frames (8 s), 50 steps, CFG 5, a clip takes **788 s** end to end on a v6e-8 (15.7 s a step, 25.0 GiB peak a chip). Two CFG groups of four chips do not fit a v6e chip at 720p (both experts on four chips plus the activations), so above 480x832 on chips under 64 GB the CFG branches share all chips ([usage](#run-mova--运行-mova)).
 
   **2026-11-26** — 支持 **MOVA-720p**:架构和配置与 MOVA-360p 完全相同,只是权重不同,用 `--repo OpenMOSS-Team/MOVA-720p` 运行。官方 1280x720、193 帧(8 秒)、50 步、CFG 5,v6e-8 上一条端到端 **788 秒**(每步 15.7 秒,每 chip 峰值 25.0 GiB)。720p 下 CFG 两组各 4 chip 放不进 v6e(两个专家分到 4 个 chip 再加激活),所以分辨率高于 480x832 且 chip 显存小于 64 GB 时,CFG 两支共用全部 chip。
@@ -651,6 +654,19 @@ hf download OpenMOSS-Team/MOSS-Image-SFT --include "transformer/*" --include "sc
 hf download lodestones/MOSS-Image-SFT-8-steps-dmd generator.safetensors
 bash scripts/run_moss_image.sh --dmd --prompt "..."
 ```
+
+---
+
+## Run VideoGym-LTX-2.3 / 运行 VideoGym-LTX-2.3
+
+```bash
+hf download OpenMOSS-Team/VideoGym-LTX-2.3      # ~96 GB (Gemma-3-12B in float32 is half of it)
+bash scripts/run_ltx2.sh --image canvas.png --prompt "Move the red dot along the white path to the green square."
+```
+
+`--image` is the 768x512 canvas (a 512x512 puzzle centered, black borders, as in the model card); it is re-compressed as H.264 CRF 33 like diffusers / ltx-pipelines (`--crf 0` skips that). Output: H.264 mp4 with the model's (untrained, near-silent) audio. `--frames` (8k + 1), `--steps`, `--guidance`, `--stg`, `--seed` as needed; `--resident` sets how many DiT blocks stay whole on every chip (default 20; fewer saves HBM, more saves all-gathers). The first run of a process compiles for about 6 minutes (`--compile-cache-dir` keeps it).
+
+`--image` 为 768x512 画布(512x512 谜题居中、两侧黑边,同模型卡);与 diffusers / ltx-pipelines 一样先做 H.264 CRF 33 重压缩(`--crf 0` 跳过)。输出 H.264 mp4,附带模型的音频(未训练,接近静音)。可按需设置 `--frames`(8k + 1)、`--steps`、`--guidance`、`--stg`、`--seed`;`--resident` 为每个 chip 上整份常驻的 DiT 块数(默认 20;少则省显存,多则省 all-gather)。进程第一次运行编译约 6 分钟(`--compile-cache-dir` 可保留)。
 
 ---
 
