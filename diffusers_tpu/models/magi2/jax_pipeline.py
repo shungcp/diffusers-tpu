@@ -469,15 +469,18 @@ def parse_figure_id(token_key: str) -> int:
 
 
 def ensure_figure_tokens(prompt: str, figure_ids: Sequence[int]) -> str:
-  """Attach ``reference_layer:The first frame refers to <Figure 1>`` (``inference_engine.py:L283``)."""
-  del figure_ids  # Upstream always injects the exact <Figure 1> reference_layer hint.
+  """Attach ``reference_layer:The first frame refers to <Figure 1>`` if absent (``inference_engine.py:L283``)."""
+  del figure_ids  # Upstream default injects the exact <Figure 1> reference_layer hint.
   try:
     prompt_obj = json.loads(prompt)
     if not isinstance(prompt_obj, dict):
       raise ValueError("prompt JSON is not an object")
-    prompt_obj["reference_layer"] = ["The first frame refers to <Figure 1>"]
+    if not prompt_obj.get("reference_layer"):
+      prompt_obj["reference_layer"] = ["The first frame refers to <Figure 1>"]
     return json.dumps(prompt_obj, ensure_ascii=False)
   except (json.JSONDecodeError, TypeError, ValueError):
+    if "reference_layer:" in prompt and "<Figure 1>" in prompt:
+      return prompt
     return prompt + "reference_layer:The first frame refers to <Figure 1>"
 
 
