@@ -375,7 +375,7 @@ def main():
                  help="video layers tensor parallel (Megatron) instead of sequence parallel")
   p.add_argument("--cfg", type=int, default=0, choices=(0, 1, 2),
                  help="CFG-parallel mesh axis: 0 = 2 with 8+ chips (each half holds both experts "
-                      "split over the rest), else 1")
+                      "split over the rest), else 1; 1 above 480x832 on chips under 64 GB")
   p.add_argument("--output", default="mova.mp4")
   p.add_argument("--compile-cache-dir", default="~/.cache/mova_jax")
   args = p.parse_args()
@@ -387,7 +387,13 @@ def main():
     jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
     jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
   n = len(jax.devices())
-  cfg = args.cfg or (2 if n >= 8 else 1)
+  if not args.cfg:
+    # Two CFG groups need both experts on half the chips: at 720p on a v6e (32 GB a chip) that
+    # plus the activations does not fit (the VAE encode already fails), so one group of all chips.
+    hbm = jax.devices()[0].memory_stats().get("bytes_limit", 0)
+    big = args.height * args.width > 480 * 832 and hbm < 64 * 2**30
+    args.cfg = 2 if n >= 8 and not big else 1
+  cfg = args.cfg
   if cfg not in (1, 2) or n % cfg:
     raise SystemExit(f"--cfg must be 1 or 2 and divide the {n} chips (got {cfg})")
   mesh = Mesh(mesh_utils.create_device_mesh((cfg, n // cfg)), ("cfg", "tensor"))

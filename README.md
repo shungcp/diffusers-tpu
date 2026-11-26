@@ -30,6 +30,9 @@ Newest first. Each entry links a date to what changed.
 
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-26** — **MOVA-720p**: same architecture and configs as MOVA-360p, only the weights differ, so it runs with `--repo OpenMOSS-Team/MOVA-720p`. At the official 1280x720, 193 frames (8 s), 50 steps, CFG 5, a clip takes **788 s** end to end on a v6e-8 (15.7 s a step, 25.0 GiB peak a chip). Two CFG groups of four chips do not fit a v6e chip at 720p (both experts on four chips plus the activations), so above 480x832 on chips under 64 GB the CFG branches share all chips ([usage](#run-mova--运行-mova)).
+
+  **2026-11-26** — 支持 **MOVA-720p**:架构和配置与 MOVA-360p 完全相同,只是权重不同,用 `--repo OpenMOSS-Team/MOVA-720p` 运行。官方 1280x720、193 帧(8 秒)、50 步、CFG 5,v6e-8 上一条端到端 **788 秒**(每步 15.7 秒,每 chip 峰值 25.0 GiB)。720p 下 CFG 两组各 4 chip 放不进 v6e(两个专家分到 4 个 chip 再加激活),所以分辨率高于 480x832 且 chip 显存小于 64 GB 时,CFG 两支共用全部 chip。
 - **2026-11-25** — **OmniVAE T2AV** (OpenMOSS `OpenMOSS-Team/OmniVAE`, final configuration `t2av_recon_distill_avclip`: two 1B Z-Image towers for video and audio joined by 18 cross-attention bridges, Qwen3.5-0.8B, decoded by OmniVAE's Wan2.2-style video decoder and its DAC audio decoder): 256x256, 121 frames (5 s) with 48 kHz audio, 50 steps, the release evaluation's dual CFG (3 forwards a step, scales 4). On a v6e-4 a clip takes **4.90 s** end to end (95 ms a step; 17.6 s on one chip), the simple CFG of the official CLI 61 ms a step; on a v6e-8 **3.73 s** (72 ms a step; simple CFG 49 ms). The model is small (2.6B) and has 15 heads, so every chip keeps all weights and the video rows are split over the chips: each chip holds its quarter of the video tokens plus a copy of the caption, keys are gathered for self-attention, and video-to-audio bridge attention merges per-chip partial softmaxes. In float32 the pipeline matches the official code step by step (latents within 6e-6 after 4 steps, both CFG modes; video decoder 3e-7, audio 122 dB); in bfloat16 its error is that of the official bfloat16 run. RoPE runs rotate-half on q / k columns regrouped per head (exact). Two differences from the official code's intent, both following what it actually runs: the scheduler shift is 3 for video and audio (the code's 5 / 3 never reaches the scheduler), and the prompt template is drawn with the seed, without the duration suffix. The Wan2.2 decoder (`models/wan_vae/jax_wan22_vae.py`) is shared ([usage](#run-omnivae--运行-omnivae)).
 
   **2026-11-25** — 支持 **OmniVAE T2AV**(OpenMOSS `OpenMOSS-Team/OmniVAE`,最终配置 `t2av_recon_distill_avclip`:视频、音频两个 1B Z-Image 塔,由 18 个交叉注意力桥连接,Qwen3.5-0.8B 文本编码器,用 OmniVAE 的 Wan2.2 式视频解码器和 DAC 音频解码器解码):256x256、121 帧(5 秒)加 48 kHz 音频,50 步,发布评测用的 dual CFG(每步 3 次前向,各尺度 4)。v6e-4 上一条端到端 **4.90 秒**(每步 95 毫秒;单 chip 17.6 秒),官方 CLI 的 simple CFG 每步 61 毫秒;v6e-8 上 **3.73 秒**(每步 72 毫秒;simple CFG 49 毫秒)。模型小(2.6B)且只有 15 个头,所以每个 chip 持有整份权重,视频行切分到各 chip:每个 chip 放自己那 1/4 视频 token 和一份 caption,自注意力 gather key,视频到音频的桥接注意力合并各 chip 的部分 softmax。fp32 下整条流程与官方逐步一致(两种 CFG 4 步后 latent 误差 ≤ 6e-6;视频解码器 3e-7,音频 122 dB);bf16 下误差与官方 bf16 同级。RoPE 改为 rotate-half(按头重排 q / k 列,精确等价)。与官方代码"意图"不同、但与其实际运行一致的两处:调度器 shift 视频、音频都是 3(代码里的 5 / 3 没有真正设到调度器上);提示词模板按种子选取,不加时长后缀。Wan2.2 解码器(`models/wan_vae/jax_wan22_vae.py`)为公共模块。
@@ -674,11 +677,13 @@ Output: H.264 + AAC (48 kHz) mp4. `--frames`, `--height`, `--width`, `--steps`, 
 hf download OpenMOSS-Team/MOVA-360p
 bash scripts/run_mova.sh --image ref.jpg --prompt "A man in a blue blazer speaks in a quiet room ..."   # 352x640, 8 s, all chips
 bash scripts/run_mova.sh --image ref.jpg --prompt "..." --cfg 2      # 8 chips: CFG branches on two groups of 4
+hf download OpenMOSS-Team/MOVA-720p
+bash scripts/run_mova.sh --repo OpenMOSS-Team/MOVA-720p --height 720 --width 1280 --image ref.jpg --prompt "..."   # 720p
 ```
 
-The reference image is center-cropped to 352x640 as in the official script. Output: H.264 + AAC (48 kHz) mp4. `--frames`, `--steps`, `--cfg-scale`, `--seed` as in the official CLI.
+The reference image is center-cropped to the output size (352x640 by default) as in the official script. Output: H.264 + AAC (48 kHz) mp4. `--frames`, `--steps`, `--cfg-scale`, `--seed` as in the official CLI.
 
-参考图按官方脚本居中裁剪到 352x640。输出 H.264 + AAC(48 kHz)mp4。`--frames`、`--steps`、`--cfg-scale`、`--seed` 与官方一致。
+参考图按官方脚本居中裁剪到输出尺寸(默认 352x640)。输出 H.264 + AAC(48 kHz)mp4。`--frames`、`--steps`、`--cfg-scale`、`--seed` 与官方一致。
 
 ---
 
