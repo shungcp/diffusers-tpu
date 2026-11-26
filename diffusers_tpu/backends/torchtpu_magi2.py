@@ -117,6 +117,65 @@ def _wrap_spmd_compile(fn, *, use_spmd_safe: bool = True):
   return torch.compile(fn, backend="tpu", fullgraph=True, dynamic=False)
 
 
+_ACTIVE_MAGI2_HOOKS: Any = None
+_ACTIVE_SAMPLE_LENS: tuple[int, ...] = ()
+
+
+def _top_run_mm_layer(
+    mod, x_sorted, rope_96, mod_ids_sorted, group_sizes, perm_local, inv_perm_local
+):
+  return type(mod).forward(
+      mod,
+      x_sorted,
+      rope_96,
+      mod_ids_sorted,
+      group_sizes,
+      perm_local,
+      inv_perm_local,
+      _ACTIVE_SAMPLE_LENS,
+      hooks=_ACTIVE_MAGI2_HOOKS,
+  )
+
+
+def _top_run_moe_layer(
+    mod, x_sorted, rope_96, mod_ids_sorted, group_sizes, perm_local, inv_perm_local
+):
+  return type(mod).forward(
+      mod,
+      x_sorted,
+      rope_96,
+      mod_ids_sorted,
+      group_sizes,
+      perm_local,
+      inv_perm_local,
+      _ACTIVE_SAMPLE_LENS,
+      hooks=_ACTIVE_MAGI2_HOOKS,
+  )
+
+
+def _top_run_group(
+    mods, x_sorted, rope_96, mod_ids_sorted, group_sizes, perm_local, inv_perm_local
+):
+  for m in mods:
+    x_sorted = type(m).forward(
+        m,
+        x_sorted,
+        rope_96,
+        mod_ids_sorted,
+        group_sizes,
+        perm_local,
+        inv_perm_local,
+        _ACTIVE_SAMPLE_LENS,
+        hooks=_ACTIVE_MAGI2_HOOKS,
+    )
+  return x_sorted
+
+
+def _top_run_post(post_mod, x_sorted, inv_perm_local, mod_ids):
+  x_seq = x_sorted.index_select(0, inv_perm_local)
+  return type(post_mod).forward(post_mod, x_seq, mod_ids, hooks=_ACTIVE_MAGI2_HOOKS)
+
+
 class CompiledMagi2PreviewTT:
   """AOT-compiled 40-layer ``Magi2PreviewTransformerTorch`` for ``torch_tpu``."""
 
@@ -130,59 +189,90 @@ class CompiledMagi2PreviewTT:
       use_compile: bool = True,
       use_spmd_safe: bool = True,
   ) -> None:
+    global _ACTIVE_MAGI2_HOOKS, _ACTIVE_SAMPLE_LENS
     self.model = model
     self.sample_lens = tuple(int(s) for s in sample_lens)
     self.hooks = hooks
     self.aot_group = max(1, int(aot_group))
     self.use_compile = use_compile
+    _ACTIVE_MAGI2_HOOKS = hooks
+    _ACTIVE_SAMPLE_LENS = self.sample_lens
 
-    def _run_one_layer(
-        mod, x_sorted, rope_96, mod_ids_sorted, group_sizes, perm_local, inv_perm_local
-    ):
-      return type(mod).forward(
-          mod,
-          x_sorted,
-          rope_96,
-          mod_ids_sorted,
-          group_sizes,
-          perm_local,
-          inv_perm_local,
+    persist_dir = os.environ.get("DT_AOT_PERSIST", "").strip()
+    if persist_dir == "0":
+      persist_dir = ""
+
+    def _make_fn(raw_fn, prog_tag: str):
+      if not use_compile:
+        return raw_fn
+      compiled = _wrap_spmd_compile(raw_fn, use_spmd_safe=use_spmd_safe)
+      if not persist_dir or not hasattr(compiled, "aot_compile"):
+        return compiled
+      import hashlib
+
+      rank_str = os.environ.get("RANK", "0")
+      world_str = os.environ.get("WORLD_SIZE", "1")
+      salt = (
+          prog_tag,
           self.sample_lens,
-          hooks=self.hooks,
+          self.aot_group,
+          world_str,
+          str(self.model.dtype),
+          os.environ.get("DT_MAGI2_AG_CAP_FACTOR", ""),
+          bool(getattr(self.hooks, "fp8_moe", False)),
+          bool(getattr(self.hooks, "use_splash", True)),
       )
+      h = hashlib.sha1(repr(salt).encode("utf-8")).hexdigest()[:16]
+      os.makedirs(persist_dir, exist_ok=True)
+      bin_path = os.path.join(persist_dir, f"magi2_{prog_tag}_{h}.bin")
+      art_holder: list[Any] = [None]
+      tried: list[bool] = [False]
 
-    def _run_group(
-        mods, x_sorted, rope_96, mod_ids_sorted, group_sizes, perm_local, inv_perm_local
-    ):
-      for m in mods:
-        x_sorted = type(m).forward(
-            m,
-            x_sorted,
-            rope_96,
-            mod_ids_sorted,
-            group_sizes,
-            perm_local,
-            inv_perm_local,
-            self.sample_lens,
-            hooks=self.hooks,
-        )
-      return x_sorted
+      def _call_persisted(*args):
+        if art_holder[0] is not None:
+          return art_holder[0](*args)
+        if not tried[0]:
+          tried[0] = True
+          if os.path.exists(bin_path) and hasattr(torch.compiler, "load_compiled_function"):
+            t_ld = time.perf_counter()
+            try:
+              with open(bin_path, "rb") as f:
+                art = torch.compiler.load_compiled_function(f, f_globals=globals())
+              art_holder[0] = art
+              if rank_str == "0":
+                print(
+                    f"  [aot] loaded {os.path.basename(bin_path)} in {time.perf_counter() - t_ld:.2f}s",
+                    flush=True,
+                )
+              return art(*args)
+            except Exception as exc:
+              if rank_str == "0":
+                print(
+                    f"  [aot] cached {os.path.basename(bin_path)} unusable ({type(exc).__name__}); recompiling",
+                    flush=True,
+                )
+          try:
+            art = compiled.aot_compile((args, {}))
+            art_holder[0] = art
+            if rank_str == "0" and hasattr(art, "save_compiled_function"):
+              tmp_p = f"{bin_path}.tmp.{os.getpid()}"
+              art.save_compiled_function(tmp_p)
+              os.replace(tmp_p, bin_path)
+              print(f"  [aot] saved {os.path.basename(bin_path)}", flush=True)
+            return art(*args)
+          except Exception as exc:
+            if rank_str == "0":
+              print(
+                  f"  [aot] fallback to torch.compile for {prog_tag} ({type(exc).__name__}: {str(exc)[:120]})",
+                  flush=True,
+              )
+        return compiled(*args)
 
-    def _run_post(post_mod, x_sorted, inv_perm_local, mod_ids):
-      x_seq = x_sorted.index_select(0, inv_perm_local)
-      return type(post_mod).forward(post_mod, x_seq, mod_ids, hooks=self.hooks)
+      return _call_persisted
 
-    if use_compile:
-      self._mm_fn = _wrap_spmd_compile(_run_one_layer, use_spmd_safe=use_spmd_safe)
-      if self.aot_group == 1:
-        self._moe_fn = _wrap_spmd_compile(_run_one_layer, use_spmd_safe=use_spmd_safe)
-      else:
-        self._moe_fn = _wrap_spmd_compile(_run_group, use_spmd_safe=use_spmd_safe)
-      self._post_fn = _wrap_spmd_compile(_run_post, use_spmd_safe=use_spmd_safe)
-    else:
-      self._mm_fn = _run_one_layer
-      self._moe_fn = _run_one_layer if self.aot_group == 1 else _run_group
-      self._post_fn = _run_post
+    self._mm_fn = _make_fn(_top_run_mm_layer, "mm")
+    self._moe_fn = _make_fn(_top_run_moe_layer if self.aot_group == 1 else _top_run_group, "moe")
+    self._post_fn = _make_fn(_top_run_post, "post")
 
   @torch.no_grad()
   def forward_embedded_local(

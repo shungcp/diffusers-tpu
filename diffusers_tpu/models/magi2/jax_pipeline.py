@@ -186,6 +186,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
       default="",
       help="Path to .npz file to load/save precomputed text embeddings (skips 27B encoder on hit).",
   )
+  ap.add_argument(
+      "--enhance",
+      action="store_true",
+      help="Expand a short prompt into upstream PE JSON (dynamic_layer.timeline_segments with dialogue & Foley).",
+  )
+  ap.add_argument(
+      "--enhance-mode",
+      default="builtin",
+      choices=("builtin", "api"),
+      help="Prompt enhancer backend: 'builtin' (offline structured PE) or 'api' (GEMINI_API_KEY / OPENAI_API_KEY).",
+  )
+  ap.add_argument(
+      "--encode-only",
+      action="store_true",
+      help="Stop right after Stage 0b text encoding (useful with --text-embeds-cache).",
+  )
+  ap.add_argument(
+      "--requests",
+      default="",
+      help="Run TPU-resident server mode over a JSONL batch file (delegates to jax_server).",
+  )
 
   # Resolution & sampling
   ap.add_argument(
@@ -1426,6 +1447,35 @@ def print_timing_summary(timings: dict[str, Any], devices: Sequence[Any]) -> Non
 
 def main(argv: Sequence[str] | None = None) -> None:
   args = parse_args(argv)
+  if args.requests:
+    from .jax_server import main as server_main
+
+    srv_argv = [
+        "--model-dir", args.model_dir,
+        "--requests", args.requests,
+        "--resolution", args.resolution,
+        "--dtype", args.dtype,
+        "--moe-mode", args.moe_mode,
+    ]
+    if args.fp8:
+      srv_argv.append("--fp8")
+    if args.capacity_factor is not None:
+      srv_argv.extend(["--capacity-factor", str(args.capacity_factor)])
+    if args.resolution == "1080p" and not args.no_refiner:
+      srv_argv.append("--enable-refiner")
+    if args.refiner_qk_fp8:
+      srv_argv.append("--refiner-qk-fp8")
+    if args.lossy:
+      srv_argv.append("--lossy")
+    if args.enhance:
+      srv_argv.append("--enhance")
+    if args.compile_cache:
+      srv_argv.extend(["--compile-cache", args.compile_cache])
+    if args.chips > 0:
+      srv_argv.extend(["--chips", str(args.chips)])
+    server_main(srv_argv)
+    return
+
   t_e2e_start = time.perf_counter()
 
   # Set TPU XLA flags BEFORE importing JAX / libtpu.
@@ -1511,6 +1561,18 @@ def main(argv: Sequence[str] | None = None) -> None:
 
   image_dict = parse_image_paths(args.image)
   is_i2v = bool(image_dict)
+  if args.enhance:
+    from .prompt_enhancer import enhance_prompt_to_pe_json_str
+
+    prompt = enhance_prompt_to_pe_json_str(
+        prompt,
+        mode=args.enhance_mode,
+        seconds=args.seconds,
+        is_i2v=is_i2v,
+        num_refs=len(image_dict),
+    )
+    print(f"[magi2] Prompt expanded via --enhance ({args.enhance_mode}): {len(prompt)} chars", flush=True)
+
   figure_ids: list[int] = []
   if is_i2v:
     sorted_fig_keys = sorted(image_dict.keys())
@@ -1723,6 +1785,10 @@ def main(argv: Sequence[str] | None = None) -> None:
       del cond_j, uncond_j, spec_j, text_enc
       gc.collect()
       _log_hbm("after Stage 0b (Qwen3.5-27B freed)", devices)
+
+    if args.encode_only:
+      print("[magi2] --encode-only set; exiting after Stage 0b text encode.", flush=True)
+      return
 
   # Draw initial noise on host in exact upstream order (video -> audio -> refiner).
   video_shape = (1, preview_cfg.video_in_channels, video_latent_t, preview_lat_h, preview_lat_w)
