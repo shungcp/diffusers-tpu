@@ -764,6 +764,10 @@ bash scripts/run_magi2_torchtpu.sh --mode denoise --resolution 540p --fp8 --step
 | `540p FP8-W8A8` | `3.430 s/step` (`42.7 GiB` HBM) | `3.745 s/step` | **`3.248 s/step`** |
 | Stage 2 `1080p` Refiner (`1088x1920 @ 25 fps`, 5 steps) | `87.35 s/step` (`23.8 GiB` HBM) | — | — |
 
+> **Audio note / 音频提示:** For rich synchronized dialogue and Foley, pass an upstream PE-structured JSON/markdown prompt via `--prompt-file` (e.g., `assets/sample_enhanced_t2v.json`); short visual-only prompts are strongly attenuated by the upstream 429-token `DEFAULT_NEGATIVE_PROMPT` (which also contains `music, instrumental`) under `audio_cfg=7.0`. Leave `--adaptive-volume-scaling` off (default) unless you want loud clips attenuated to `-31 dBFS`.
+>
+> 如需清晰同步的人声对白与音效,建议通过 `--prompt-file` 传入官方 PE 结构化 JSON/Markdown 剧本(例如 `assets/sample_enhanced_t2v.json`);极短的纯画面提示词在 `audio_cfg=7.0` 和官方 429-token 默认负向词(内含 `music, instrumental`)下会被压成近乎静音。默认不开启 `--adaptive-volume-scaling`(仅衰减至 `-31 dBFS`)。
+
 ---
 
 ## Good to know / 使用须知

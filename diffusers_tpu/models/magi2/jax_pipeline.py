@@ -1050,7 +1050,14 @@ def mux_video_and_audio_ffmpeg(
   """Encode RGB24 uint8 ``(T, H, W, 3)`` frames (+ optional WAV) to H.264/AAC MP4 via ffmpeg."""
   ffmpeg_bin = shutil.which("ffmpeg")
   if ffmpeg_bin is None:
-    print("[magi2] WARNING: ffmpeg not found on PATH; skipping MP4 muxing.", flush=True)
+    try:
+      import imageio_ffmpeg
+
+      ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+      ffmpeg_bin = None
+  if ffmpeg_bin is None:
+    print("[magi2] WARNING: ffmpeg not found on PATH or imageio_ffmpeg; skipping MP4 muxing.", flush=True)
     return False
 
   t_num, h, w, c = frames_uint8.shape
@@ -1084,8 +1091,8 @@ def mux_video_and_audio_ffmpeg(
 
   cmd.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18"])
   if wav_path is not None and wav_path.exists():
-    cmd.extend(["-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k"])
-  cmd.append(str(mp4_path))
+    cmd.extend(["-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k", "-shortest"])
+  cmd.extend(["-movflags", "+faststart", str(mp4_path)])
 
   proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
   assert proc.stdin is not None
