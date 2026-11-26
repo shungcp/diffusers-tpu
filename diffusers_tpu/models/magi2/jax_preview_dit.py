@@ -205,16 +205,11 @@ def _sdpa_with_sink_single_segment(
   seq_len = q_seg.shape[2]
   out_dtype = q_seg.dtype
 
-  if hkv != hq:
-    if hq % hkv != 0:
-      raise ValueError(f"num_heads_q={hq} must be divisible by num_heads_kv={hkv}")
-    rep = hq // hkv
-    k_seg = jnp.repeat(k_seg, rep, axis=1)
-    v_seg = jnp.repeat(v_seg, rep, axis=1)
-
   scale = head_dim ** -0.5
 
   if use_splash and _splash is not None and head_dim % 128 == 0:
+    if hq % hkv != 0:
+      raise ValueError(f"num_heads_q={hq} must be divisible by num_heads_kv={hkv}")
     try:
       blocks = _block_sizes.resolve_block_sizes(
           seq_len, seq_len, head_dim, {}, "residual", _block_sizes.detect_spec()
@@ -241,6 +236,13 @@ def _sdpa_with_sink_single_segment(
     else:
       o_f32 = o_unnorm / jnp.maximum(l, jnp.float32(1e-30))
     return o_f32.astype(out_dtype)
+
+  if hkv != hq:
+    if hq % hkv != 0:
+      raise ValueError(f"num_heads_q={hq} must be divisible by num_heads_kv={hkv}")
+    rep = hq // hkv
+    k_seg = jnp.repeat(k_seg, rep, axis=1)
+    v_seg = jnp.repeat(v_seg, rep, axis=1)
 
   # Exact float32 fallback (CPU parity tests & small head_dim).
   logits = (
@@ -1451,101 +1453,108 @@ def make_jitted_forward(
   m_dtype = model.dtype
   splash_flag = _resolve_use_splash(use_splash)
 
-  def _run_local(st, x_l, rope_l, mod_l, time_l, *, _cp: int):
-    pre_s, layer_ss, post_s = st
-    mod_ids = jnp.where(
-        mod_l == MODALITY_TIME,
-        jnp.int32(MODALITY_TEXT),
-        mod_l.astype(jnp.int32),
-    )
-    if embedded_input:
-      x_emb = x_l
-    else:
-      x_emb = nnx.merge(pre_gd, pre_s)(x_l, mod_ids)
+  def _compile_for_lens(target_lens: tuple[int, ...]):
+    t_lens = tuple(int(v) for v in target_lens)
 
-    if rope_l.shape[-1] == 9:
-      rope_96 = _elementwise_fourier_embed_jax(
-          rope_l, head_dim=c.head_dim, temperature=c.rope_temperature
+    def _run_local(st, x_l, rope_l, mod_l, time_l, *, _cp: int):
+      pre_s, layer_ss, post_s = st
+      mod_ids = jnp.where(
+          mod_l == MODALITY_TIME,
+          jnp.int32(MODALITY_TEXT),
+          mod_l.astype(jnp.int32),
       )
-    else:
-      rope_96 = rope_l.astype(jnp.float32)
+      if embedded_input:
+        x_emb = x_l
+      else:
+        x_emb = nnx.merge(pre_gd, pre_s)(x_l, mod_ids)
 
-    x = x_emb.astype(jnp.float32)
-    if time_l is not None and time_l.shape[-1] > 0:
-      t_dim = time_l.shape[-1]
-      x = x.at[:, :t_dim].set(time_l.astype(x.dtype))
-    x = x.astype(m_dtype)
+      if rope_l.shape[-1] == 9:
+        rope_96 = _elementwise_fourier_embed_jax(
+            rope_l, head_dim=c.head_dim, temperature=c.rope_temperature
+        )
+      else:
+        rope_96 = rope_l.astype(jnp.float32)
 
-    perm_local = jnp.argsort(mod_ids, stable=True)
-    inv_perm_local = jnp.empty_like(perm_local).at[perm_local].set(
-        jnp.arange(perm_local.shape[0], dtype=perm_local.dtype)
-    )
-    mod_ids_sorted = mod_ids[perm_local]
-    group_sizes = jnp.bincount(mod_ids_sorted, length=3).astype(jnp.int32)
-    x_sorted = x[perm_local]
+      x = x_emb.astype(jnp.float32)
+      if time_l is not None and time_l.shape[-1] > 0:
+        t_dim = time_l.shape[-1]
+        x = x.at[:, :t_dim].set(time_l.astype(x.dtype))
+      x = x.astype(m_dtype)
 
-    for (is_scan, lgd, _run), lst in zip(segments, layer_ss):
-      if is_scan:
-        def _step(carry, one_st, _lgd=lgd):
-          lyr = nnx.merge(_lgd, one_st)
-          nxt = lyr(
-              carry,
+      perm_local = jnp.argsort(mod_ids, stable=True)
+      inv_perm_local = jnp.empty_like(perm_local).at[perm_local].set(
+          jnp.arange(perm_local.shape[0], dtype=perm_local.dtype)
+      )
+      mod_ids_sorted = mod_ids[perm_local]
+      group_sizes = jnp.bincount(mod_ids_sorted, length=3).astype(jnp.int32)
+      x_sorted = x[perm_local]
+
+      for (is_scan, lgd, _run), lst in zip(segments, layer_ss):
+        if is_scan:
+          def _step(carry, one_st, _lgd=lgd):
+            lyr = nnx.merge(_lgd, one_st)
+            nxt = lyr(
+                carry,
+                rope_96,
+                perm_local,
+                inv_perm_local,
+                mod_ids_sorted,
+                group_sizes,
+                sample_lens=t_lens,
+                cp_size=_cp,
+                axis_name=ax,
+                use_splash=splash_flag,
+                moe_mode=moe_mode,
+                capacity_factor=capacity_factor,
+            )
+            return nxt, None
+
+          x_sorted, _ = jax.lax.scan(_step, x_sorted, lst)
+        else:
+          lyr = nnx.merge(lgd, lst)
+          x_sorted = lyr(
+              x_sorted,
               rope_96,
               perm_local,
               inv_perm_local,
               mod_ids_sorted,
               group_sizes,
-              sample_lens=seg_lens,
+              sample_lens=t_lens,
               cp_size=_cp,
               axis_name=ax,
               use_splash=splash_flag,
               moe_mode=moe_mode,
               capacity_factor=capacity_factor,
           )
-          return nxt, None
 
-        x_sorted, _ = jax.lax.scan(_step, x_sorted, lst)
-      else:
-        lyr = nnx.merge(lgd, lst)
-        x_sorted = lyr(
-            x_sorted,
-            rope_96,
-            perm_local,
-            inv_perm_local,
-            mod_ids_sorted,
-            group_sizes,
-            sample_lens=seg_lens,
-            cp_size=_cp,
-            axis_name=ax,
-            use_splash=splash_flag,
-            moe_mode=moe_mode,
-            capacity_factor=capacity_factor,
-        )
+      x_seq = x_sorted[inv_perm_local]
+      return nnx.merge(post_gd, post_s)(x_seq, mod_ids)
 
-    x_seq = x_sorted[inv_perm_local]
-    return nnx.merge(post_gd, post_s)(x_seq, mod_ids)
+    if mesh is not None and cp_size > 1:
+      sharded = jax.shard_map(
+          lambda st, xl, rl, ml, tl: _run_local(st, xl, rl, ml, tl, _cp=cp_size),
+          mesh=mesh,
+          in_specs=(
+              packed_specs,
+              P(ax, None),
+              P(ax, None),
+              P(ax,),
+              P(ax, None) if has_time else None,
+          ),
+          out_specs=P(ax, None),
+          check_vma=False,
+      )
+      return jax.jit(sharded)
 
-  if mesh is not None and cp_size > 1:
-    sharded = jax.shard_map(
-        lambda st, xl, rl, ml, tl: _run_local(st, xl, rl, ml, tl, _cp=cp_size),
-        mesh=mesh,
-        in_specs=(
-            packed_specs,
-            P(ax, None),
-            P(ax, None),
-            P(ax,),
-            P(ax, None) if has_time else None,
-        ),
-        out_specs=P(ax, None),
-        check_vma=False,
-    )
-    return jax.jit(sharded), packed_state
+    @jax.jit
+    def _single_scanned(st, x_l, rope_l, mod_l, time_l):
+      return _run_local(st, x_l, rope_l, mod_l, time_l, _cp=1)
 
-  @jax.jit
-  def _single_scanned(st, x_l, rope_l, mod_l, time_l):
-    return _run_local(st, x_l, rope_l, mod_l, time_l, _cp=1)
+    return _single_scanned
 
-  return _single_scanned, packed_state
+  primary_fn = _compile_for_lens(seg_lens)
+  primary_fn.bind_sample_lens = _compile_for_lens
+  return primary_fn, packed_state
 
 
 # ---------------------------------------------------------------------------

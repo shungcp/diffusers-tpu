@@ -333,6 +333,47 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
       help="Disable TPU Pallas Splash attention in Stage 1 Preview (use exact fp32 fallback).",
   )
   ap.add_argument(
+      "--lossy",
+      action="store_true",
+      help=(
+          "Enable controllable Stage 1 ~2x speedup preset (audio+video aware TeaCache "
+          "step-cache-thresh=0.30 + late-step half-seq cfg-skip-after=0.65). Lossless by default."
+      ),
+  )
+  ap.add_argument(
+      "--step-cache-thresh",
+      type=float,
+      default=None,
+      help="Audio+video TeaCache accumulated relative-L1 velocity change threshold (0 disables; --lossy uses 0.30).",
+  )
+  ap.add_argument(
+      "--step-cache-max-skip",
+      type=int,
+      default=2,
+      help="Max consecutive cached Stage 1 steps before forcing a fresh DiT evaluation (default: 2).",
+  )
+  ap.add_argument(
+      "--step-cache-warmup",
+      type=float,
+      default=0.15,
+      help="Fraction of initial Stage 1 steps always evaluated cleanly (default: 0.15; --lossy uses 0.12).",
+  )
+  ap.add_argument(
+      "--step-cache-tail",
+      type=float,
+      default=0.10,
+      help="Fraction of final Stage 1 steps always evaluated cleanly (default: 0.10; --lossy uses 0.08).",
+  )
+  ap.add_argument(
+      "--cfg-skip-after",
+      type=float,
+      default=None,
+      help=(
+          "Fraction of Stage 1 steps after which to run half-sequence cond-only DiT with "
+          "smoothly decayed cached CFG delta (1.0 disables; --lossy uses 0.65)."
+      ),
+  )
+  ap.add_argument(
       "--warmup",
       action="store_true",
       help="Run a 1-step Stage 1 warmup before timed denoising to separate compile from steady state.",
@@ -952,13 +993,166 @@ def _make_preview_step_fn(
     )[None, ...]
     uncond_a = out_all[s_cond + n_vid : s_cond + n_vid + n_aud, :a_ch][None, ...]
 
-    v_cfg_video = uncond_v + video_cfg * (cond_v - uncond_v)
-    v_cfg_audio = uncond_a + audio_cfg * (cond_a - uncond_a)
+    delta_v = cond_v - uncond_v
+    delta_a = cond_a - uncond_a
+    v_cfg_video = uncond_v + video_cfg * delta_v
+    v_cfg_audio = uncond_a + audio_cfg * delta_a
     if rep_sharding is not None:
       v_cfg_video = lax.with_sharding_constraint(v_cfg_video, rep_sharding)
       v_cfg_audio = lax.with_sharding_constraint(v_cfg_audio, rep_sharding)
     return v_cfg_video, v_cfg_audio
 
+  @jax.jit
+  def _step_with_delta_fn(
+      st,
+      latent_ncthw,
+      audio_btc,
+      raw_t_scalar,
+      video_cfg,
+      audio_cfg,
+      txt_cond_emb,
+      ref_cond_emb,
+      txt_uncond_emb,
+      ref_uncond_emb,
+      pad_emb,
+      rope_all,
+      mod_all,
+      time_kind_all,
+  ):
+    pre_s, core_s = st
+    pre_mod = nnx.merge(pre_gd, pre_s)
+    v_flat = jnp.transpose(latent_ncthw[0], (1, 2, 3, 0)).reshape(n_vid, v_ch)
+    if seq_sharding is not None and (n_vid % cp_size == 0):
+      v_flat = lax.with_sharding_constraint(v_flat, seq_sharding)
+    v_emb = pre_mod.embed_video(v_flat).astype(model_dtype)
+    a_emb = pre_mod.embed_audio(audio_btc[0]).astype(model_dtype)
+
+    parts = [v_emb, a_emb, txt_cond_emb]
+    if ref_cond_emb.shape[0] > 0:
+      parts.append(ref_cond_emb)
+    parts.extend([v_emb, a_emb, txt_uncond_emb])
+    if ref_uncond_emb.shape[0] > 0:
+      parts.append(ref_uncond_emb)
+    if pad_emb.shape[0] > 0:
+      parts.append(pad_emb)
+    x_emb = jnp.concatenate(parts, axis=0)
+    if seq_sharding is not None:
+      x_emb = lax.with_sharding_constraint(x_emb, seq_sharding)
+
+    if time_dim > 0:
+      emb_noisy = sinusoidal_embedding_1d(raw_t_scalar, dim=time_dim)
+      emb_clean = sinusoidal_embedding_1d(jnp.float32(0.0), dim=time_dim)
+      emb_zero = jnp.zeros((time_dim,), dtype=jnp.float32)
+      time_all = jnp.where(
+          (time_kind_all == 2)[:, None],
+          emb_noisy[None, :],
+          jnp.where(
+              (time_kind_all == 1)[:, None],
+              emb_clean[None, :],
+              emb_zero[None, :],
+          ),
+      )
+      if seq_sharding is not None:
+        time_all = lax.with_sharding_constraint(time_all, seq_sharding)
+    else:
+      time_all = None
+
+    out_all = core_fn(core_s, x_emb, rope_all, mod_all, time_all)
+    cond_v = jnp.transpose(
+        out_all[0:n_vid, :v_ch].reshape(t_v, h_v, w_v, v_ch), (3, 0, 1, 2)
+    )[None, ...]
+    cond_a = out_all[n_vid : n_vid + n_aud, :a_ch][None, ...]
+    uncond_v = jnp.transpose(
+        out_all[s_cond : s_cond + n_vid, :v_ch].reshape(t_v, h_v, w_v, v_ch),
+        (3, 0, 1, 2),
+    )[None, ...]
+    uncond_a = out_all[s_cond + n_vid : s_cond + n_vid + n_aud, :a_ch][None, ...]
+
+    delta_v = cond_v - uncond_v
+    delta_a = cond_a - uncond_a
+    v_cfg_video = uncond_v + video_cfg * delta_v
+    v_cfg_audio = uncond_a + audio_cfg * delta_a
+    if rep_sharding is not None:
+      v_cfg_video = lax.with_sharding_constraint(v_cfg_video, rep_sharding)
+      v_cfg_audio = lax.with_sharding_constraint(v_cfg_audio, rep_sharding)
+      delta_v = lax.with_sharding_constraint(delta_v, rep_sharding)
+      delta_a = lax.with_sharding_constraint(delta_a, rep_sharding)
+    return v_cfg_video, v_cfg_audio, delta_v, delta_a
+
+  cond_step_fn = None
+  if hasattr(core_fn, "bind_sample_lens"):
+    core_cond_fn = core_fn.bind_sample_lens((s_cond,))
+
+    @jax.jit
+    def _cond_step_fn(
+        st,
+        latent_ncthw,
+        audio_btc,
+        raw_t_scalar,
+        video_cfg,
+        audio_cfg,
+        delta_decay,
+        cached_delta_v,
+        cached_delta_a,
+        txt_cond_emb,
+        ref_cond_emb,
+        pad_cond_emb,
+        rope_cond,
+        mod_cond,
+        time_kind_cond,
+    ):
+      pre_s, core_s = st
+      pre_mod = nnx.merge(pre_gd, pre_s)
+      v_flat = jnp.transpose(latent_ncthw[0], (1, 2, 3, 0)).reshape(n_vid, v_ch)
+      if seq_sharding is not None and (n_vid % cp_size == 0):
+        v_flat = lax.with_sharding_constraint(v_flat, seq_sharding)
+      v_emb = pre_mod.embed_video(v_flat).astype(model_dtype)
+      a_emb = pre_mod.embed_audio(audio_btc[0]).astype(model_dtype)
+
+      parts = [v_emb, a_emb, txt_cond_emb]
+      if ref_cond_emb.shape[0] > 0:
+        parts.append(ref_cond_emb)
+      if pad_cond_emb.shape[0] > 0:
+        parts.append(pad_cond_emb)
+      x_emb = jnp.concatenate(parts, axis=0)
+      if seq_sharding is not None:
+        x_emb = lax.with_sharding_constraint(x_emb, seq_sharding)
+
+      if time_dim > 0:
+        emb_noisy = sinusoidal_embedding_1d(raw_t_scalar, dim=time_dim)
+        emb_clean = sinusoidal_embedding_1d(jnp.float32(0.0), dim=time_dim)
+        emb_zero = jnp.zeros((time_dim,), dtype=jnp.float32)
+        time_all = jnp.where(
+            (time_kind_cond == 2)[:, None],
+            emb_noisy[None, :],
+            jnp.where(
+                (time_kind_cond == 1)[:, None],
+                emb_clean[None, :],
+                emb_zero[None, :],
+            ),
+        )
+        if seq_sharding is not None:
+          time_all = lax.with_sharding_constraint(time_all, seq_sharding)
+      else:
+        time_all = None
+
+      out_c = core_cond_fn(core_s, x_emb, rope_cond, mod_cond, time_all)
+      cond_v = jnp.transpose(
+          out_c[0:n_vid, :v_ch].reshape(t_v, h_v, w_v, v_ch), (3, 0, 1, 2)
+      )[None, ...]
+      cond_a = out_c[n_vid : n_vid + n_aud, :a_ch][None, ...]
+      v_cfg_video = cond_v + (video_cfg - jnp.float32(1.0)) * delta_decay * cached_delta_v
+      v_cfg_audio = cond_a + (audio_cfg - jnp.float32(1.0)) * delta_decay * cached_delta_a
+      if rep_sharding is not None:
+        v_cfg_video = lax.with_sharding_constraint(v_cfg_video, rep_sharding)
+        v_cfg_audio = lax.with_sharding_constraint(v_cfg_audio, rep_sharding)
+      return v_cfg_video, v_cfg_audio
+
+    cond_step_fn = _cond_step_fn
+
+  _step_fn.step_with_delta_fn = _step_with_delta_fn
+  _step_fn.cond_step_fn = cond_step_fn
+  _step_fn.core_fn = core_fn
   return _step_fn, state
 
 
@@ -1667,29 +1861,110 @@ def main(argv: Sequence[str] | None = None) -> None:
       video_cfg_j = jax.device_put(jnp.float32(args.video_cfg), rep_sharding)
       audio_cfg_j = jax.device_put(jnp.float32(args.audio_cfg), rep_sharding)
 
+      # Phase 3b: Optional controllable Stage 1 acceleration (--lossy preset or manual knobs).
+      cache_thresh = (
+          float(args.step_cache_thresh)
+          if args.step_cache_thresh is not None
+          else (0.30 if args.lossy else 0.0)
+      )
+      cfg_skip_after = (
+          float(args.cfg_skip_after)
+          if args.cfg_skip_after is not None
+          else (0.65 if args.lossy else 1.0)
+      )
+      cache_warmup_frac = 0.12 if (args.lossy and args.step_cache_warmup == 0.15) else float(args.step_cache_warmup)
+      cache_tail_frac = 0.08 if (args.lossy and args.step_cache_tail == 0.10) else float(args.step_cache_tail)
+      use_step_cache = cache_thresh > 0.0
+      use_cfg_skip = (
+          cfg_skip_after < 1.0
+          and getattr(preview_step_fn, "cond_step_fn", None) is not None
+          and getattr(preview_step_fn, "step_with_delta_fn", None) is not None
+      )
+      cond_aux_arrays: list[Any] = []
+      if use_cfg_skip:
+        s_cond_len = int(plan["sample_lens"][0])
+        pad_cond_len = (-s_cond_len) % num_chips
+        pad_cond_emb = jax.device_put(
+            jnp.zeros((pad_cond_len, preview_cfg.stream_hidden_size), dtype=dtype),
+            rep_sharding,
+        )
+        rope_c_np = plan["rope_all"][:s_cond_len]
+        mod_c_np = plan["mod_all"][:s_cond_len]
+        tk_c_np = plan["time_kind_all"][:s_cond_len]
+        if pad_cond_len > 0:
+          rope_c_np = np.concatenate(
+              [rope_c_np, np.zeros((pad_cond_len, rope_c_np.shape[1]), dtype=np.float32)], axis=0
+          )
+          mod_c_np = np.concatenate([mod_c_np, np.full((pad_cond_len,), 2, dtype=np.int32)], axis=0)
+          tk_c_np = np.concatenate([tk_c_np, np.zeros((pad_cond_len,), dtype=np.int32)], axis=0)
+        rope_cond_only = jax.device_put(jnp.asarray(rope_c_np, dtype=jnp.float32), seq2d_sharding)
+        mod_cond_only = jax.device_put(jnp.asarray(mod_c_np, dtype=jnp.int32), seq1d_sharding)
+        time_kind_cond_only = jax.device_put(jnp.asarray(tk_c_np, dtype=jnp.int32), seq1d_sharding)
+        cond_aux_arrays.extend([pad_cond_emb, rope_cond_only, mod_cond_only, time_kind_cond_only])
+
+      if use_step_cache:
+        @jax.jit
+        def _vel_rel_change(v_cur, v_prev, a_cur, a_prev):
+          rv = jnp.sum(jnp.abs(v_cur - v_prev)) / jnp.maximum(
+              jnp.sum(jnp.abs(v_cur)), jnp.float32(1e-6)
+          )
+          ra = jnp.sum(jnp.abs(a_cur - a_prev)) / jnp.maximum(
+              jnp.sum(jnp.abs(a_cur)), jnp.float32(1e-6)
+          )
+          return rv, ra
+
+      if use_step_cache or use_cfg_skip:
+        print(
+            f"[magi2] Stage 1 accel enabled: step_cache_thresh={cache_thresh:.3f} "
+            f"(max_skip={args.step_cache_max_skip}, warmup={args.step_cache_warmup:.2f}, "
+            f"tail={args.step_cache_tail:.2f}), cfg_skip_after={cfg_skip_after:.2f}",
+            flush=True,
+        )
+
       # Optional explicit 1-step warmup to separate cold XLA compilation from steady-state loop.
       if args.warmup:
         t_warm = time.perf_counter()
         w_v = jax.device_put(jnp.asarray(init_video_np, dtype=jnp.float32), rep_sharding)
         w_a = jax.device_put(jnp.asarray(init_audio_np, dtype=jnp.float32), rep_sharding)
         w_t = jax.device_put(jnp.float32(0.999), rep_sharding)
-        w_ov, w_oa = preview_step_fn(
-            preview_state,
-            w_v,
-            w_a,
-            w_t,
-            video_cfg_j,
-            audio_cfg_j,
-            txt_cond_emb,
-            ref_cond_emb,
-            txt_uncond_emb,
-            ref_uncond_emb,
-            pad_emb,
-            rope_all,
-            mod_all,
-            time_kind_all,
-        )
-        jax.block_until_ready((w_ov, w_oa))
+        if use_cfg_skip:
+          w_ov, w_oa, w_dv, w_da = preview_step_fn.step_with_delta_fn(
+              preview_state,
+              w_v,
+              w_a,
+              w_t,
+              video_cfg_j,
+              audio_cfg_j,
+              txt_cond_emb,
+              ref_cond_emb,
+              txt_uncond_emb,
+              ref_uncond_emb,
+              pad_emb,
+              rope_all,
+              mod_all,
+              time_kind_all,
+          )
+          jax.block_until_ready((w_ov, w_oa, w_dv, w_da))
+          _free_device_arrays(w_dv, w_da)
+          del w_dv, w_da
+        else:
+          w_ov, w_oa = preview_step_fn(
+              preview_state,
+              w_v,
+              w_a,
+              w_t,
+              video_cfg_j,
+              audio_cfg_j,
+              txt_cond_emb,
+              ref_cond_emb,
+              txt_uncond_emb,
+              ref_uncond_emb,
+              pad_emb,
+              rope_all,
+              mod_all,
+              time_kind_all,
+          )
+          jax.block_until_ready((w_ov, w_oa))
         timings["stage1_compile_s"] = time.perf_counter() - t_warm
         print(f"  [stage1] warmup/compile done in {timings['stage1_compile_s']:.2f}s", flush=True)
         _free_device_arrays(w_v, w_a, w_t, w_ov, w_oa)
@@ -1718,6 +1993,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         t_after_step0 = t_run_start
         per_step_ms: list[float] = []
 
+        n_steps_tot = len(video_scheduler.timesteps)
+        cache_start = int(round(n_steps_tot * max(0.0, min(1.0, cache_warmup_frac))))
+        cache_end = n_steps_tot - int(round(n_steps_tot * max(0.0, min(1.0, cache_tail_frac))))
+        cfg_skip_step = int(round(n_steps_tot * max(0.0, min(1.0, cfg_skip_after))))
+        max_consec_skip = max(1, int(args.step_cache_max_skip))
+
+        prev_v_cfg = None
+        prev_a_cfg = None
+        cached_delta_v = None
+        cached_delta_a = None
+        last_rel_rate = 1.0
+        accum_rel_err = 0.0
+        consec_skips = 0
+        n_full_cfg = 0
+        n_cond_only = 0
+        n_cached = 0
+
         for step_idx, t_int in enumerate(video_scheduler.timesteps):
           # Exact upstream sampler.py:L162: t_int is int64(sigma * 1000), raw_t = t_int / 1000.0
           raw_t_val = float(np.int64(t_int)) / 1000.0
@@ -1730,22 +2022,117 @@ def main(argv: Sequence[str] | None = None) -> None:
             jax.profiler.start_trace(prof_dir)
 
           t_s = time.perf_counter()
-          v_cfg_video, v_cfg_audio = preview_step_fn(
-              preview_state,
-              latent_v,
-              latent_a,
-              raw_t_j,
-              video_cfg_j,
-              audio_cfg_j,
-              txt_cond_emb,
-              ref_cond_emb,
-              txt_uncond_emb,
-              ref_uncond_emb,
-              pad_emb,
-              rope_all,
-              mod_all,
-              time_kind_all,
+          can_cache = (
+              use_step_cache
+              and prev_v_cfg is not None
+              and step_idx >= cache_start
+              and step_idx < cache_end
+              and consec_skips < max_consec_skip
+              and (accum_rel_err + last_rel_rate) < cache_thresh
           )
+          if can_cache:
+            v_cfg_video, v_cfg_audio = prev_v_cfg, prev_a_cfg
+            accum_rel_err += last_rel_rate
+            consec_skips += 1
+            n_cached += 1
+          elif use_cfg_skip and step_idx >= cfg_skip_step and cached_delta_v is not None:
+            frac_late = (step_idx - cfg_skip_step) / max(1, n_steps_tot - cfg_skip_step)
+            decay_val = max(0.30, 1.0 - 0.70 * frac_late)
+            decay_j = jax.device_put(jnp.float32(decay_val), rep_sharding)
+            v_cfg_video, v_cfg_audio = preview_step_fn.cond_step_fn(
+                preview_state,
+                latent_v,
+                latent_a,
+                raw_t_j,
+                video_cfg_j,
+                audio_cfg_j,
+                decay_j,
+                cached_delta_v,
+                cached_delta_a,
+                txt_cond_emb,
+                ref_cond_emb,
+                pad_cond_emb,
+                rope_cond_only,
+                mod_cond_only,
+                time_kind_cond_only,
+            )
+            n_cond_only += 1
+            if use_step_cache and prev_v_cfg is not None:
+              rv_j, ra_j = _vel_rel_change(v_cfg_video, prev_v_cfg, v_cfg_audio, prev_a_cfg)
+              rv_f, ra_f = float(rv_j), float(ra_j)
+              last_rel_rate = max(rv_f, 0.7 * ra_f) / float(consec_skips + 1)
+              if (step_idx + 1) % 15 == 0:
+                print(
+                    f"  [cache] step {step_idx+1} cond_only rv={rv_f:.4f} ra={ra_f:.4f} rate={last_rel_rate:.4f} hits={n_cached}",
+                    flush=True,
+                )
+            accum_rel_err = 0.0
+            consec_skips = 0
+            prev_v_cfg, prev_a_cfg = v_cfg_video, v_cfg_audio
+          elif use_cfg_skip:
+            v_cfg_video, v_cfg_audio, cached_delta_v, cached_delta_a = (
+                preview_step_fn.step_with_delta_fn(
+                    preview_state,
+                    latent_v,
+                    latent_a,
+                    raw_t_j,
+                    video_cfg_j,
+                    audio_cfg_j,
+                    txt_cond_emb,
+                    ref_cond_emb,
+                    txt_uncond_emb,
+                    ref_uncond_emb,
+                    pad_emb,
+                    rope_all,
+                    mod_all,
+                    time_kind_all,
+                )
+            )
+            n_full_cfg += 1
+            if use_step_cache and prev_v_cfg is not None:
+              rv_j, ra_j = _vel_rel_change(v_cfg_video, prev_v_cfg, v_cfg_audio, prev_a_cfg)
+              rv_f, ra_f = float(rv_j), float(ra_j)
+              last_rel_rate = max(rv_f, 0.7 * ra_f) / float(consec_skips + 1)
+              if (step_idx + 1) % 15 == 0:
+                print(
+                    f"  [cache] step {step_idx+1} full_cfg rv={rv_f:.4f} ra={ra_f:.4f} rate={last_rel_rate:.4f} hits={n_cached}",
+                    flush=True,
+                )
+            accum_rel_err = 0.0
+            consec_skips = 0
+            prev_v_cfg, prev_a_cfg = v_cfg_video, v_cfg_audio
+          else:
+            v_cfg_video, v_cfg_audio = preview_step_fn(
+                preview_state,
+                latent_v,
+                latent_a,
+                raw_t_j,
+                video_cfg_j,
+                audio_cfg_j,
+                txt_cond_emb,
+                ref_cond_emb,
+                txt_uncond_emb,
+                ref_uncond_emb,
+                pad_emb,
+                rope_all,
+                mod_all,
+                time_kind_all,
+            )
+            n_full_cfg += 1
+            if use_step_cache:
+              if prev_v_cfg is not None:
+                rv_j, ra_j = _vel_rel_change(v_cfg_video, prev_v_cfg, v_cfg_audio, prev_a_cfg)
+                rv_f, ra_f = float(rv_j), float(ra_j)
+                last_rel_rate = max(rv_f, 0.7 * ra_f) / float(consec_skips + 1)
+                if (step_idx + 1) % 15 == 0:
+                  print(
+                      f"  [cache] step {step_idx+1} full_cfg rv={rv_f:.4f} ra={ra_f:.4f} rate={last_rel_rate:.4f} hits={n_cached}",
+                      flush=True,
+                  )
+              accum_rel_err = 0.0
+              consec_skips = 0
+              prev_v_cfg, prev_a_cfg = v_cfg_video, v_cfg_audio
+
           latent_v = video_scheduler.step(v_cfg_video, t_int, latent_v, return_dict=False)[0]
           latent_a = audio_scheduler.step(v_cfg_audio, t_int, latent_a, return_dict=False)[0]
 
@@ -1794,17 +2181,22 @@ def main(argv: Sequence[str] | None = None) -> None:
           steady_step_ms_last = (run_wall / max(1, n_steps)) * 1000.0
         else:
           steady_step_ms_last = ((t_run_end - t_after_step0) / (n_steps - 1)) * 1000.0
+        accel_msg = (
+            f" [full_cfg={n_full_cfg}, cond_only={n_cond_only}, cached={n_cached}]"
+            if (use_step_cache or use_cfg_skip)
+            else ""
+        )
         print(
             f"[magi2] Stage 1 run {run_idx+1}/{num_runs}: {run_wall:.2f}s "
-            f"({steady_step_ms_last:.1f} ms/step steady)",
+            f"({steady_step_ms_last:.1f} ms/step effective){accel_msg}",
             flush=True,
         )
 
         if run_idx == num_runs - 1:
           stage1_video_np = np.asarray(latent_v, dtype=np.float32)
           stage1_audio_np = np.asarray(latent_a, dtype=np.float32)
-        _free_device_arrays(latent_v, latent_a)
-        del latent_v, latent_a
+        _free_device_arrays(latent_v, latent_a, prev_v_cfg, prev_a_cfg, cached_delta_v, cached_delta_a)
+        del latent_v, latent_a, prev_v_cfg, prev_a_cfg, cached_delta_v, cached_delta_a
 
     assert stage1_video_np is not None and stage1_audio_np is not None
     timings["stage1_denoise_s"] = run_times[-1]
@@ -1829,6 +2221,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         preview_state,
         txt_cond_emb,
         ref_cond_emb,
+        *cond_aux_arrays,
         txt_uncond_emb,
         ref_uncond_emb,
         pad_emb,
