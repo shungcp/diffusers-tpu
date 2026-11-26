@@ -148,3 +148,48 @@ Measured on `v7x-8` (`torch_tpu 0.2.0`, `libtpu 0.0.52`, fresh OS processes with
 - **Storage & compression notes (`dedup_stats.py`)**:
   - Sharing one `rank 0` archive across all 8 ranks (`3dcddf3`) cuts `DT_AOT_PERSIST` disk usage by **8×** immediately (`H3 t2va` `829.3 MiB -> 105.5 MiB`; `H3-Image 2K+4K` `2,645.7 MiB -> 330.7 MiB`).
   - Because `save_compiled_function` embeds uncompressed PJRT executable bytes inside a Python pickle, plain `zstd -3` (4 MiB window) only achieves `~4.4×`, whereas **`zstd -3 --long=27`** (128 MiB window) compresses single rank-0 files by **`16×–25×`** (`330.7 MiB -> 13.4 MiB` on `H3-Image 2K+4K`) and **FastCDC `1 KiB` + `zstd --long=27`** compresses cross-shape archives down to **`9.76 MiB`** (`33.9×` on rank-0; `164.9×–329.5×` if per-rank copies were stored).
+
+---
+
+## 8. `MAGI-2-preview` (113.93B Multi-Head Latent MoE + 1080p Refiner) on TPU `v7x-8` / `MAGI-2-preview` 端到端优化台账
+
+Full end-to-end 4-phase optimization of Sand.ai **MAGI-2-preview** (113.93B / 5.95B active Stage 1 Multi-Head Latent MoE DiT with 4-stream mHC + Attention Sink, 6.72B 30-layer Stage 2 1080p Refiner, Qwen3.5-27B text encoder, Wan2.2-TI2V-5B I2V encoder, TurboVAED video decoder, and AutoencoderOobleck stereo audio VAE) across **Native JAX**, **torchax**, and **torch_tpu** on TPU `v7x-8` (`jax 0.12.0.1`, `torch_tpu`, `libtpu 0.0.52`, `94.74 GiB` HBM per logical device).
+
+### 8.1 Stage-by-Stage Optimization Ledger (Phases 1–4)
+
+| Phase / Commit | Stage & Target | Baseline (`v7x-8`) | Optimized (`v7x-8`) | Speedup | Parity / QA Verification |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| **Phase 1** (`dc341a0`) | Stage 0a `Wan2_2_VAEEncoder` (`@jax.jit`) | `70.41 s` cold / `12.58 s` warm eager | **`13.67 s`** cold / **`0.29 s`** cache hit / **`22.7 ms`** warm | **`554×`** warm | `rel_l2 = 1.48e-3` (lossless) |
+| **Phase 1** (`dc341a0`) | Stage 0b `Qwen3.5-27B` `--uncond-cache` (default ON) | `20.80 s` per request | **`1.62 ms`** disk cache hit | **`12,840×`** | `max\|d\| = 0.0` (bit-exact) |
+| **Phase 1** (`dc341a0`) | Stage 3a `TurboVAED` 8-chip `decode_sharded` (`540p`, 125f) | `1.29 s` warm (1-chip) | **`0.72 s`** warm (8-chip chunk-parallel) | **`1.80×`** | **`identical=True`, `max\|d\|=0`, `PSNR=∞`** |
+| **Phase 1** (`dc341a0`) | Stage 3a `TurboVAED` 8-chip `decode_sharded` (`1080p`, 249f) | `11.97 s` warm (1-chip) | **`3.88 s`** warm (8-chip chunk-parallel) | **`3.09×`** | **`identical=True`, `max\|d\|=0`, `PSNR=∞`** |
+| **Phase 2** (`e900499`) | Stage 2 `1080p` Refiner (`CP=8`, GQA+W-coal+tail Pallas BF16) | `87.35 s/step` (`437 s` / 5 steps) | **`10.69 s/step`** (`53.97 s` / 5 steps) | **`8.17×`** | 1-step `cos = 0.999998` |
+| **Phase 2** (`e900499`) | Stage 2 `1080p` Refiner (**default `DP=2 × CP=4` CFG-parallel BF16**) | `87.35 s/step` (`437 s` / 5 steps) | **`10.56 s/step`** (`53.38 s` / 5 steps) | **`8.27×`** | 1-step `cos = 0.999999`; 5-step vs CP=8 `cos = 0.999985` |
+| **Phase 2** (`e900499`) | Stage 2 `1080p` Refiner (opt-in `--refiner-qk-fp8`) | `87.35 s/step` | **`10.15 s/step`** (`50.75 s` / 5 steps warm) | **`8.61×`** | 5-step vs BF16 `cos = 0.998875` |
+| **Phase 3** (`53b5c95`) | Stage 1 `540p` 100-step I2V `--lossy` (Audio+Video TeaCache `0.30` + late-step half-seq `cond-only` CFG skip `after=0.65`) | `318–338 s` lossless (`3.18–3.38 s/step`) | **`129.76 s`** (`1.266 s/step` eff.; `29` full + `17` cond-only @ `1.97 s` + `54` cached); warm E2E **`181.23 s`** | **`2.51×–2.61×`** | Case 2 Barista QA vs lossless: Video **`PSNR = 22.62 dB`** (`mean\|d\|=7.60/255`), Dialogue Audio **`-23.1 vs -23.5 dBFS`**, 50 ms speech envelope **corr `0.9793`** |
+| **Phase 4** (`ffc4f17`) | Native JAX Resident Server (`jax_server.py`, `--requests` JSONL) | Cold reload per request (`33–320 s` startup + re-JIT) | **All 4 models BF16 resident in `41.80 GiB / 94.74 GiB` HBM/chip** (`33.65 s` warm startup once); req #2 zero-reload via `bind_sample_lens` (`s3v=0.19 s`, `s3a=0.04 s`) | **`316×` s3v / `363×` s3a** warm; **0 s** reload | Verified 2 distinct prompt lengths (`cafe` + `fox`) with zero extra HBM weight copies |
+| **Phase 4** (`ffc4f17`) | `torch_tpu` E2E (`run_magi2_torchtpu.sh --prompt --enhance --decode-mp4`) + shared rank-0 `DT_AOT_PERSIST` (`272p FP8`) | `32.57 s` cold compile / `9.18 s` warm Inductor+XLA; manual 3-step CLI | **`1.45 s`** compile via `DT_AOT_PERSIST` (`178 MiB` rank-0 bins: `mm 35M`, `moe 141M`, `post 2.7M`); **`0.717 s/step`** denoise + full MP4 mux | **`22.5×`** vs cold / **`6.3×`** vs warm Inductor+XLA | Identical cross-process latent stats (`video std=1.9196`, `audio std=0.6711`) |
+
+### 8.2 Three-Backend Stage 1 + Stage 2 Performance Summary (`v7x-8`, 10 s Audio+Video, CFG=2)
+
+| Configuration (`v7x-8`) | Native JAX | `torchax` | `torch_tpu` (`8-rank`, `spmd_safe`) |
+| :--- | :---: | :---: | :---: |
+| Stage 1 `272p BF16` (`S=29,664`) | `0.960 s/step` | `0.960 s/step` | **`0.923 s/step`** |
+| Stage 1 `272p FP8-W8A8` | — | `0.963 s/step` | **`0.717–0.829 s/step`** (`1.45 s` warm `DT_AOT_PERSIST` compile) |
+| Stage 1 `540p BF16` (`S=115,680`, lossless) | `3.415 s/step` (`67.7 GiB` peak) | `3.728 s/step` | **`3.331 s/step`** |
+| Stage 1 `540p FP8-W8A8` (lossless) | `3.430 s/step` (`42.7 GiB` HBM, `PSNR 20.83 dB`) | `3.745 s/step` | **`3.248 s/step`** |
+| Stage 1 `540p BF16 --lossy` (100 steps I2V E2E) | **`1.266 s/step` eff. (`129.76 s` denoise / `181.23 s` warm E2E)** | — | — |
+| Stage 2 `1080p` Refiner (`1088×1920 @ 25 fps`, 5 steps, default BF16 `DP=2×CP=4`) | **`10.56 s/step` (`53.38 s` / 5 steps, `8.27×` lossless)** | — | — |
+| Stage 2 `1080p` Refiner (`--refiner-qk-fp8`, 5 steps) | **`10.15 s/step` (`50.75 s` warm, `8.61×`)** | — | — |
+
+### 8.3 Key Engineering Decisions & Data-Driven Drops / 关键工程决策与实测否决项
+
+- **Stage 2 Refiner Kernel (`jax_refiner_dit.py`)**: Micro-profiling proved legacy `_masked_pallas_block_grid_attention` accounted for **88.5%** (`41.48 s/pass`) of total Refiner time while Dense MatMuls took only `0.51 s/pass` and CP=8 all-to-all took `0.53 s/pass`. Fusing all 4 GQA query heads per KV head (`bq=512`), coalescing 5 contiguous W-blocks per DMA (`bkv=640` via `pl.Element`), keeping tail KV resident in VMEM, adding a dedicated `bkv=1024` tail-Q kernel (`32×` fewer grid steps), and running CFG branches in parallel (`DP=2 × CP=4`) delivered **`8.27×` lossless** speedup (`87.35 -> 10.56 s/step`).
+- **Stage 1 Zero-HBM Multi-Length Compilation (`bind_sample_lens`)**: Because MAGI-2 Stage 1 attention has no text pad mask (injecting zero-padded text tokens would corrupt attention), we added `core_fn.bind_sample_lens(sample_lens)` sharing the single resident 113.93B packed parameter state with **zero extra HBM** — powering both Phase 3b half-sequence `cond-only` CFG skip (`1.97 s/step`) and Phase 4 resident multi-request serving (`41.80 GiB` HBM total for all 4 models in BF16).
+- **`torch_tpu` `DT_AOT_PERSIST` Closure Hygiene (`torchtpu_magi2.py`)**: Hoisting `_top_run_mm_layer`, `_top_run_moe_layer`, `_top_run_group`, and `_top_run_post` to module top-level (avoiding closures over `self.hooks` / `torch._C._DispatchModule`) enabled clean single-copy rank-0 `.bin` serialization (`178 MiB` total for all 8 ranks), reducing warm cross-process compile from `32.57 s` cold (`9.18 s` warm Inductor/XLA) down to **`1.45 s`**.
+- **Intentionally Rejected Optimizations (Measured, Not Worth Keeping)**:
+  1. **Refiner Dense MatMul FP8**: Dense MatMuls are only `0.51 s/pass` (`1.1%` of Refiner); FP8 gave `1.03×` total gain -> skipped to preserve lossless BF16.
+  2. **Stage 1 Splash Attention `qk_fp8`**: Measured `0.705 s/step` (`8.81 ms/layer`) vs `0.682 s/step` (`8.52 ms/layer`) in BF16 on MHA (`Hq=Hkv=24`) due to Q/K cast overhead -> dropped; kept lossless BF16 Splash (with redundant `jnp.repeat` removed).
+  3. **Stage 1 Dense/Attn/Shared `GroupedLinear` FP8**: Measured `0.077 s/step` vs `0.096 s/step` BF16 (only `19 ms/step`, `0.6%`) -> kept lossless BF16.
+  4. **Stage 1 `moe_mode=ep` (`ragged_all_to_all`)**: Real-weight 540p 4-step benchmark measured **`4.92 s/step`** vs **`3.45 s/step`** for `moe_mode=ag` (`1.42×` slower on 8-chip ICI due to variable-length routing imbalance + metadata sync) -> kept `ag` as default.
+
