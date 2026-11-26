@@ -56,6 +56,16 @@ Measured, judged not worth the complexity at the time, and left here for anyone 
 
   **gmm_v2 tile_m 改 512。** 照 tokamax 的 gmm_v2:13,008 行时每对专家矩阵乘 0.81 → 0.73 ms,输出逐位相同;但 768p 端到端在噪声内(去噪 104.7 对 104.9 秒),未采用。
 
+## JAX, VideoGym-LTX-2.3
+
+- **Overlap the per-block weight all-gathers with compute (v6e-8: up to ~27% of a step).** With 20 of 48 blocks resident, a 4-row forward is 481 ms: 314 ms compute, 126 ms all-gather with zero overlap, 35 ms idle. XLA keeps every all-gather synchronous (952 plain `all-gather` in the HLO) under every libtpu flag set tried; the all-gather continuation fusion flag is not supported on v6e. Gathering block i+1 inside block i by hand is the next thing to try. On v7x all 48 blocks fit each device, so there is nothing to gather.
+
+  **把每块的权重 all-gather 与计算重叠(v6e-8:最多约占一步的 27%)。** 48 块中常驻 20 块时,4 行前向 481 ms:计算 314 ms,all-gather 126 ms 且与计算零重叠,空闲 35 ms。试过的各组 libtpu flag 下 XLA 都把 all-gather 保持为同步(HLO 中 952 个普通 `all-gather`);all-gather continuation fusion 的 flag 在 v6e 上不支持。下一步可试手动在第 i 块里提前 gather 第 i+1 块。v7x 上 48 块都能整份放进每个 device,没有需要 gather 的。
+
+- **More resident blocks (28: 4-row forward 481 -> 449 ms).** The DiT alone peaks at 23.1 GiB a chip with 28 resident blocks, which does not leave room on a 32 GB v6e chip for Gemma-3 and the 129-frame VAE decode (27.6 GiB peak with 20).
+
+  **更多常驻块(28 块:4 行前向 481 -> 449 ms)。** 常驻 28 块时仅 DiT 每 chip 峰值 23.1 GiB,32 GB 的 v6e chip 上放不下 Gemma-3 和 129 帧 VAE 解码(常驻 20 块时峰值 27.6 GiB)。
+
 ## How these were found / 怎么找到的
 
 Host stalls show up as chip idle time between XLA ops in an xprof trace (`--profile`); `--profile-host` adds the CPU activity to the torch_tpu profiler, which records the host's Python stacks in the same trace, which names the work the chip is waiting for. Removing two per-step host syncs this way gave Pika ref2va 480p 9.2 -> 8.0 s (2026-11-24).
