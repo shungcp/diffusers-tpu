@@ -265,8 +265,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
   ap.add_argument(
       "--refiner-attn-impl",
       default="",
-      choices=("", "auto", "masked_pallas", "sparse_splash", "ref"),
+      choices=(
+          "",
+          "auto",
+          "masked_pallas",
+          "masked_pallas_fp8",
+          "masked_pallas_legacy",
+          "sparse_splash",
+          "ref",
+      ),
       help="Override Stage 2 Refiner attention backend.",
+  )
+  ap.add_argument(
+      "--refiner-cfg-parallel",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help="Run Stage 2 Refiner cond & uncond simultaneously on 2x(N/2) chips (DP=2 x CP=4 on v7x-8, lossless).",
+  )
+  ap.add_argument(
+      "--refiner-qk-fp8",
+      action="store_true",
+      help="Use E4M3 FP8 QK^T inside the Stage 2 Refiner GQA+W-coalesced Pallas kernel.",
   )
 
   # Noise & reproducibility
@@ -1895,6 +1914,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     from .jax_refiner_dit import (
         build_refiner_attention_layout,
         load_refiner,
+        make_jitted_cfg_forward as make_refiner_cfg_jitted_forward,
         make_jitted_forward as make_refiner_jitted_forward,
         pack_refiner_inputs_np,
         unpack_refiner_video_jax,
@@ -1915,19 +1935,47 @@ def main(argv: Sequence[str] | None = None) -> None:
     else:
       z_ref_init_np = z_up_np
 
+    ref_cfg = float(args.refiner_cfg)
+    use_uncond_only = ref_cfg == 0.0
+    use_cond_only = ref_cfg == 1.0
+    ref_attn_impl = args.refiner_attn_impl or (
+        "masked_pallas_fp8" if args.refiner_qk_fp8 else ""
+    )
+    need_flat_tables = ref_attn_impl.lower() == "sparse_splash"
+    use_cfg_parallel = (
+        bool(args.refiner_cfg_parallel)
+        and not use_uncond_only
+        and not use_cond_only
+        and not need_flat_tables
+        and args.refiner_sharding == "replicated"
+        and num_chips >= 2
+        and num_chips % 2 == 0
+        and refiner_cfg.num_heads_q % (num_chips // 2) == 0
+        and refiner_cfg.num_heads_kv % (num_chips // 2) == 0
+    )
+    ref_cp = (num_chips // 2) if use_cfg_parallel else num_chips
+    ref_mesh = (
+        Mesh(np.array(devices).reshape(2, ref_cp), ("cfg", "cp"))
+        if use_cfg_parallel
+        else mesh
+    )
+    ref_cp_axis = "cp" if use_cfg_parallel else "tp"
+
     print(
         f"[magi2] Stage 2: Loading 6.72B Refiner DiT from {refiner_dir} "
-        f"(sharding={args.refiner_sharding}, CP={num_chips}) ...",
+        f"(sharding={args.refiner_sharding}, "
+        f"{f'DP=2xCP={ref_cp} CFG-parallel' if use_cfg_parallel else f'CP={ref_cp}'}, "
+        f"attn={ref_attn_impl or 'auto'}) ...",
         flush=True,
     )
     t_load2 = time.perf_counter()
     refiner_model = load_refiner(
         refiner_dir,
         config=refiner_cfg,
-        mesh=mesh,
+        mesh=ref_mesh,
         dtype=dtype,
         sharding=args.refiner_sharding,
-        axis_name="tp",
+        axis_name=ref_cp_axis,
         verbose=True,
     )
     timings["stage2_load_s"] = time.perf_counter() - t_load2
@@ -1941,7 +1989,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     tail_bucket = (
         math.ceil(max_txt / block_vol) * block_vol if max_txt > 0 else 0
     )
-    need_flat_tables = (args.refiner_attn_impl or "").lower() == "sparse_splash"
 
     layout_cond = build_refiner_attention_layout(
         target_thw,
@@ -1949,7 +1996,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         n_audio=0,
         config=refiner_cfg,
         tail_bucket_len=tail_bucket if tail_bucket > 0 else None,
-        cp_size=num_chips,
+        cp_size=ref_cp,
         build_flat_tables=need_flat_tables,
     )
     layout_uncond = build_refiner_attention_layout(
@@ -1958,7 +2005,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         n_audio=0,
         config=refiner_cfg,
         tail_bucket_len=tail_bucket if tail_bucket > 0 else None,
-        cp_size=num_chips,
+        cp_size=ref_cp,
         build_flat_tables=need_flat_tables,
     )
     print(
@@ -1971,58 +2018,91 @@ def main(argv: Sequence[str] | None = None) -> None:
     _, _, txt_cond_packed_np = pack_refiner_inputs_np(z_ref_init_np, cond_txt_np, layout_cond)
     _, _, txt_uncond_packed_np = pack_refiner_inputs_np(z_ref_init_np, uncond_txt_np, layout_uncond)
 
-    rep_sharding = NamedSharding(mesh, P())
-    seq2d_sharding = NamedSharding(mesh, P("tp", None))
+    ref_rep_sharding = NamedSharding(ref_mesh, P())
+    ref_seq2d_sharding = NamedSharding(ref_mesh, P(ref_cp_axis, None))
     vid_sharding = (
-        seq2d_sharding if (layout_cond.n_vid_pad % num_chips == 0) else rep_sharding
+        ref_seq2d_sharding
+        if (not use_cfg_parallel and layout_cond.n_vid_pad % ref_cp == 0)
+        else ref_rep_sharding
     )
 
-    with _mesh_context(mesh):
-      jitted_refiner, _, refiner_state = make_refiner_jitted_forward(
-          refiner_model,
-          layout_cond,
-          mesh=mesh,
-          cp_axis="tp",
-          parallel_mode="cp",
-          compute_dtype=dtype,
-          attn_impl=args.refiner_attn_impl or None,
-      )
-      # masked_pallas & ref consume dynamic kv_blen, so cond & uncond reuse ONE
-      # compiled XLA graph; sparse_splash bakes static kv_table lists into layout.
-      if need_flat_tables and not np.array_equal(
-          layout_cond.kv_block_valid_lens > 0, layout_uncond.kv_block_valid_lens > 0
-      ):
-        jitted_refiner_uncond, _, _ = make_refiner_jitted_forward(
+    ref_aux_arrays: list[Any] = []
+    with _mesh_context(ref_mesh):
+      if use_cfg_parallel:
+        jitted_refiner_cfg, _, refiner_state = make_refiner_cfg_jitted_forward(
             refiner_model,
-            layout_uncond,
-            mesh=mesh,
-            cp_axis="tp",
+            layout_cond,
+            mesh=ref_mesh,
+            cfg_axis="cfg",
+            cp_axis="cp",
+            compute_dtype=dtype,
+            attn_impl=ref_attn_impl or None,
+        )
+        txt_2_j = jax.device_put(
+            jnp.asarray(np.stack([txt_cond_packed_np, txt_uncond_packed_np], axis=0), dtype=jnp.float32),
+            NamedSharding(ref_mesh, P("cfg", None, None)),
+        )
+        rope_2_j = jax.device_put(
+            jnp.asarray(np.stack([layout_cond.rope_96, layout_uncond.rope_96], axis=0), dtype=jnp.float32),
+            NamedSharding(ref_mesh, P("cfg", "cp", None)),
+        )
+        kv_blen_2_j = jax.device_put(
+            jnp.asarray(
+                np.stack([layout_cond.kv_block_valid_lens, layout_uncond.kv_block_valid_lens], axis=0),
+                dtype=jnp.int32,
+            ),
+            NamedSharding(ref_mesh, P("cfg", None)),
+        )
+        ref_cfg_j = jax.device_put(jnp.float32(ref_cfg), ref_rep_sharding)
+        ref_aux_arrays.extend([txt_2_j, rope_2_j, kv_blen_2_j, ref_cfg_j])
+      else:
+        jitted_refiner, _, refiner_state = make_refiner_jitted_forward(
+            refiner_model,
+            layout_cond,
+            mesh=ref_mesh,
+            cp_axis=ref_cp_axis,
             parallel_mode="cp",
             compute_dtype=dtype,
-            attn_impl=args.refiner_attn_impl or None,
+            attn_impl=ref_attn_impl or None,
         )
-      else:
-        jitted_refiner_uncond = jitted_refiner
+        if need_flat_tables and not np.array_equal(
+            layout_cond.kv_block_valid_lens > 0, layout_uncond.kv_block_valid_lens > 0
+        ):
+          jitted_refiner_uncond, _, _ = make_refiner_jitted_forward(
+              refiner_model,
+              layout_uncond,
+              mesh=ref_mesh,
+              cp_axis=ref_cp_axis,
+              parallel_mode="cp",
+              compute_dtype=dtype,
+              attn_impl=ref_attn_impl or None,
+          )
+        else:
+          jitted_refiner_uncond = jitted_refiner
+        txt_cond_j = jax.device_put(jnp.asarray(txt_cond_packed_np, dtype=jnp.float32), ref_rep_sharding)
+        txt_uncond_j = jax.device_put(
+            jnp.asarray(txt_uncond_packed_np, dtype=jnp.float32), ref_rep_sharding
+        )
+        rope_cond_j = jax.device_put(
+            jnp.asarray(layout_cond.rope_96, dtype=jnp.float32), ref_seq2d_sharding
+        )
+        rope_uncond_j = jax.device_put(
+            jnp.asarray(layout_uncond.rope_96, dtype=jnp.float32), ref_seq2d_sharding
+        )
+        kv_blen_cond_j = jax.device_put(
+            jnp.asarray(layout_cond.kv_block_valid_lens, dtype=jnp.int32), ref_rep_sharding
+        )
+        kv_blen_uncond_j = jax.device_put(
+            jnp.asarray(layout_uncond.kv_block_valid_lens, dtype=jnp.int32), ref_rep_sharding
+        )
+        ref_aux_arrays.extend([
+            txt_cond_j, txt_uncond_j, rope_cond_j, rope_uncond_j, kv_blen_cond_j, kv_blen_uncond_j
+        ])
 
       vid_src_idx_j = jax.device_put(
-          jnp.asarray(layout_cond.vid_src_idx, dtype=jnp.int32), rep_sharding
+          jnp.asarray(layout_cond.vid_src_idx, dtype=jnp.int32), ref_rep_sharding
       )
-      txt_cond_j = jax.device_put(jnp.asarray(txt_cond_packed_np, dtype=jnp.float32), rep_sharding)
-      txt_uncond_j = jax.device_put(
-          jnp.asarray(txt_uncond_packed_np, dtype=jnp.float32), rep_sharding
-      )
-      rope_cond_j = jax.device_put(
-          jnp.asarray(layout_cond.rope_96, dtype=jnp.float32), seq2d_sharding
-      )
-      rope_uncond_j = jax.device_put(
-          jnp.asarray(layout_uncond.rope_96, dtype=jnp.float32), seq2d_sharding
-      )
-      kv_blen_cond_j = jax.device_put(
-          jnp.asarray(layout_cond.kv_block_valid_lens, dtype=jnp.int32), rep_sharding
-      )
-      kv_blen_uncond_j = jax.device_put(
-          jnp.asarray(layout_uncond.kv_block_valid_lens, dtype=jnp.int32), rep_sharding
-      )
+      ref_aux_arrays.append(vid_src_idx_j)
 
       @jax.jit
       def _pack_refiner_video(z_ncthw, src_idx):
@@ -2035,22 +2115,23 @@ def main(argv: Sequence[str] | None = None) -> None:
       @jax.jit
       def _unpack_refiner_video(v_pad):
         out = unpack_refiner_video_jax(v_pad, layout_cond)[None, ...]
-        return jax.lax.with_sharding_constraint(out, rep_sharding)
+        return jax.lax.with_sharding_constraint(out, ref_rep_sharding)
 
       refiner_scheduler = FlowUniPCMultistepScheduler()
       refiner_scheduler.set_timesteps(args.refiner_steps, shift=args.refiner_shift)
 
-      latent_ref = jax.device_put(jnp.asarray(z_ref_init_np, dtype=jnp.float32), rep_sharding)
-      ref_cfg = float(args.refiner_cfg)
-      use_uncond_only = ref_cfg == 0.0
-      use_cond_only = ref_cfg == 1.0
+      latent_ref = jax.device_put(jnp.asarray(z_ref_init_np, dtype=jnp.float32), ref_rep_sharding)
 
       t_ref_start = time.perf_counter()
       t_ref_after_s0 = t_ref_start
       for step_idx, t_int in enumerate(refiner_scheduler.timesteps):
         t_s = time.perf_counter()
         v_packed = _pack_refiner_video(latent_ref, vid_src_idx_j)
-        if use_uncond_only:
+        if use_cfg_parallel:
+          v_pred_pad = jitted_refiner_cfg(
+              refiner_state, v_packed, txt_2_j, rope_2_j, kv_blen_2_j, ref_cfg_j
+          )
+        elif use_uncond_only:
           v_pred_pad, _ = jitted_refiner_uncond(
               refiner_state, v_packed, txt_uncond_j, rope_uncond_j, kv_blen_uncond_j, None
           )
@@ -2106,28 +2187,23 @@ def main(argv: Sequence[str] | None = None) -> None:
         refiner_model,
         refiner_state,
         latent_ref,
-        vid_src_idx_j,
-        txt_cond_j,
-        txt_uncond_j,
-        rope_cond_j,
-        rope_uncond_j,
-        kv_blen_cond_j,
-        kv_blen_uncond_j,
+        *ref_aux_arrays,
     )
-    del (
-        refiner_model,
-        refiner_state,
-        jitted_refiner,
-        jitted_refiner_uncond,
-        latent_ref,
-        vid_src_idx_j,
-        txt_cond_j,
-        txt_uncond_j,
-        rope_cond_j,
-        rope_uncond_j,
-        kv_blen_cond_j,
-        kv_blen_uncond_j,
-    )
+    ref_aux_arrays.clear()
+    del refiner_model, refiner_state, latent_ref, vid_src_idx_j
+    if use_cfg_parallel:
+      del jitted_refiner_cfg, txt_2_j, rope_2_j, kv_blen_2_j, ref_cfg_j
+    else:
+      del (
+          jitted_refiner,
+          jitted_refiner_uncond,
+          txt_cond_j,
+          txt_uncond_j,
+          rope_cond_j,
+          rope_uncond_j,
+          kv_blen_cond_j,
+          kv_blen_uncond_j,
+      )
     gc.collect()
     _log_hbm("after Stage 2 Refiner freed", devices)
 

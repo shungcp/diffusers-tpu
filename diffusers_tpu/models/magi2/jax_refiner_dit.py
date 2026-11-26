@@ -987,6 +987,466 @@ def _dense_masked_splash_attention(
 
 
 # ---------------------------------------------------------------------------
+# 2b. Fast GQA-Grouped + W-Coalesced 3D Block-Grid Pallas Attention (9x-12x)
+# ---------------------------------------------------------------------------
+
+
+def _gqa_wcoal_video_kernel(
+    kv_blen_vid_ref: Any,   # SMEM (nt, nh, nw) i32
+    row_full_ref: Any,      # SMEM (nt, nh, nw_base_cnt) i32 (1 if all win_w blocks == block_vol)
+    tail_len_ref: Any,      # SMEM (1,) i32
+    q_ref: Any,             # VMEM (bq_gqa, D) bf16 where bq_gqa = G * block_vol
+    k_vid_ref: Any,         # VMEM (bkv_w, D) bf16 where bkv_w = win_w * block_vol
+    v_vid_ref: Any,         # VMEM (bkv_w, D) bf16
+    k_tail_ref: Any,        # VMEM (n_tail_pad, D) bf16 (or dummy if n_tail_pad == 0)
+    v_tail_ref: Any,        # VMEM (n_tail_pad, D) bf16
+    o_out_ref: Any,         # VMEM (D, bq_gqa) bf16
+    m_scratch_ref: Any,     # VMEM (8, bq_gqa) f32
+    l_scratch_ref: Any,     # VMEM (8, bq_gqa) f32
+    o_scratch_ref: Any,     # VMEM (D, bq_gqa) f32
+    *,
+    nt: int,
+    nh: int,
+    nw: int,
+    rt: int,
+    rh: int,
+    rw: int,
+    win_t: int,
+    win_h: int,
+    win_w: int,
+    block_vol: int,
+    has_tail: bool,
+    head_dim_v: int,
+    qk_fp8: bool = False,
+) -> None:
+  """GQA-grouped + W-coalesced 3D block-grid sparse splash kernel.
+
+  Fuses all ``G = H_q // H_kv`` GQA query heads into one ``bq = G * 128`` (512)
+  Q tile and coalesces all ``win_w = 2*rw + 1`` (5) contiguous W-neighbor KV
+  blocks into a single ``bkv = win_w * 128`` (640) DMA tile, cutting grid
+  iterations by ~20x and K/V HBM traffic by 4x while keeping tail KV resident
+  in VMEM for ``j == 0`` initialization. Mathematically bit-exact in BF16.
+  """
+  float32 = jnp.float32
+  head_dim_v_repeats, rem = divmod(head_dim_v, _NUM_SUBLANES)
+  if rem != 0:
+    raise NotImplementedError(f"{head_dim_v=} must be a multiple of {_NUM_SUBLANES}")
+  bkv_w = win_w * block_vol
+
+  qt = pl.program_id(1)
+  qh = pl.program_id(2)
+  qw = pl.program_id(3)
+  j = pl.program_id(4)
+
+  qt_lo = jnp.maximum(jnp.int32(0), qt - rt)
+  qt_hi = jnp.minimum(jnp.int32(nt), qt + rt + 1)
+  qh_lo = jnp.maximum(jnp.int32(0), qh - rh)
+  qh_hi = jnp.minimum(jnp.int32(nh), qh + rh + 1)
+  qw_lo = jnp.maximum(jnp.int32(0), qw - rw)
+  qw_hi = jnp.minimum(jnp.int32(nw), qw + rw + 1)
+
+  kt_base = jnp.minimum(qt_lo, jnp.int32(nt - win_t))
+  kh_base = jnp.minimum(qh_lo, jnp.int32(nh - win_h))
+  kw_base = jnp.minimum(qw_lo, jnp.int32(nw - win_w))
+
+  dt = j // win_h
+  dh = j - dt * win_h
+  kt = kt_base + dt
+  kh = kh_base + dh
+
+  th_active = (kt >= qt_lo) & (kt < qt_hi) & (kh >= qh_lo) & (kh < qh_hi)
+
+  def _dot_qk(k_mat: Any, q_mat: Any) -> Any:
+    if qk_fp8:
+      return lax.dot_general(
+          k_mat.astype(jnp.float8_e4m3fn),
+          q_mat.astype(jnp.float8_e4m3fn),
+          _NT_DIM_NUMBERS,
+          preferred_element_type=float32,
+      )
+    return lax.dot_general(
+        k_mat, q_mat, _NT_DIM_NUMBERS, preferred_element_type=float32
+    )
+
+  def _online_step(qk: Any, v_mat: Any) -> None:
+    m_prev, l_prev = m_scratch_ref[...], l_scratch_ref[...]
+    m_curr = qk.max(axis=0)[None, :]
+    m_next = jnp.maximum(m_prev, m_curr)
+    s_curr = jnp.exp2(qk - m_next[0:1])
+    s_cast = s_curr.astype(jnp.bfloat16)
+    l_curr = s_curr.sum(axis=0, keepdims=True)
+    alpha = jnp.exp2(m_prev - m_next)
+    o_curr = lax.dot_general(
+        v_mat, s_cast, _SV_DIM_NUMBERS, preferred_element_type=float32
+    )
+    o_scratch_ref[:] = alpha[0:1, ...] * o_scratch_ref[:] + o_curr
+    m_scratch_ref[...], l_scratch_ref[...] = m_next, l_curr + alpha * l_prev
+
+  @pl.when(j == 0)
+  def _init():
+    if has_tail:
+      q = q_ref[...]
+      k_t = k_tail_ref[...]
+      v_t = v_tail_ref[...]
+      qk_t = _dot_qk(k_t, q)
+      tlen = tail_len_ref[0]
+      tpos = lax.broadcasted_iota(jnp.int32, qk_t.shape, 0)
+      qk_t = jnp.where(tpos < tlen, qk_t, _DEFAULT_MASK_VALUE)
+      m0 = qk_t.max(axis=0)[None, :]
+      s0 = jnp.exp2(qk_t - m0[0:1])
+      l0 = s0.sum(axis=0, keepdims=True)
+      o0 = lax.dot_general(
+          v_t, s0.astype(jnp.bfloat16), _SV_DIM_NUMBERS, preferred_element_type=float32
+      )
+      m_scratch_ref[...] = jnp.broadcast_to(m0, m_scratch_ref.shape)
+      l_scratch_ref[...] = jnp.broadcast_to(l0, l_scratch_ref.shape)
+      o_scratch_ref[...] = o0
+    else:
+      o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
+      l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+      m_scratch_ref[...] = jnp.full_like(m_scratch_ref, _DEFAULT_MASK_VALUE)
+
+  w_all_in = (kw_base >= qw_lo) & ((kw_base + win_w) <= qw_hi)
+  all_full = w_all_in & (row_full_ref[kt, kh, kw_base] > 0)
+
+  @pl.when(th_active & all_full)
+  def _run_full():
+    qk = _dot_qk(k_vid_ref[...], q_ref[...])
+    _online_step(qk, v_vid_ref[...])
+
+  @pl.when(th_active & jnp.logical_not(all_full))
+  def _run_masked():
+    qk = _dot_qk(k_vid_ref[...], q_ref[...])
+    pos = lax.broadcasted_iota(jnp.int32, (bkv_w, 1), 0)
+    b_idx = pos // block_vol
+    r_idx = pos - b_idx * block_vol
+    kw_cur = kw_base + b_idx
+    in_w = (kw_cur >= qw_lo) & (kw_cur < qw_hi)
+    vlen = jnp.full((bkv_w, 1), kv_blen_vid_ref[kt, kh, kw_base], dtype=jnp.int32)
+    for w in range(1, win_w):
+      vlen = jnp.where(b_idx == w, kv_blen_vid_ref[kt, kh, kw_base + w], vlen)
+    valid = in_w & (r_idx < vlen)
+    qk = jnp.where(valid, qk, _DEFAULT_MASK_VALUE)
+    _online_step(qk, v_vid_ref[...])
+
+  @pl.when(j == (win_t * win_h) - 1)
+  def _end():
+    l = l_scratch_ref[...]
+    l_safe = jnp.where(l == 0.0, 1.0, l)
+    l_inv = jnp.concatenate([1.0 / l_safe] * head_dim_v_repeats, axis=0)
+    o_out_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_out_ref.dtype)
+
+
+def _gqa_dense_tail_kernel(
+    sb_blen_ref: Any,       # SMEM (n_superblocks, blocks_per_sb) i32
+    sb_full_ref: Any,       # SMEM (n_superblocks,) i32 (1 if all sub-blocks == block_vol)
+    sb_active_ref: Any,     # SMEM (n_superblocks,) i32 (1 if sum(sub-blocks) > 0)
+    q_ref: Any,             # VMEM (bq_gqa, D) bf16
+    k_ref: Any,             # VMEM (bkv_sb, D) bf16 where bkv_sb = blocks_per_sb * block_vol
+    v_ref: Any,             # VMEM (bkv_sb, D) bf16
+    o_out_ref: Any,         # VMEM (D, bq_gqa) bf16
+    m_scratch_ref: Any,     # VMEM (8, bq_gqa) f32
+    l_scratch_ref: Any,     # VMEM (8, bq_gqa) f32
+    o_scratch_ref: Any,     # VMEM (D, bq_gqa) f32
+    *,
+    n_superblocks: int,
+    blocks_per_sb: int,
+    block_vol: int,
+    head_dim_v: int,
+    qk_fp8: bool = False,
+) -> None:
+  """GQA-grouped superblock (bkv=1024) dense masked splash kernel for tail Q tokens."""
+  float32 = jnp.float32
+  head_dim_v_repeats, rem = divmod(head_dim_v, _NUM_SUBLANES)
+  if rem != 0:
+    raise NotImplementedError(f"{head_dim_v=} must be a multiple of {_NUM_SUBLANES}")
+  bkv_sb = blocks_per_sb * block_vol
+
+  j = pl.program_id(2)
+  active = sb_active_ref[j] > 0
+  is_full = sb_full_ref[j] > 0
+
+  @pl.when(j == 0)
+  def _init():
+    o_scratch_ref[...] = jnp.zeros_like(o_scratch_ref)
+    l_scratch_ref[...] = jnp.zeros_like(l_scratch_ref)
+    m_scratch_ref[...] = jnp.full_like(m_scratch_ref, _DEFAULT_MASK_VALUE)
+
+  def _step(masked: bool) -> None:
+    q = q_ref[...]
+    k = k_ref[...]
+    v = v_ref[...]
+    if qk_fp8:
+      qk = lax.dot_general(
+          k.astype(jnp.float8_e4m3fn),
+          q.astype(jnp.float8_e4m3fn),
+          _NT_DIM_NUMBERS,
+          preferred_element_type=float32,
+      )
+    else:
+      qk = lax.dot_general(k, q, _NT_DIM_NUMBERS, preferred_element_type=float32)
+    if masked:
+      pos = lax.broadcasted_iota(jnp.int32, (bkv_sb, 1), 0)
+      b_idx = pos // block_vol
+      r_idx = pos - b_idx * block_vol
+      vlen = jnp.full((bkv_sb, 1), sb_blen_ref[j, 0], dtype=jnp.int32)
+      for sb in range(1, blocks_per_sb):
+        vlen = jnp.where(b_idx == sb, sb_blen_ref[j, sb], vlen)
+      qk = jnp.where(r_idx < vlen, qk, _DEFAULT_MASK_VALUE)
+
+    m_prev, l_prev = m_scratch_ref[...], l_scratch_ref[...]
+    m_curr = qk.max(axis=0)[None, :]
+    m_next = jnp.maximum(m_prev, m_curr)
+    s_curr = jnp.exp2(qk - m_next[0:1])
+    s_cast = s_curr.astype(jnp.bfloat16)
+    l_curr = s_curr.sum(axis=0, keepdims=True)
+    alpha = jnp.exp2(m_prev - m_next)
+    o_curr = lax.dot_general(v, s_cast, _SV_DIM_NUMBERS, preferred_element_type=float32)
+    o_scratch_ref[:] = alpha[0:1, ...] * o_scratch_ref[:] + o_curr
+    m_scratch_ref[...], l_scratch_ref[...] = m_next, l_curr + alpha * l_prev
+
+  @pl.when(active & is_full)
+  def _run_full():
+    _step(masked=False)
+
+  @pl.when(active & jnp.logical_not(is_full))
+  def _run_masked():
+    _step(masked=True)
+
+  @pl.when(j == n_superblocks - 1)
+  def _end():
+    l = l_scratch_ref[...]
+    l_safe = jnp.where(l == 0.0, 1.0, l)
+    l_inv = jnp.concatenate([1.0 / l_safe] * head_dim_v_repeats, axis=0)
+    o_out_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_out_ref.dtype)
+
+
+def _gqa_wcoal_block_grid_attention(
+    q: Any,  # (S_total, H_q, D)
+    k: Any,  # (S_total, H_kv, D)
+    v: Any,  # (S_total, H_kv, D)
+    kv_blen: Any,  # (num_kv_blocks,) i32
+    *,
+    layout: RefinerAttentionLayout,
+    scale: float,
+    qk_fp8: bool = False,
+) -> Any:
+  """Fast GQA-grouped + W-coalesced TPU Pallas sparse + tail attention."""
+  _, num_q_heads, head_dim = q.shape
+  num_kv_heads = k.shape[1]
+  assert num_q_heads % num_kv_heads == 0
+  g_size = num_q_heads // num_kv_heads
+  nt, nh, nw = layout.block_grid_thw
+  rt, rh, rw = layout.radius
+  bvol = layout.block_vol
+  win_t = min(nt, 2 * rt + 1)
+  win_h = min(nh, 2 * rh + 1)
+  win_w = min(nw, 2 * rw + 1)
+  bq_gqa = g_size * bvol
+  bkv_w = win_w * bvol
+  n_vid_blocks = layout.n_vid_blocks
+  n_vid_pad = layout.n_vid_pad
+  n_tail_blocks = layout.n_tail_blocks
+  n_tail_pad = layout.n_tail_pad
+  has_tail = n_tail_pad > 0
+
+  # Video Q grouped by GQA group: (H_kv, n_vid_blocks * bq_gqa, D)
+  q_vid = q[:n_vid_pad].reshape(n_vid_blocks, bvol, num_kv_heads, g_size, head_dim)
+  q_vid = jnp.transpose(q_vid, (2, 0, 3, 1, 4)).reshape(
+      num_kv_heads, n_vid_blocks * bq_gqa, head_dim
+  )
+  q_vid_scaled = (q_vid.astype(jnp.float32) * (scale * _LOG2_E)).astype(jnp.bfloat16)
+
+  # Video K, V in 3D grid layout: (H_kv, nt, nh, nw * bvol, D)
+  k_vid = (
+      jnp.transpose(k[:n_vid_pad], (1, 0, 2))
+      .reshape(num_kv_heads, nt, nh, nw * bvol, head_dim)
+      .astype(jnp.bfloat16)
+  )
+  v_vid = (
+      jnp.transpose(v[:n_vid_pad], (1, 0, 2))
+      .reshape(num_kv_heads, nt, nh, nw * bvol, head_dim)
+      .astype(jnp.bfloat16)
+  )
+
+  # Tail K, V (resident in VMEM if has_tail; tiny 128-token dummy otherwise)
+  if has_tail:
+    k_tail = jnp.transpose(k[n_vid_pad:], (1, 0, 2)).astype(jnp.bfloat16)
+    v_tail = jnp.transpose(v[n_vid_pad:], (1, 0, 2)).astype(jnp.bfloat16)
+    tail_blk = n_tail_pad
+    tail_len = jnp.sum(kv_blen[n_vid_blocks:], dtype=jnp.int32).reshape(1)
+  else:
+    k_tail = jnp.zeros((num_kv_heads, bvol, head_dim), dtype=jnp.bfloat16)
+    v_tail = jnp.zeros((num_kv_heads, bvol, head_dim), dtype=jnp.bfloat16)
+    tail_blk = bvol
+    tail_len = jnp.zeros((1,), dtype=jnp.int32)
+
+  kv_blen_vid = kv_blen[:n_vid_blocks].reshape(nt, nh, nw)
+  # Precompute per-W-window all-full flag: (nt, nh, nw - win_w + 1)
+  nw_base = nw - win_w + 1
+  w_full_slices = [
+      (kv_blen_vid[:, :, w : w + nw_base] >= bvol) for w in range(win_w)
+  ]
+  row_full = w_full_slices[0]
+  for s in w_full_slices[1:]:
+    row_full = row_full & s
+  row_full_i32 = row_full.astype(jnp.int32)
+
+  nhw = nh * nw
+
+  def q_index_map(h, qt, qh, qw, j, *_):
+    return (h, qt * nhw + qh * nw + qw, 0)
+
+  def kv_vid_index_map(h, qt, qh, qw, j, *_):
+    qt_lo = jnp.maximum(jnp.int32(0), qt - rt)
+    qh_lo = jnp.maximum(jnp.int32(0), qh - rh)
+    qw_lo = jnp.maximum(jnp.int32(0), qw - rw)
+    kt_base = jnp.minimum(qt_lo, jnp.int32(nt - win_t))
+    kh_base = jnp.minimum(qh_lo, jnp.int32(nh - win_h))
+    kw_base = jnp.minimum(qw_lo, jnp.int32(nw - win_w))
+    dt = j // win_h
+    dh = j - dt * win_h
+    return (h, kt_base + dt, kh_base + dh, kw_base * bvol, 0)
+
+  def kv_tail_index_map(h, qt, qh, qw, j, *_):
+    return (h, 0, 0)
+
+  def out_index_map(h, qt, qh, qw, j, *_):
+    return (h, 0, qt * nhw + qh * nw + qw)
+
+  scratch_shapes = [
+      pltpu.VMEM((_NUM_SUBLANES, bq_gqa), jnp.float32),
+      pltpu.VMEM((_NUM_SUBLANES, bq_gqa), jnp.float32),
+      pltpu.VMEM((head_dim, bq_gqa), jnp.float32),
+  ]
+
+  out_vid_hdb = pl.pallas_call(
+      functools.partial(
+          _gqa_wcoal_video_kernel,
+          nt=nt,
+          nh=nh,
+          nw=nw,
+          rt=rt,
+          rh=rh,
+          rw=rw,
+          win_t=win_t,
+          win_h=win_h,
+          win_w=win_w,
+          block_vol=bvol,
+          has_tail=has_tail,
+          head_dim_v=head_dim,
+          qk_fp8=qk_fp8,
+      ),
+      grid_spec=pltpu.PrefetchScalarGridSpec(
+          num_scalar_prefetch=3,
+          in_specs=[
+              pl.BlockSpec((None, bq_gqa, head_dim), q_index_map),
+              pl.BlockSpec(
+                  (None, None, None, pl.Element(bkv_w), pl.Element(head_dim)),
+                  kv_vid_index_map,
+              ),
+              pl.BlockSpec(
+                  (None, None, None, pl.Element(bkv_w), pl.Element(head_dim)),
+                  kv_vid_index_map,
+              ),
+              pl.BlockSpec((None, tail_blk, head_dim), kv_tail_index_map),
+              pl.BlockSpec((None, tail_blk, head_dim), kv_tail_index_map),
+          ],
+          out_specs=pl.BlockSpec((None, head_dim, bq_gqa), out_index_map),
+          scratch_shapes=scratch_shapes,
+          grid=(num_kv_heads, nt, nh, nw, win_t * win_h),
+      ),
+      compiler_params=pltpu.CompilerParams(
+          dimension_semantics=("parallel", "parallel", "parallel", "parallel", "arbitrary"),
+          flags={"XLA_TPU_FORCE_LP_LLO_SCHEDULER": True},
+          vmem_limit_bytes=_vmem_limit_bytes(),
+      ),
+      out_shape=jax.ShapeDtypeStruct(
+          (num_kv_heads, head_dim, n_vid_blocks * bq_gqa), jnp.bfloat16
+      ),
+  )(kv_blen_vid, row_full_i32, tail_len, q_vid_scaled, k_vid, v_vid, k_tail, v_tail)
+
+  out_vid = out_vid_hdb.reshape(num_kv_heads, head_dim, n_vid_blocks, g_size, bvol)
+  out_vid = jnp.transpose(out_vid, (2, 4, 0, 3, 1)).reshape(
+      n_vid_pad, num_q_heads, head_dim
+  )
+
+  if not has_tail:
+    return out_vid.astype(q.dtype)
+
+  # Fast GQA-grouped superblock (bkv = 8 * block_vol = 1024) dense tail-Q attention
+  blocks_per_sb = 8
+  bkv_sb = blocks_per_sb * bvol
+  n_kv_blocks = n_vid_blocks + n_tail_blocks
+  n_superblocks = math.ceil(n_kv_blocks / blocks_per_sb)
+  pad_blocks = n_superblocks * blocks_per_sb - n_kv_blocks
+
+  q_tail = q[n_vid_pad:].reshape(n_tail_blocks, bvol, num_kv_heads, g_size, head_dim)
+  q_tail = jnp.transpose(q_tail, (2, 0, 3, 1, 4)).reshape(
+      num_kv_heads, n_tail_blocks * bq_gqa, head_dim
+  )
+  q_tail_scaled = (q_tail.astype(jnp.float32) * (scale * _LOG2_E)).astype(jnp.bfloat16)
+
+  k_all = jnp.transpose(k, (1, 0, 2)).astype(jnp.bfloat16)
+  v_all = jnp.transpose(v, (1, 0, 2)).astype(jnp.bfloat16)
+  if pad_blocks > 0:
+    pad_tok = pad_blocks * bvol
+    k_all = jnp.pad(k_all, ((0, 0), (0, pad_tok), (0, 0)))
+    v_all = jnp.pad(v_all, ((0, 0), (0, pad_tok), (0, 0)))
+    sb_blen = jnp.pad(kv_blen, (0, pad_blocks)).reshape(n_superblocks, blocks_per_sb)
+  else:
+    sb_blen = kv_blen.reshape(n_superblocks, blocks_per_sb)
+
+  sb_full = jnp.all(sb_blen >= bvol, axis=1).astype(jnp.int32)
+  sb_active = (jnp.sum(sb_blen, axis=1) > 0).astype(jnp.int32)
+
+  def qt_index_map(h, i, j, *_):
+    return (h, i, 0)
+
+  def kvt_index_map(h, i, j, *_):
+    return (h, j, 0)
+
+  def outt_index_map(h, i, j, *_):
+    return (h, 0, i)
+
+  out_tail_hdb = pl.pallas_call(
+      functools.partial(
+          _gqa_dense_tail_kernel,
+          n_superblocks=n_superblocks,
+          blocks_per_sb=blocks_per_sb,
+          block_vol=bvol,
+          head_dim_v=head_dim,
+          qk_fp8=qk_fp8,
+      ),
+      grid_spec=pltpu.PrefetchScalarGridSpec(
+          num_scalar_prefetch=3,
+          in_specs=[
+              pl.BlockSpec((None, bq_gqa, head_dim), qt_index_map),
+              pl.BlockSpec((None, bkv_sb, head_dim), kvt_index_map),
+              pl.BlockSpec((None, bkv_sb, head_dim), kvt_index_map),
+          ],
+          out_specs=pl.BlockSpec((None, head_dim, bq_gqa), outt_index_map),
+          scratch_shapes=scratch_shapes,
+          grid=(num_kv_heads, n_tail_blocks, n_superblocks),
+      ),
+      compiler_params=pltpu.CompilerParams(
+          dimension_semantics=("parallel", "parallel", "arbitrary"),
+          flags={"XLA_TPU_FORCE_LP_LLO_SCHEDULER": True},
+          vmem_limit_bytes=_vmem_limit_bytes(),
+      ),
+      out_shape=jax.ShapeDtypeStruct(
+          (num_kv_heads, head_dim, n_tail_blocks * bq_gqa), jnp.bfloat16
+      ),
+  )(sb_blen, sb_full, sb_active, q_tail_scaled, k_all, v_all)
+
+  out_tail = out_tail_hdb.reshape(num_kv_heads, head_dim, n_tail_blocks, g_size, bvol)
+  out_tail = jnp.transpose(out_tail, (2, 4, 0, 3, 1)).reshape(
+      n_tail_pad, num_q_heads, head_dim
+  )
+  return jnp.concatenate([out_vid, out_tail], axis=0).astype(q.dtype)
+
+
+# ---------------------------------------------------------------------------
 # 3. Direct sparse_splash.py Backend (when all_video_blocks_full=True) & CPU Ref
 # ---------------------------------------------------------------------------
 
@@ -1101,8 +1561,33 @@ def _masked_pallas_block_grid_attention(
     *,
     layout: RefinerAttentionLayout,
     scale: float,
+    qk_fp8: bool = False,
+    use_gqa_wcoal: bool = True,
 ) -> Any:
   """Device-local TPU Pallas 3D block-grid sparse attention with exact pad masking."""
+  nt, nh, nw = layout.block_grid_thw
+  rt, rh, rw = layout.radius
+  win_t = min(nt, 2 * rt + 1)
+  win_h = min(nh, 2 * rh + 1)
+  win_w = min(nw, 2 * rw + 1)
+  if (
+      use_gqa_wcoal
+      and q.shape[1] % k.shape[1] == 0
+      and nt >= win_t
+      and nh >= win_h
+      and nw >= win_w
+      and layout.n_tail_pad <= 1024
+  ):
+    return _gqa_wcoal_block_grid_attention(
+        q,
+        k,
+        v,
+        kv_blen,
+        layout=layout,
+        scale=scale,
+        qk_fp8=qk_fp8,
+    )
+
   q_hsd = jnp.transpose(q, (1, 0, 2))  # (H_q, S_total, D)
   k_hsd = jnp.transpose(k, (1, 0, 2))  # (H_kv, S_total, D)
   v_hsd = jnp.transpose(v, (1, 0, 2))  # (H_kv, S_total, D)
@@ -1224,7 +1709,7 @@ def refiner_sparse_attention(
   dec_arr = jnp.asarray(layout.dec_arr, dtype=jnp.int32)
 
   def _local_attn(q_loc, k_loc, v_loc, nb_loc, cnt_loc, dec_loc, blen_loc):
-    if mode == "masked_pallas":
+    if mode in ("masked_pallas", "masked_pallas_fp8", "masked_pallas_legacy"):
       return _masked_pallas_block_grid_attention(
           q_loc,
           k_loc,
@@ -1235,6 +1720,8 @@ def refiner_sparse_attention(
           blen_loc,
           layout=layout,
           scale=scale,
+          qk_fp8=(mode == "masked_pallas_fp8"),
+          use_gqa_wcoal=(mode != "masked_pallas_legacy"),
       )
     if mode == "sparse_splash":
       return _sparse_splash_backend_attention(
@@ -2415,6 +2902,176 @@ def make_jitted_forward(
     return post_mod(x, layout.modality_lens)
 
   return _forward_scanned, (pre_gd, tuple(s[1] for s in segments), post_gd), packed_state
+
+
+def make_jitted_cfg_forward(
+    model: Any,
+    layout: RefinerAttentionLayout,
+    *,
+    mesh: Any,
+    cfg_axis: str = "cfg",
+    cp_axis: str = "cp",
+    compute_dtype: Any = None,
+    attn_impl: str | None = None,
+    scan_layers: bool = True,
+) -> tuple[Callable[..., Any], Any, Any]:
+  """Compile a fused 2-branch CFG-parallel Refiner forward over a 2D ``(cfg=2, cp=N)`` mesh.
+
+  Runs conditional (``cfg=0``) and unconditional (``cfg=1``) branches simultaneously
+  on two halves of the TPU slice (e.g. chips 0..3 and 4..7 on ``v7x-8`` with
+  ``CP=4``, ``8 Q / 2 KV`` heads/chip), eliminating sequential 2x weight reads and
+  2x XLA dispatch while remaining 100% mathematically lossless.
+
+  Returns:
+    ``(jitted_cfg_fn, graphdef, packed_state)`` where calling:
+      ``v_cfg_pad = jitted_cfg_fn(state, video_packed, txt_2, rope_2, kv_blen_2, cfg_scale)``
+    returns the CFG-combined video velocity ``(n_vid_pad, 48)`` in float32.
+  """
+  from flax import nnx
+
+  if mesh is None or cfg_axis not in mesh.axis_names or cp_axis not in mesh.axis_names:
+    raise ValueError(
+        f"make_jitted_cfg_forward requires a 2D mesh with axes ({cfg_axis!r}, {cp_axis!r}); "
+        f"got {getattr(mesh, 'axis_names', None)}"
+    )
+  if int(mesh.shape[cfg_axis]) != 2:
+    raise ValueError(f"Expected mesh.shape[{cfg_axis!r}] == 2, got {mesh.shape[cfg_axis]}")
+
+  pre_gd, pre_st = nnx.split(model.pre_adapter)
+  post_gd, post_st = nnx.split(model.post_adapter)
+  layers = list(model.block.layers)
+
+  def _sig(layer):
+    return int(layer.num_modality)
+
+  segments: list[tuple[bool, Any, list[int]]] = []
+  idx = 0
+  while idx < len(layers):
+    if idx == 0 or not scan_layers:
+      segments.append((False, nnx.split(layers[idx])[0], [idx]))
+      idx += 1
+      continue
+    sig = _sig(layers[idx])
+    j = idx + 1
+    while j < len(layers) and _sig(layers[j]) == sig:
+      j += 1
+    run = list(range(idx, j))
+    if len(run) >= 3:
+      segments.append((True, nnx.split(layers[idx])[0], run))
+    else:
+      for k in run:
+        segments.append((False, nnx.split(layers[k])[0], [k]))
+    idx = j
+
+  rep_sharding = NamedSharding(mesh, P())
+  pre_st = jax.tree.map(lambda x: jax.device_put(x, rep_sharding), pre_st)
+  post_st = jax.tree.map(lambda x: jax.device_put(x, rep_sharding), post_st)
+
+  seg_states = []
+  for is_scan, _gd, run in segments:
+    if is_scan:
+      st_list = [
+          jax.tree.map(lambda x: jax.device_put(x, rep_sharding), nnx.split(layers[k])[1])
+          for k in run
+      ]
+      seg_states.append(_stack_layer_states_sharded(st_list, mesh))
+    else:
+      seg_states.append(
+          jax.tree.map(lambda x: jax.device_put(x, rep_sharding), nnx.split(layers[run[0]])[1])
+      )
+
+  packed_state = (pre_st, tuple(seg_states), post_st)
+  c_dtype = model.dtype if compute_dtype is None else compute_dtype
+
+  n_v, n_a, n_t = layout.modality_lens
+  mod_ids_np = np.concatenate([
+      np.zeros((n_v,), dtype=np.int32),
+      np.ones((n_a,), dtype=np.int32),
+      np.full((n_t,), 2, dtype=np.int32),
+  ])
+  mod_ids_sharded = jax.device_put(
+      jnp.asarray(mod_ids_np, dtype=jnp.int32), NamedSharding(mesh, P(cp_axis,))
+  )
+  layer_specs = jax.tree_util.tree_map(lambda _: P(), tuple(seg_states))
+
+  def _run_layers_cfg_local(layer_ss, x_loc, rope_loc, mod_loc, blen_loc):
+    # x_loc: (1, S//cp, D), rope_loc: (1, S//cp, ro_dim), blen_loc: (1, num_kv_blocks)
+    cur = x_loc[0]
+    rope_1 = rope_loc[0]
+    blen_1 = blen_loc[0]
+    gs_loc = jnp.bincount(mod_loc, length=3).astype(jnp.int32)
+    for (is_scan, lgd, _run), lst in zip(segments, layer_ss):
+      if is_scan:
+        def _step(carry, one_st, _lgd=lgd):
+          lyr = nnx.merge(_lgd, one_st)
+          nxt = lyr(
+              carry,
+              rope_1,
+              blen_1,
+              layout=layout,
+              compute_dtype=c_dtype,
+              mesh=mesh,
+              cp_axis=cp_axis,
+              parallel_mode="cp",
+              attn_impl=attn_impl,
+              modality_ids=mod_loc,
+              group_sizes=gs_loc,
+              in_shard_map=True,
+          )
+          return nxt, None
+
+        cur, _ = lax.scan(_step, cur, lst)
+      else:
+        lyr = nnx.merge(lgd, lst)
+        cur = lyr(
+            cur,
+            rope_1,
+            blen_1,
+            layout=layout,
+            compute_dtype=c_dtype,
+            mesh=mesh,
+            cp_axis=cp_axis,
+            parallel_mode="cp",
+            attn_impl=attn_impl,
+            modality_ids=mod_loc,
+            group_sizes=gs_loc,
+            in_shard_map=True,
+        )
+    return cur[None, ...]
+
+  run_layers_cfg_sharded = _shard_map(
+      _run_layers_cfg_local,
+      mesh=mesh,
+      in_specs=(
+          layer_specs,
+          P(cfg_axis, cp_axis, None),
+          P(cfg_axis, cp_axis, None),
+          P(cp_axis,),
+          P(cfg_axis, None),
+      ),
+      out_specs=P(cfg_axis, cp_axis, None),
+  )
+
+  @jax.jit
+  def _forward_cfg(st, video_packed, text_packed_2, rope_2, kv_blen_2, cfg_scale):
+    pre_s, layer_ss, post_s = st
+    pre_mod = nnx.merge(pre_gd, pre_s)
+    x_c = pre_mod(video_packed, None, text_packed_2[0]).astype(c_dtype)
+    x_u = pre_mod(video_packed, None, text_packed_2[1]).astype(c_dtype)
+    x_2 = jnp.stack([x_c, x_u], axis=0)
+    x_2 = lax.with_sharding_constraint(x_2, NamedSharding(mesh, P(cfg_axis, cp_axis, None)))
+    rope_s = lax.with_sharding_constraint(rope_2, NamedSharding(mesh, P(cfg_axis, cp_axis, None)))
+    blen_s = lax.with_sharding_constraint(kv_blen_2, NamedSharding(mesh, P(cfg_axis, None)))
+
+    x_out_2 = run_layers_cfg_sharded(layer_ss, x_2, rope_s, mod_ids_sharded, blen_s)
+
+    post_mod = nnx.merge(post_gd, post_s)
+    v_2 = jax.vmap(lambda xo: post_mod(xo, layout.modality_lens)[0])(x_out_2)
+    v_c = v_2[0]
+    v_u = v_2[1]
+    return v_u + cfg_scale.astype(jnp.float32) * (v_c - v_u)
+
+  return _forward_cfg, (pre_gd, tuple(s[1] for s in segments), post_gd), packed_state
 
 
 # ---------------------------------------------------------------------------
