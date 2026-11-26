@@ -62,6 +62,7 @@ import argparse
 from contextlib import nullcontext
 import functools
 import gc
+import hashlib
 import json
 import math
 import os
@@ -369,6 +370,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
       "--save-frames-npy",
       action="store_true",
       help="Also save decoded uint8 frames as <out>/<tag>_frames.npy.",
+  )
+  ap.add_argument(
+      "--decode-chunk-shard",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help="Shard TurboVAED independent temporal chunks across all TPU chips (bit-exact).",
+  )
+  ap.add_argument(
+      "--uncond-cache",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help="Auto-cache negative-prompt Qwen3.5 embeddings on disk to skip redundant encodes.",
   )
   return ap.parse_args(argv)
 
@@ -1331,6 +1344,14 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     print(f"[magi2] Stage 0a: Loading Wan2.2 VAE encoder from {vae_dir} ...", flush=True)
     wan_enc = load_wan22_vae_encoder(vae_dir, dtype=jnp.float32, strict=True, verbose=True)
+    wan_gd, wan_st = nnx.split(wan_enc)
+    wan_st = jax.tree.map(lambda x: jax.device_put(x, devices[0]), wan_st)
+
+    @jax.jit
+    def _jit_encode_ref(st, img):
+      enc = nnx.merge(wan_gd, st)
+      return enc.encode(img, input_layout="ncthw", output_layout="ncthw", normalize=True)
+
     for k in sorted_fig_keys:
       img_ncthw = preprocess_reference_image(
           image_dict[k],
@@ -1339,7 +1360,7 @@ def main(argv: Sequence[str] | None = None) -> None:
           preview_width=preview_w,
       )
       img_tpu = jax.device_put(jnp.asarray(img_ncthw, dtype=jnp.float32), devices[0])
-      lat = wan_enc.encode(img_tpu, input_layout="ncthw", output_layout="ncthw", normalize=True)
+      lat = _jit_encode_ref(wan_st, img_tpu)
       lat_np = np.asarray(jax.block_until_ready(lat), dtype=np.float32)  # (1, 48, 1, h_k, w_k)
       ref_image_latents_np.append(lat_np)
       ref_image_hws.append((int(lat_np.shape[3]), int(lat_np.shape[4])))
@@ -1348,8 +1369,8 @@ def main(argv: Sequence[str] | None = None) -> None:
           flush=True,
       )
       _free_device_arrays(img_tpu, lat)
-    _free_device_arrays(wan_enc)
-    del wan_enc
+    _free_device_arrays(wan_enc, wan_st)
+    del wan_enc, wan_st, wan_gd, _jit_encode_ref
     gc.collect()
     timings["ref_img_encode_s"] = time.perf_counter() - t0
     _log_hbm("after Stage 0a (Wan2.2 encoder freed)", devices)
@@ -1402,6 +1423,25 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
       from .jax_text import Qwen35TextEncoder
 
+      # Optional disk cache for static negative-prompt embeddings (skips redundant 512-tok compile+run).
+      uncond_disk_path: Path | None = None
+      uncond_cached_np: np.ndarray | None = None
+      if args.use_negative_prompt and args.negative_prompt and args.uncond_cache:
+        cc_root = (
+            Path(args.compile_cache).expanduser()
+            if args.compile_cache
+            else Path(os.environ.get("JAX_COMPILATION_CACHE_DIR", str(Path.home() / ".cache/magi2")))
+        )
+        neg_key = hashlib.sha256(
+            f"{txt_dir.resolve()}|skip=2|{args.dtype}|{args.negative_prompt}".encode("utf-8")
+        ).hexdigest()[:16]
+        uncond_disk_path = cc_root / "uncond_cache" / f"qwen35_uncond_{neg_key}.npy"
+        if uncond_disk_path.exists():
+          try:
+            uncond_cached_np = np.asarray(np.load(uncond_disk_path, allow_pickle=False), dtype=np.float32)
+          except Exception:
+            uncond_cached_np = None
+
       print(f"[magi2] Stage 0b: Loading Qwen3.5-27B text encoder from {txt_dir} ...", flush=True)
       t_load = time.perf_counter()
       with _mesh_context(mesh):
@@ -1422,9 +1462,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         cond_txt_np = np.asarray(cond_j.astype(jnp.float32), dtype=np.float32)
 
         if args.use_negative_prompt and args.negative_prompt:
-          uncond_j = text_enc.encode(args.negative_prompt)
-          uncond_j = jax.block_until_ready(uncond_j)
-          uncond_txt_np = np.asarray(uncond_j.astype(jnp.float32), dtype=np.float32)
+          if uncond_cached_np is not None:
+            uncond_j = None
+            uncond_txt_np = uncond_cached_np
+            print(f"  [cache] Reused negative-prompt embeddings from {uncond_disk_path}", flush=True)
+          else:
+            uncond_j = text_enc.encode(args.negative_prompt)
+            uncond_j = jax.block_until_ready(uncond_j)
+            uncond_txt_np = np.asarray(uncond_j.astype(jnp.float32), dtype=np.float32)
+            if uncond_disk_path is not None:
+              uncond_disk_path.parent.mkdir(parents=True, exist_ok=True)
+              np.save(uncond_disk_path, uncond_txt_np)
         else:
           uncond_j = None
           uncond_txt_np = np.zeros((1, 0, preview_cfg.text_in_channels), dtype=np.float32)
@@ -2110,44 +2158,65 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     timings["video_vae_load_s"] = time.perf_counter() - t_vload
 
-    dec_graphdef, dec_state = nnx.split(turbo_vae.decoder)
-
-    @functools.partial(jax.jit, static_argnames=("is_first_chunk",))
-    def _jit_decode_chunk_uint8(st, z_chunk, is_first_chunk: bool):
-      dec = nnx.merge(dec_graphdef, st)
-      rgb = dec(z_chunk, is_first_chunk=is_first_chunk)
-      # Exact match to inference_engine.py:L704-707:
-      # float -> mul(0.5).add(0.5).clamp(0, 1).mul(255).astype(uint8) on TPU
-      # (cuts PCIe D2H and host RAM 4x at 1080p!).
-      rgb_u8 = (
-          jnp.clip(rgb.astype(jnp.float32) * jnp.float32(0.5) + jnp.float32(0.5), 0.0, 1.0)
-          * jnp.float32(255.0)
-      ).astype(jnp.uint8)
-      return rgb_u8
-
     t_vdec = time.perf_counter()
-    z_vid_tpu = jax.device_put(jnp.asarray(final_video_latent_np, dtype=jnp.float32), devices[0])
-    frames_bthwc = turbo_vae.decode(
-        z_vid_tpu,
-        input_layout="ncthw",
-        output_layout="ndhwc",
-        denormalize=True,
-        output_offload=True,
-        chunk_fn=lambda z_c, is_first_chunk=True: _jit_decode_chunk_uint8(
-            dec_state, z_c, is_first_chunk=is_first_chunk
-        ),
-    )
-    frames_uint8 = np.asarray(frames_bthwc[0], dtype=np.uint8)  # (T_frames, H, W, 3)
-    timings["video_vae_decode_s"] = time.perf_counter() - t_vdec
-    print(
-        f"[magi2] Stage 3a: Decoded video {tuple(frames_uint8.shape)} @ {output_fps:g} fps "
-        f"in {timings['video_vae_decode_s']:.2f}s",
-        flush=True,
-    )
+    if args.decode_chunk_shard and len(devices) > 1:
+      with _mesh_context(mesh):
+        frames_uint8 = turbo_vae.decode_sharded(
+            final_video_latent_np,
+            mesh=mesh,
+            devices=devices,
+            axis_name="tp",
+            input_layout="ncthw",
+            denormalize=True,
+            to_uint8=True,
+        )
+      timings["video_vae_decode_s"] = time.perf_counter() - t_vdec
+      print(
+          f"[magi2] Stage 3a: Decoded video {tuple(frames_uint8.shape)} @ {output_fps:g} fps "
+          f"in {timings['video_vae_decode_s']:.2f}s (chunk-sharded x{len(devices)})",
+          flush=True,
+      )
+      _free_device_arrays(turbo_vae)
+      del turbo_vae
+      gc.collect()
+    else:
+      dec_graphdef, dec_state = nnx.split(turbo_vae.decoder)
 
-    _free_device_arrays(turbo_vae, dec_state, z_vid_tpu)
-    del turbo_vae, dec_state, dec_graphdef, z_vid_tpu, frames_bthwc
-    gc.collect()
+      @functools.partial(jax.jit, static_argnames=("is_first_chunk",))
+      def _jit_decode_chunk_uint8(st, z_chunk, is_first_chunk: bool):
+        dec = nnx.merge(dec_graphdef, st)
+        rgb = dec(z_chunk, is_first_chunk=is_first_chunk)
+        # Exact match to inference_engine.py:L704-707:
+        # float -> mul(0.5).add(0.5).clamp(0, 1).mul(255).astype(uint8) on TPU
+        # (cuts PCIe D2H and host RAM 4x at 1080p!).
+        rgb_u8 = (
+            jnp.clip(rgb.astype(jnp.float32) * jnp.float32(0.5) + jnp.float32(0.5), 0.0, 1.0)
+            * jnp.float32(255.0)
+        ).astype(jnp.uint8)
+        return rgb_u8
+
+      z_vid_tpu = jax.device_put(jnp.asarray(final_video_latent_np, dtype=jnp.float32), devices[0])
+      frames_bthwc = turbo_vae.decode(
+          z_vid_tpu,
+          input_layout="ncthw",
+          output_layout="ndhwc",
+          denormalize=True,
+          output_offload=True,
+          chunk_fn=lambda z_c, is_first_chunk=True: _jit_decode_chunk_uint8(
+              dec_state, z_c, is_first_chunk=is_first_chunk
+          ),
+      )
+      frames_uint8 = np.asarray(frames_bthwc[0], dtype=np.uint8)  # (T_frames, H, W, 3)
+      timings["video_vae_decode_s"] = time.perf_counter() - t_vdec
+      print(
+          f"[magi2] Stage 3a: Decoded video {tuple(frames_uint8.shape)} @ {output_fps:g} fps "
+          f"in {timings['video_vae_decode_s']:.2f}s",
+          flush=True,
+      )
+
+      _free_device_arrays(turbo_vae, dec_state, z_vid_tpu)
+      del turbo_vae, dec_state, dec_graphdef, z_vid_tpu, frames_bthwc
+      gc.collect()
 
     # 3b. Stereo audio decode (AutoencoderOobleck, fp32 + 441/512 sinc resample)
     wav_path: Path | None = None

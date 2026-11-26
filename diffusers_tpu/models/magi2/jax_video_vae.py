@@ -56,7 +56,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 from flax import nnx
 import jax
@@ -943,6 +943,191 @@ class TurboVAED(nnx.Module):
     if output_layout == "ndhwc":
       return out_all
     raise ValueError(f"Unsupported output_layout: {output_layout!r}")
+
+  def decode_sharded(
+      self,
+      z_np: np.ndarray,
+      *,
+      mesh: Any,
+      devices: Sequence[Any],
+      axis_name: str = "tp",
+      input_layout: str = "ncthw",
+      denormalize: bool = True,
+      to_uint8: bool = True,
+  ) -> np.ndarray:
+    """Bit-exact multi-chip chunk-parallel sliding-window decode across TPU devices.
+
+    Every sliding-window chunk of ``TurboVAED`` is temporally independent:
+    - All middle chunks (length ``step + 2``, ``is_first_chunk=False``) are
+      batched across all ``N`` chips via ``jax.shard_map`` (replicated BF16
+      decoder weights, ~0.87 GiB/chip), cutting 1080p (9 chunks = 1 + 7 + 1)
+      from 9 sequential decodes to 2 parallel waves.
+    - Chunk 0 (``is_first_chunk=True``, length ``first + 1``) and the final
+      chunk (``is_first_chunk=False``, length ``step + 1``) are dispatched
+      concurrently on ``devices[0]`` and ``devices[1]``.
+    - Returns host NumPy ``(T_out, H_out, W_out, 3)`` (for ``B=1``) in ``uint8``
+      when ``to_uint8=True`` or ``float32`` in ``[-1, 1]`` otherwise.
+    """
+    import functools
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    z_arr = np.asarray(z_np, dtype=np.float32)
+    if input_layout == "ncthw":
+      z_ndhwc_np = np.transpose(z_arr, (0, 2, 3, 4, 1))
+    elif input_layout == "ndhwc":
+      z_ndhwc_np = z_arr
+    else:
+      raise ValueError(f"Unsupported input_layout: {input_layout!r}")
+    if z_ndhwc_np.shape[0] != 1:
+      raise ValueError(f"decode_sharded expects batch_size=1, got {z_ndhwc_np.shape}")
+
+    if denormalize:
+      mean = np.asarray(WAN22_LATENT_MEAN, dtype=np.float32).reshape(1, 1, 1, 1, -1)
+      std = np.asarray(WAN22_LATENT_STD, dtype=np.float32).reshape(1, 1, 1, 1, -1)
+      z_ndhwc_np = z_ndhwc_np * std + mean
+
+    first_chunk_size = self.config.first_chunk_size
+    step = self.config.step_size
+    r_t = self.config.temporal_compression_ratio
+    overlap = 1 * r_t
+
+    num_frames = int(z_ndhwc_np.shape[1])
+    num_padding_frames = 0
+    if num_frames < first_chunk_size:
+      num_padding_frames = first_chunk_size - num_frames
+    elif (num_frames - first_chunk_size) % step != 0:
+      num_padding_frames = step - (num_frames - first_chunk_size) % step
+
+    if num_padding_frames > 0:
+      tail = np.repeat(z_ndhwc_np[:, -1:, :, :, :], num_padding_frames, axis=1)
+      z_ndhwc_np = np.concatenate([z_ndhwc_np, tail], axis=1)
+      num_frames = num_frames + num_padding_frames
+
+    num_chips = len(devices)
+    dec_graphdef, dec_state = nnx.split(self.decoder)
+    rep_sharding = NamedSharding(mesh, P())
+    batch_sharding = NamedSharding(mesh, P(axis_name, None, None, None, None))
+    dec_state_rep = jax.tree.map(lambda x: jax.device_put(x, rep_sharding), dec_state)
+
+    cache_key = (id(mesh), axis_name, bool(to_uint8))
+    if not hasattr(self, "_sharded_fn_cache"):
+      self._sharded_fn_cache = {}
+    cached_fns = self._sharded_fn_cache.get(cache_key)
+    if cached_fns is None:
+      def _post(rgb: jax.Array) -> jax.Array:
+        if not to_uint8:
+          return rgb.astype(jnp.float32)
+        return (
+            jnp.clip(rgb.astype(jnp.float32) * jnp.float32(0.5) + jnp.float32(0.5), 0.0, 1.0)
+            * jnp.float32(255.0)
+        ).astype(jnp.uint8)
+
+      @functools.partial(jax.jit, static_argnames=("is_first_chunk", "trim_left", "trim_right"))
+      def _jit_single(st, z_c, is_first_chunk: bool, trim_left: int, trim_right: int):
+        dec = nnx.merge(dec_graphdef, st)
+        rgb = dec(z_c.astype(self.dtype), is_first_chunk=is_first_chunk)
+        if trim_right > 0:
+          rgb = rgb[:, trim_left:-trim_right]
+        elif trim_left > 0:
+          rgb = rgb[:, trim_left:]
+        return _post(rgb)
+
+      def _mid_body(st, z_local):
+        dec = nnx.merge(dec_graphdef, st)
+        rgb = dec(z_local.astype(self.dtype), is_first_chunk=False)
+        rgb = rgb[:, overlap:-overlap]
+        return _post(rgb)
+
+      mid_sharded_fn = jax.jit(
+          jax.shard_map(
+              _mid_body,
+              mesh=mesh,
+              in_specs=(P(), P(axis_name, None, None, None, None)),
+              out_specs=P(axis_name, None, None, None, None),
+              check_vma=False,
+          )
+      )
+      self._sharded_fn_cache[cache_key] = (_jit_single, mid_sharded_fn)
+    else:
+      _jit_single, mid_sharded_fn = cached_fns
+
+    st_d0 = jax.tree.map(lambda x: x.addressable_shards[0].data, dec_state_rep)
+    mesh_d0 = jax.sharding.Mesh(np.array([devices[0]]), ("_s",))
+
+    if num_frames == first_chunk_size:
+      z0 = jax.device_put(jnp.asarray(z_ndhwc_np, dtype=self.dtype), devices[0])
+      with jax.set_mesh(mesh_d0):
+        out0 = np.asarray(_jit_single(st_d0, z0, True, 0, 0))[0]
+      if num_padding_frames > 0:
+        out0 = out0[: -num_padding_frames * r_t]
+      return out0
+
+    # Prepare first, middle, and last windows matching TurboVAED.decode() exactly.
+    z_first_np = z_ndhwc_np[:, 0 : first_chunk_size + 1]
+    mid_windows: list[np.ndarray] = []
+    z_last_np: np.ndarray | None = None
+    for i in range(first_chunk_size, num_frames, step):
+      is_last = i + step == num_frames
+      left = i - 1
+      right = i + step if is_last else i + step + 1
+      win = z_ndhwc_np[:, left:right]
+      if is_last:
+        z_last_np = win
+      else:
+        mid_windows.append(win)
+
+    # Wave 1: Dispatch first chunk (chip 0) & last chunk (chip 1) concurrently.
+    # Bind each single-chip call to a 1-device mesh so any active 8-chip caller
+    # mesh context does not conflict with single-device array placements.
+    z0_dev = jax.device_put(jnp.asarray(z_first_np, dtype=self.dtype), devices[0])
+    with jax.set_mesh(mesh_d0):
+      fut_first = _jit_single(st_d0, z0_dev, True, 0, overlap)
+
+    fut_last = None
+    zl_dev = None
+    if z_last_np is not None:
+      dev_last_idx = 1 if num_chips > 1 else 0
+      st_dl = jax.tree.map(lambda x: x.addressable_shards[dev_last_idx].data, dec_state_rep)
+      zl_dev = jax.device_put(jnp.asarray(z_last_np, dtype=self.dtype), devices[dev_last_idx])
+      mesh_dl = (
+          mesh_d0
+          if dev_last_idx == 0
+          else jax.sharding.Mesh(np.array([devices[dev_last_idx]]), ("_s",))
+      )
+      with jax.set_mesh(mesh_dl):
+        fut_last = _jit_single(st_dl, zl_dev, False, overlap, 0)
+
+    first_out_np = np.asarray(fut_first)[0]
+    last_out_np = np.asarray(fut_last)[0] if fut_last is not None else None
+    del z0_dev, fut_first, zl_dev, fut_last
+
+    # Wave 2: Decode all middle chunks in parallel waves of `num_chips` via shard_map.
+    mid_out_np: list[np.ndarray] = []
+    if mid_windows:
+      for start in range(0, len(mid_windows), num_chips):
+        wave = mid_windows[start : start + num_chips]
+        n_valid = len(wave)
+        if n_valid < num_chips:
+          wave = wave + [wave[-1]] * (num_chips - n_valid)
+        batch_np = np.concatenate(wave, axis=0)  # (num_chips, step+2, H, W, 48)
+        batch_dev = jax.device_put(jnp.asarray(batch_np, dtype=self.dtype), batch_sharding)
+        out_wave = mid_sharded_fn(dec_state_rep, batch_dev)
+        shards_sorted = sorted(out_wave.addressable_shards, key=lambda s: int(s.index[0].start))
+        for sh in shards_sorted[:n_valid]:
+          mid_out_np.append(np.asarray(sh.data)[0])
+        del batch_dev, out_wave
+
+    del dec_state_rep
+
+    out_chunks = [first_out_np]
+    out_chunks.extend(mid_out_np)
+    if last_out_np is not None:
+      out_chunks.append(last_out_np)
+
+    out_all = np.concatenate(out_chunks, axis=0)
+    if num_padding_frames > 0:
+      out_all = out_all[: -num_padding_frames * r_t]
+    return out_all
 
   def __call__(self, z: jax.Array, **kwargs: Any) -> jax.Array | np.ndarray:
     return self.decode(z, **kwargs)
