@@ -4,9 +4,9 @@ Fast inference for open diffusion models on Cloud TPU, built on top of [huggingf
 
 基于 [huggingface/diffusers](https://github.com/huggingface/diffusers),在 Cloud TPU 上高速运行开源扩散模型。
 
-Eight models are supported today: **MiniMax-H3** (video + audio), **MiniMax-H3-Image** (image and image editing), **Qwen-Image-2.1** (image), **MOSS-Image** (image, torchax backend), **MOSS-SoundEffect-v2** (text-to-audio, JAX), **MOVA** (image + text to video with audio, JAX), **OmniVAE T2AV** (text to video with audio, JAX) and **VideoGym-LTX-2.3** (image + text to video, LTX-2.3, JAX).
+Nine models are supported today: **MiniMax-H3** (video + audio), **MiniMax-H3-Image** (image and image editing), **Qwen-Image-2.1** (image), **MOSS-Image** (image, torchax backend), **MOSS-SoundEffect-v2** (text-to-audio, JAX), **MOVA** (image + text to video with audio, JAX), **OmniVAE T2AV** (text to video with audio, JAX), **VideoGym-LTX-2.3** (image + text to video, LTX-2.3, JAX) and **MAGI-2-preview** (113.93B Multi-Head Latent MoE video + audio + 1080p refiner, JAX / torchax / torch_tpu, currently on branch `feat/magi2-preview`).
 
-目前支持八个模型:**MiniMax-H3**(视频 + 音频)、**MiniMax-H3-Image**(图像与图像编辑)、**Qwen-Image-2.1**(图像)、**MOSS-Image**(图像,torchax 后端)、**MOSS-SoundEffect-v2**(文生音效,JAX)、**MOVA**(图 + 文生成带同步音频的视频,JAX)、**OmniVAE T2AV**(文生带同步音频的视频,JAX)和 **VideoGym-LTX-2.3**(图 + 文生视频,LTX-2.3,JAX)。
+目前支持九个模型:**MiniMax-H3**(视频 + 音频)、**MiniMax-H3-Image**(图像与图像编辑)、**Qwen-Image-2.1**(图像)、**MOSS-Image**(图像,torchax 后端)、**MOSS-SoundEffect-v2**(文生音效,JAX)、**MOVA**(图 + 文生成带同步音频的视频,JAX)、**OmniVAE T2AV**(文生带同步音频的视频,JAX)、**VideoGym-LTX-2.3**(图 + 文生视频,LTX-2.3,JAX)和 **MAGI-2-preview**(113.93B 多头潜空间 MoE 音视频生成 + 1080p 超分,JAX / torchax / torch_tpu 三后端,代码正在 `feat/magi2-preview` 分支持续优化)。
 
 MiniMax-H3 also runs with the six-step **Pika-H3-Flex** adapters.
 
@@ -30,6 +30,9 @@ Newest first. Each entry links a date to what changed.
 
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-26** — **MAGI-2-preview** (Sand.ai 113.93B / 5.95B active Multi-Head Latent MoE Stage 1 DiT + 4-stream mHC + Attention Sink, Qwen3.5-27B text encoder, Stage 2 1080p 6.72B Refiner DiT, TurboVAED / Wan2.2-TI2V-5B video VAE, and AutoencoderOobleck stereo audio VAE) on TPU v7x-8 across Native JAX, torchax, and torch_tpu (implementation currently on branch [`feat/magi2-preview`](https://github.com/shungcp/diffusers-tpu/tree/feat/magi2-preview); [usage](#run-magi-2-preview--运行-magi-2-preview)). Stage 1 runs Ulysses CP=8 + EP=8 (32 local experts/head/chip) with Pallas Splash+Sink (`V7_SPEC`), MegaCore Dual-TC `gmm_v2` (BF16 and W8A8 E4M3 FP8), and Tokamax Pallas 4-stream mHC. Verified on v7x-8 (10 s audio+video, CFG=2): **Native JAX** Stage 1 `272p BF16` **0.960 s/step**, `540p BF16` **3.18–3.42 s/step** (67.7 GiB peak HBM; T2V / I2V / Ref2VA with synchronized English speech verified), `540p FP8` **3.430 s/step** (42.7 GiB HBM); **Stage 2 `1080p` Refiner** (`1088x1920 @ 25 fps`, 5 steps, 522,752 tokens) accelerated **8.27x lossless** from **87.35 -> 10.56 s/step** (**53.4 s** for 5 steps, `cos=0.999999` vs legacy BF16; opt-in `--refiner-qk-fp8` **10.15 s/step**) via GQA 4-head fused (`bq=512`) + W-coalesced (`bkv=640`) + tail-Q (`bkv=1024`) Pallas kernels and `DP=2 x CP=4` CFG-parallel; **Stage 3a `TurboVAED`** 8-chip chunk-parallel decode cuts 540p warm `1.29 -> 0.72 s` (`1.80x`) and 1080p warm `11.97 -> 3.88 s` (`3.09x`, 100% bit-exact `max|d|=0`); **Stage 0a `Wan2.2` I2V encode** JIT `70.4 s -> 0.29 s` cache-hit (`22.7 ms` warm) and **Stage 0b `Qwen3.5-27B`** static negative-prompt disk cache `20.8 s -> 1.62 ms` (bit-exact); **torchax** matches Native JAX (`272p BF16` **0.960 s/step**, `540p BF16` **3.728 s/step**, `540p FP8` **3.745 s/step**); **torch_tpu** (`torchrun --nproc_per_node 8`) reaches **0.923 / 0.829 s/step** (`272p BF16 / FP8`) and **3.331 / 3.248 s/step** (`540p BF16 / FP8`).
+
+  **2026-11-26** — TPU v7x-8 支持 **MAGI-2-preview**(Sand.ai 113.93B / 5.95B 激活多头潜空间 MoE 一阶段 DiT + 4 流 mHC + Attention Sink、Qwen3.5-27B 文本编码器、二阶段 1080p 6.72B Refiner DiT、TurboVAED / Wan2.2 视频 VAE 与 AutoencoderOobleck 立体声音频 VAE),覆盖原生 JAX、torchax、torch_tpu 三后端(代码正在 [`feat/magi2-preview`](https://github.com/shungcp/diffusers-tpu/tree/feat/magi2-preview) 分支持续优化,[用法](#run-magi-2-preview--运行-magi-2-preview))。一阶段采用 Ulysses CP=8 + EP=8(每卡每头 32 本地专家),结合 Pallas Splash+Sink(`V7_SPEC`)、MegaCore Dual-TC `gmm_v2`(BF16 / W8A8 E4M3 FP8)与 Tokamax Pallas 4 流 mHC。v7x-8 实测(10 秒音视频,CFG=2):**原生 JAX** 一阶段 `272p BF16` **0.960 秒/步**、`540p BF16` **3.18–3.42 秒/步**(峰值 HBM 67.7 GiB,已完成 T2V / I2V / Ref2VA 含同步人声对白端到端验证)、`540p FP8` **3.430 秒/步**(42.7 GiB HBM);**二阶段 `1080p` Refiner**(`1088x1920 @ 25 fps`,5 步,`522,752 tokens`)通过 GQA 4-Head 融合(`bq=512`)+ W 维 5 块合并连续 DMA(`bkv=640`)+ Tail-Q 超块(`bkv=1024`)自研 Pallas 核及 `DP=2 × CP=4` CFG 并行实现 **8.27 倍无损提速**,从 **87.35 降至 10.56 秒/步**(5 步总计 **53.4 秒**,`cos=0.999999`,可选 `--refiner-qk-fp8` **10.15 秒/步**);**Stage 3a `TurboVAED`** 8 芯分片并行解码使 540p 热解码 `1.29 -> 0.72 秒`(`1.80x`)、1080p 热解码 `11.97 -> 3.88 秒`(`3.09x`,100% bit-exact `max|d|=0`);**Stage 0a `Wan2.2` I2V 编码** JIT 后 `70.4 -> 0.29 秒`(热 `22.7 毫秒`),**Stage 0b `Qwen3.5-27B`** 静态负向 prompt 磁盘缓存 `20.8 秒 -> 1.62 毫秒`(bit-exact);**torchax** `272p BF16` **0.960 秒/步**、`540p BF16 / FP8` **3.728 / 3.745 秒/步**;**torch_tpu**(`torchrun --nproc_per_node 8`)达到 `272p BF16 / FP8` **0.923 / 0.829 秒/步**、`540p BF16 / FP8` **3.331 / 3.248 秒/步**。
 - **2026-11-26** — **VideoGym-LTX-2.3** (OpenMOSS `OpenMOSS-Team/VideoGym-LTX-2.3`: LTX-2.3's 22B audio-video DiT post-trained for visual reasoning puzzles, with Gemma-3-12B, the text connectors, the LTX-2 video VAE, the audio VAE and vocoder): image + text to video at the model card's settings, 768x512 (the 512x512 puzzle centered on a black canvas), 129 frames at 24 fps, 30 steps, CFG 3 with spatio-temporal guidance and guidance rescale 0.7. On a v6e-8 a clip takes **15.4 s** end to end (0.47 s a step; 27.6 GiB peak a chip). The DiT and the connectors are native JAX, Gemma-3 and the VAEs run through torchax; in bfloat16 the pipeline's error against the official float32 run is that of the official bfloat16 run (latents 1.8e-2 vs 2.2e-2 after 3 steps, frames 46.6 vs 45.1 dB). The 6,528 video tokens are few and the 44 GB of weights many, so the blocks run sequence parallel instead of tensor parallel (which all-reduces the residual stream four times a block: 1.26 s a forward against 0.39 s): each chip keeps 1/8 of the rows, 20 blocks stay whole on every chip and the other 28 are all-gathered block by block, the self-attention goes through Ulysses all-to-alls and the video-to-audio attention merges per-chip partial softmaxes. Each step is one forward over four rows (negative, positive, positive with STG, positive with the audio/video attentions off): the last row is diffusers' default audio modality guidance (audio CFG 7, modality 3), which the audio, and through it the video, follow ([usage](#run-videogym-ltx-23--运行-videogym-ltx-23)).
 
   **2026-11-26** — 支持 **VideoGym-LTX-2.3**(OpenMOSS `OpenMOSS-Team/VideoGym-LTX-2.3`:LTX-2.3 的 22B 音视频 DiT 在视觉推理谜题上做的后训练,配 Gemma-3-12B、文本 connectors、LTX-2 视频 VAE、音频 VAE 与 vocoder):按模型卡设置图 + 文生视频,768x512(512x512 谜题居中、两侧黑边),129 帧 24 fps,30 步,CFG 3 加时空引导(STG)与 guidance rescale 0.7。v6e-8 上一条端到端 **15.4 秒**(每步 0.47 秒;每 chip 峰值 27.6 GiB)。DiT 与 connectors 为原生 JAX,Gemma-3 和各 VAE 经 torchax 运行;bf16 下对官方 fp32 的误差与官方 bf16 同级(3 步后 latent 1.8e-2 对 2.2e-2,帧 46.6 对 45.1 dB)。视频只有 6528 个 token 而权重有 44 GB,所以各块用序列并行而不是张量并行(张量并行每块要对残差流做四次 all-reduce:每次前向 1.26 秒,序列并行 0.39 秒):每个 chip 持有 1/8 的行,20 个块在每个 chip 上整份常驻,其余 28 个逐块 all-gather,自注意力走 Ulysses all-to-all,视频到音频的注意力合并各 chip 的部分 softmax。每步一次前向、四行(负、正、正 + STG、正且关掉音视频互注意力):最后一行是 diffusers 默认的音频模态引导(音频 CFG 7、modality 3),音频以及通过它的视频都与之一致。
@@ -766,6 +769,52 @@ The adapter is merged into the weights while loading, so the denoising step cost
 The adapters are released under the MiniMax H3 Community License by Pika Labs.
 
 这两个适配器由 Pika Labs 以 MiniMax H3 社区许可证发布。
+
+---
+
+## Run MAGI-2-preview / 运行 MAGI-2-preview
+
+> **Branch status / 分支状态:** MAGI-2-preview code is actively being developed and benchmarked on branch [`feat/magi2-preview`](https://github.com/shungcp/diffusers-tpu/tree/feat/magi2-preview) (`git checkout feat/magi2-preview`) before final merge into `main`.
+>
+> MAGI-2-preview 代码目前在 [`feat/magi2-preview`](https://github.com/shungcp/diffusers-tpu/tree/feat/magi2-preview) 分支持续优化与验证,待全部优化完成后合并至 `main`。
+
+Sand.ai's 113.93B (5.95B active) Multi-Head Latent MoE audio+video model with 4-stream mHC, Attention Sink, Qwen3.5-27B text encoder, Stage 2 1080p 6.72B Refiner, TurboVAED / Wan2.2 video VAE, and AutoencoderOobleck stereo audio VAE. Official resolution presets are `272p` (`256x448`, 12.5 fps), `540p` (`512x896`, 12.5 fps), and `1080p` (`1088x1920`, 25 fps via Stage 2 Refiner).
+
+Sand.ai 113.93B(5.95B 激活)多头潜空间 MoE 音视频生成模型,包含 4 流 mHC、Attention Sink、Qwen3.5-27B 文本编码器、二阶段 1080p 6.72B Refiner、TurboVAED / Wan2.2 视频 VAE 与 AutoencoderOobleck 立体声音频 VAE。官方分辨率预设为 `272p`(`256x448`,12.5 fps)、`540p`(`512x896`,12.5 fps)与 `1080p`(`1088x1920`,二阶段 Refiner 25 fps)。
+
+```bash
+git checkout feat/magi2-preview
+hf download sand-ai/MAGI-2-preview --local-dir /path/to/magi2_preview_weights
+export MAGI2_CKPT_ROOT=/path/to/magi2_preview_weights
+
+# Priority 1: Native JAX (T2V / I2V / Ref2VA, 272p / 540p / 1080p, optional --fp8)
+bash scripts/run_magi2_jax.sh 540p --prompt-file assets/sample_enhanced_t2v.json
+bash scripts/run_magi2_jax.sh 1080p --prompt-file assets/sample_enhanced_t2v.json   # Stage 1 (540p) + Stage 2 Refiner (1080p)
+bash scripts/run_magi2_jax.sh i2v 540p --image ref.png --prompt-file scene.json
+
+# Priority 2: torchax (PyTorch DiT traced through JAX/shard_map/lax.scan)
+bash scripts/run_magi2_torchax.sh 540p --fp8 --prompt "..."
+
+# Priority 3: torch_tpu (8-process torchrun, 1/chip, spmd_safe + Pallas jax_op)
+bash scripts/run_magi2_torchtpu.sh --mode bench --resolution 540p --fp8
+bash scripts/run_magi2_torchtpu.sh --mode denoise --resolution 540p --fp8 --steps 100 \
+  --text-embeds-cache prompt_embeds.npz
+```
+
+| MAGI-2-preview on TPU v7x-8 (10 s, CFG=2) | Native JAX (`feat/magi2-preview`) | torchax | torch_tpu |
+|---|---|---|---|
+| Stage 1 `272p BF16` (`113.93B`, `S=29,664`) | `0.960 s/step` | `0.960 s/step` | **`0.923 s/step`** |
+| Stage 1 `272p FP8-W8A8` | — | `0.963 s/step` | **`0.829 s/step`** |
+| Stage 1 `540p BF16` (`113.93B`, `S=115,680`) | `3.18–3.42 s/step` (`67.7 GiB` HBM) | `3.728 s/step` | **`3.331 s/step`** |
+| Stage 1 `540p FP8-W8A8` | `3.430 s/step` (`42.7 GiB` HBM) | `3.745 s/step` | **`3.248 s/step`** |
+| Stage 2 `1080p` Refiner (`6.72B`, 5 steps, BF16 lossless) | **`10.56 s/step`** (`53.4 s` / 5 steps, **`8.27x`** vs `87.35 s`) | — | — |
+| Stage 2 `1080p` Refiner (`--refiner-qk-fp8`, opt-in) | **`10.15 s/step`** (`50.8 s` warm / 5 steps, **`8.61x`**) | — | — |
+| Stage 3a `TurboVAED` 8-chip sharded decode (`540p` / `1080p` warm) | **`0.72 s`** (`1.80x`) / **`3.88 s`** (`3.09x`, bit-exact) | — | — |
+| Stage 0a `Wan2.2` I2V ref encode / Stage 0b `Qwen3.5` `--uncond-cache` | **`0.29 s`** cache (`22.7 ms` warm) / **`1.62 ms`** disk hit | — | — |
+
+> **Audio note / 音频提示:** For rich synchronized dialogue and Foley, pass an upstream PE-structured JSON/markdown prompt (`dynamic_layer.timeline_segments`) via `--prompt-file`; short visual-only prompts are strongly attenuated by the upstream 429-token `DEFAULT_NEGATIVE_PROMPT` (which includes `music, instrumental`) under `audio_cfg=7.0`. Leave `--adaptive-volume-scaling` off (default) unless you want loud clips attenuated to `-31 dBFS`.
+>
+> 如需清晰同步的人声对白与音效,建议通过 `--prompt-file` 传入官方 PE 结构化 JSON/Markdown 剧本(`dynamic_layer.timeline_segments`);极短的纯画面提示词在 `audio_cfg=7.0` 和官方 429-token 默认负向词(内含 `music, instrumental`)下会被压成近乎静音。默认不开启 `--adaptive-volume-scaling`(仅衰减至 `-31 dBFS`)。
 
 ---
 
