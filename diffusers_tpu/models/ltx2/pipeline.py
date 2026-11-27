@@ -96,7 +96,9 @@ class Generator:
 
   def __init__(self, repo, mesh, height=512, width=768, frames=129, fps=24.0, steps=30,
                guidance=3.0, stg=1.0, rescale=0.7, stg_blocks=(28,), crf=None, resident=None, modality=1.0,
-               audio_guidance=7.0, audio_stg=1.0, audio_modality=3.0, fp8=False, qk_fp8=False):
+               audio_guidance=7.0, audio_stg=1.0, audio_modality=3.0, fp8=False, qk_fp8=False,
+               load_dit=True, load_text=True):
+    import json
     import torch
     import torchax
     from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
@@ -128,21 +130,35 @@ class Generator:
       self.every = self.axis
     self.env = torchax.default_env()
 
-    self.text = text_mod.TextEncoder(os.path.join(snap, "text_encoder"), os.path.join(snap, "tokenizer"),
-                                     dtype=torch.bfloat16, env=self.env, mesh=mesh)
-    cp, self.ccfg = jc.load(os.path.join(snap, "connectors"), jnp.bfloat16)
-    self.cparams = jc.place(cp, mesh, self.every)
-    dp, self.cfg = jd.load(os.path.join(snap, "transformer"), jnp.bfloat16)
-    if resident is None or resident < 0:
-      resident = _default_resident(self.cfg["num_layers"], mesh.shape[self.cfg_axis] if self.cfg_axis else 1)
-    self.resident = min(int(resident), self.cfg["num_layers"])
-    # Blocks kept whole on every chip (evenly spaced): no all-gather for them.
-    res = (set(np.linspace(0, self.cfg["num_layers"] - 1, self.resident).round().astype(int).tolist())
-           if self.resident else set())
-    self.params = jax_sp.place(dp, mesh, self.axis, res, fp8=fp8)
-    del dp
-    self.blocks_fn = jax_sp.make_blocks_fn(mesh, self.cfg, self.params, self.axis, res, stg_blocks,
-                                           cfg_axis=self.cfg_axis, qk_fp8=qk_fp8)
+    if load_text:
+      self.text = text_mod.TextEncoder(os.path.join(snap, "text_encoder"), os.path.join(snap, "tokenizer"),
+                                       dtype=torch.bfloat16, env=self.env, mesh=mesh)
+      cp, self.ccfg = jc.load(os.path.join(snap, "connectors"), jnp.bfloat16)
+      self.cparams = jc.place(cp, mesh, self.every)
+      self._connect = jax.jit(lambda p, h, m: jc.forward(p, self.ccfg, h, m))
+    else:
+      self.text = None
+      self.cparams = None
+      self._connect = None
+
+    if load_dit:
+      dp, self.cfg = jd.load(os.path.join(snap, "transformer"), jnp.bfloat16)
+      if resident is None or resident < 0:
+        resident = _default_resident(self.cfg["num_layers"], mesh.shape[self.cfg_axis] if self.cfg_axis else 1)
+      self.resident = min(int(resident), self.cfg["num_layers"])
+      # Blocks kept whole on every chip (evenly spaced): no all-gather for them.
+      res = (set(np.linspace(0, self.cfg["num_layers"] - 1, self.resident).round().astype(int).tolist())
+             if self.resident else set())
+      self.params = jax_sp.place(dp, mesh, self.axis, res, fp8=fp8)
+      del dp
+      self.blocks_fn = jax_sp.make_blocks_fn(mesh, self.cfg, self.params, self.axis, res, stg_blocks,
+                                             cfg_axis=self.cfg_axis, qk_fp8=qk_fp8)
+    else:
+      with open(os.path.join(snap, "transformer", "config.json")) as f:
+        self.cfg = json.load(f)
+      self.resident = 0
+      self.params = None
+      self.blocks_fn = None
 
     vae = AutoencoderKLLTX2Video.from_pretrained(os.path.join(snap, "vae"), torch_dtype=torch.bfloat16).eval()
     avae = AutoencoderKLLTX2Audio.from_pretrained(os.path.join(snap, "audio_vae"), torch_dtype=torch.bfloat16).eval()
@@ -166,7 +182,6 @@ class Generator:
     # Native JAX decoder, rows split over all chips with on-TPU uint8 conversion (4x smaller PCIe D2H).
     self.w_dec, self._decode = jax_vae.make_decoder(os.path.join(snap, "vae"), mesh, self.every, to_uint8=True)
     self._audio = jax.jit(lambda w, z: f_aud(w, (z,)))
-    self._connect = jax.jit(lambda p, h, m: jc.forward(p, self.ccfg, h, m))
 
     self.lf, self.lh, self.lw = (frames - 1) // 8 + 1, height // 32, width // 32
     self.n_tokens = self.lf * self.lh * self.lw
@@ -179,12 +194,14 @@ class Generator:
     sched.set_timesteps(sigmas=np.linspace(1.0, 1 / steps, steps), mu=mu)
     self.sigmas = sched.sigmas.float().numpy()
     self.timesteps = sched.timesteps.float().numpy()
-    self.rope = jd.ropes(self.cfg, self.lf, self.lh, self.lw, fps, self.audio_frames)
+    self.rope = jd.ropes(self.cfg, self.lf, self.lh, self.lw, fps, self.audio_frames) if load_dit else None
     idx = np.ones((self.n_tokens,), np.int32)
     idx[:self.lh * self.lw] = 0  # latent frame 0 is the image (t = 0)
+    self.token_t_np = idx
+    self.first_np = (idx == 0).astype(np.float32)[None, :, None]
     self.token_t = self._put(idx)
-    self.first = self._put((idx == 0).astype(np.float32)[None, :, None])
-    self._step = jax.jit(self._step_fn)
+    self.first = self._put(self.first_np)
+    self._step = jax.jit(self._step_fn) if load_dit else None
 
   def _put(self, a, spec=None):
     from jax.sharding import NamedSharding
@@ -343,6 +360,8 @@ def main():
                  help="CFG-parallel groups over the 4 DiT rows (default: auto = 4 on v7x, 2 on a v6e-8)")
   p.add_argument("--fp8", action="store_true", help="Quantize large DiT block linears to v7x float8_e4m3fn (W8A8)")
   p.add_argument("--qk-fp8", action="store_true", help="Cast Q and K to float8_e4m3fn inside Pallas splash attention")
+  p.add_argument("--encode-only", default="", help="Stage 0 only: save conditioning + initial noise to .npz and exit (skips DiT)")
+  p.add_argument("--decode-latents", default="", help="Stage 3 only: decode denoised latents .npz to --output mp4 (skips text & DiT)")
   p.add_argument("--output", default="ltx2.mp4")
   p.add_argument("--compile-cache-dir", default="~/.cache/ltx2_jax")
   args = p.parse_args()
@@ -366,12 +385,52 @@ def main():
   else:
     mesh = Mesh(mesh_utils.create_device_mesh((n,)), ("sp",))
     print(f"mesh: {n} devices (1-D sp)", flush=True)
+
+  load_dit = not (args.encode_only or args.decode_latents)
+  load_text = not bool(args.decode_latents)
   t0 = time.perf_counter()
   gen = Generator(args.repo, mesh, height=args.height, width=args.width, frames=args.frames, fps=args.fps,
                   steps=args.steps, guidance=args.guidance, stg=args.stg, rescale=args.rescale, crf=args.crf,
-                  resident=args.resident, fp8=args.fp8, qk_fp8=args.qk_fp8)
+                  resident=args.resident, fp8=args.fp8, qk_fp8=args.qk_fp8,
+                  load_dit=load_dit, load_text=load_text)
   print(f"load: {time.perf_counter() - t0:.1f}s (resident={gen.resident}, fp8={args.fp8}, qk_fp8={args.qk_fp8})",
         flush=True)
+
+  if args.encode_only:
+    t0 = time.perf_counter()
+    image = Image.open(args.image).convert("RGB")
+    ctx, actx = gen.conditioning(args.prompt, args.negative_prompt)
+    z0 = gen.image_latent(image)
+    x, a = gen.noise(args.seed, z0)
+    os.makedirs(os.path.dirname(os.path.abspath(args.encode_only)), exist_ok=True)
+    np.savez(
+        args.encode_only,
+        ctx=np.asarray(ctx, dtype=np.float32),
+        actx=np.asarray(actx, dtype=np.float32),
+        x=np.asarray(x, dtype=np.float32),
+        a=np.asarray(a, dtype=np.float32),
+        sigmas=gen.sigmas.astype(np.float32),
+        token_t=gen.token_t_np.astype(np.int32),
+        first=gen.first_np.astype(np.float32),
+        lf=np.int32(gen.lf),
+        lh=np.int32(gen.lh),
+        lw=np.int32(gen.lw),
+        fps=np.float32(gen.fps),
+    )
+    print(f"wrote Stage 0 conditioning to {args.encode_only} in {time.perf_counter() - t0:.2f}s", flush=True)
+    return
+
+  if args.decode_latents:
+    t0 = time.perf_counter()
+    lat = np.load(args.decode_latents, allow_pickle=False)
+    x_j = gen._put(np.asarray(lat["x"], dtype=np.float32))
+    a_j = gen._put(np.asarray(lat["a"], dtype=np.float32))
+    frames, wave = gen.decode(x_j, a_j)
+    save_mp4(args.output, frames, wave, args.fps, gen.sample_rate)
+    print(f"decoded {args.decode_latents} -> {args.output} in {time.perf_counter() - t0:.2f}s "
+          f"({frames.shape}, {wave.shape[-1] / gen.sample_rate:.2f} s audio)", flush=True)
+    return
+
   image = Image.open(args.image).convert("RGB")
   for i in range(args.runs):
     t0 = time.perf_counter()
