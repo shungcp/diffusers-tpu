@@ -148,3 +148,48 @@ Measured on `v7x-8` (`torch_tpu 0.2.0`, `libtpu 0.0.52`, fresh OS processes with
 - **Storage & compression notes (`dedup_stats.py`)**:
   - Sharing one `rank 0` archive across all 8 ranks (`3dcddf3`) cuts `DT_AOT_PERSIST` disk usage by **8×** immediately (`H3 t2va` `829.3 MiB -> 105.5 MiB`; `H3-Image 2K+4K` `2,645.7 MiB -> 330.7 MiB`).
   - Because `save_compiled_function` embeds uncompressed PJRT executable bytes inside a Python pickle, plain `zstd -3` (4 MiB window) only achieves `~4.4×`, whereas **`zstd -3 --long=27`** (128 MiB window) compresses single rank-0 files by **`16×–25×`** (`330.7 MiB -> 13.4 MiB` on `H3-Image 2K+4K`) and **FastCDC `1 KiB` + `zstd --long=27`** compresses cross-shape archives down to **`9.76 MiB`** (`33.9×` on rank-0; `164.9×–329.5×` if per-rank copies were stored).
+
+---
+
+## 8. `VideoGym-LTX-2.3` (22B Audio-Video DiT) on TPU `v7x-8` / `VideoGym-LTX-2.3` 在 `v7x-8` 上的优化台账
+
+Verified on `v7x-8` (`jax 0.12.0.1`, `diffusers 0.42.0.dev0`, `libtpu 0.0.52`, `94.74 GiB` HBM/device) against the `v6e-8` handoff baseline (`3aa98c9`: `15.03 s` E2E, `481 ms/fwd`, native JAX video decoder) at official model-card settings (`768×512×129 @ 24 fps`, `5.33 s` clip, 30 Euler steps, 4 CFG/STG/Modality rows, `maze_canvas.png`).
+
+### 8.1 Single-Forward DiT Sweep (`rows=4`, `6,528` video + `134` audio + `1,024` text tokens)
+
+| Configuration (`v7x-8` vs `v6e-8`) | Mean / Min (ms/fwd) | DiT HBM | xplane 2-fwd Breakdown (`overlap.py`) | Parity vs `1×8 BF16` |
+| :--- | :---: | :---: | :--- | :--- |
+| `v6e-8` baseline (`1×8, resident=20`, BF16) | `481.0` | `18.0 GiB` | compute `314`, AG `126` (`0` overlap), idle `35` | — |
+| `v7x-8` `1×8, resident=48`, BF16 | **`250.6 / 249.3`** (`1.92×`) | `35.65 GiB` | `window 493: compute 446, comm 0, idle 47` | ref |
+| `v7x-8` `2×4, resident=48`, BF16 | `254.8 / 253.4` | `35.64 GiB` | `window 500: compute 444, comm 2, idle 54` | `vid 7.66e-3, aud 1.51e-2` |
+| **`v7x-8` `4×2` (`cfg=4, sp=2`), `resident=48`, BF16 (auto default)** | **`207.2 / 206.0`** (**`2.33×`**) | `35.63 GiB` | **`window 407: compute 390 (95.8% util), comm 9, idle 8`** | `vid 7.73e-3, aud 1.90e-2` |
+| `v7x-8` `1×8, resident=48`, FP8-W8A8 | `228.9 / 226.4` (`2.10×`) | `18.44 GiB` | — | `vid 2.33e-2, aud 7.26e-2` |
+| **`v7x-8` `4×2, resident=48`, FP8-W8A8 (`--fp8`)** | **`184.4 / 182.2`** (**`2.64×`**) | **`18.41 GiB`** | **`window 358: compute 333 (93.0% util), comm 9, idle 16`** | `vid 2.33e-2, aud 7.27e-2` |
+| `v7x-8` `4×2, resident=48`, FP8 + `--qk-fp8` | `183.1 / 180.8` | `18.41 GiB` | `-1.3 ms` vs `--fp8` alone (negligible gain) | — |
+
+- **8-virtual-device CPU FP32 exactness**: `1×8` (`vid_rel=2.21e-7`), `2×4` (`2.19e-7`), `4×2` (`2.80e-7`) all match single-device `jax_dit.forward` to FP32 machine epsilon.
+- **Why `4×2` (`cfg=4, sp=2`) beats `1×8` by `21%` on `v7x-8` (`250.6 -> 206.0 ms/fwd`, 100% lossless)**:
+  1. `mesh_utils.create_device_mesh((4, 2))` places `sp=2` across the **2 logical cores of the same physical `v7x` chip**, keeping all 240 collectives per forward (Ulysses `all_to_all` + `v2a` `pmax`/`psum`) **100% intra-chip** (zero inter-chip ICI during all 48 DiT blocks; `idle` drops `47 -> 8 ms`).
+  2. Each core runs `B=1` row instead of `B=4`, cutting redundant audio-stream (`audio_attn1/2`, `audio_ff`, `v2a`) and text K/V projection (`attn2.to_k/v`) compute by **`4×`** (`compute` drops `223 -> 195 ms/fwd`).
+
+### 8.2 Full 30-Step End-to-End Maze Pipeline (`768×512×129 @ 24 fps`, `5.33 s` video + audio)
+
+| Configuration | Warm E2E (s) | Encode (s) | Denoise (30 steps) | Decode (s) | Peak HBM | Load (s) | 30-Step Maze QA |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+| `v6e-8` (`3aa98c9`, `1×8, res=20`, BF16) | `15.03` | `0.08` | `14.10` (`0.470/step`) | `0.84` | `27.6 GiB` | — | Maze solved |
+| `v7x-8` `1×8, res=48`, BF16 (CPU `uint8` decode) | `8.79` (`1.71×`) | `0.04` | `7.37` (`0.246/step`) | `1.39` | `44.2 GiB` | `48.0` | Ref (`v7x` `1×8`) |
+| `v7x-8` `4×2, res=48`, BF16 (CPU `uint8` decode) | `7.19` (`2.09×`) | `0.04` | `6.07` (`0.202/step`) | `1.08` | `44.2 GiB` | `50.7` | **`PSNR = 45.51 dB`** vs `1×8` |
+| **`v7x-8` `4×2, res=48`, BF16 (auto default, on-TPU `uint8` decode)** | **`6.60`** (**`2.28×`**) | `0.04` | **`6.06`** (`0.202/step`) | **`0.49`** | `44.2 GiB` | `48–51` | **Byte-exact MP4** (`209,797 B`) vs CPU `uint8`; **`45.51 dB`** vs `1×8` |
+| **`v7x-8` `4×2, res=48`, `--fp8` (on-TPU FP8 load + on-TPU `uint8` decode)** | **`5.82`** (**`2.58×`**) | `0.04` | **`5.29`** (**`0.176/step`**) | **`0.49`** | **`27.0 GiB`** | **`44.3`** (`4.95×` vs `219 s` CPU quant) | **`PSNR = 40.00 dB`** vs `1×8`; visually indistinguishable maze solve; warm cache `run 0 = 29.64 s` |
+
+- **Decode breakdown (`0.493 s` total)**: native JAX `uint8` video decoder (`jax_vae.make_decoder(..., to_uint8=True)`, cutting PCIe D2H `4×` from `608 -> 152 MB` and eliminating CPU `np.round`) takes **`0.262 s` (`min 0.255 s`, `506 FPS`!)** + torchax audio VAE/vocoder **`0.231 s` (`min 0.230 s`)**.
+
+### 8.3 `c947` Open Question on `v7x-8` (`1×8, resident=20`, BF16)
+
+| Experiment (`resident=20` on `v7x-8`) | HLO Collectives | Mean (ms/fwd) | HBM | xplane 2-fwd (`overlap.py`) | Verdict |
+| :--- | :--- | :---: | :---: | :--- | :--- |
+| Baseline (default flags, 34 `all_gather`/block) | `all-gather=952, all-gather-start=0, all-to-all-start=192` | **`296.3`** (`min 293.8`) | `18.03 GiB` | `window 588: compute 311, comm 549, overlap 287 (92.3%!), exposed 262, idle 14` | **`v7x` backend overlaps 92.3% of compute even without HLO `all-gather-start`** (`+45.7 ms` vs `res=48`, unlike `+126 ms` zero-overlap on `v6e`) |
+| Packed `--prefetch` (1 flat `all_gather`/block hoisted to block `i`) | `all-gather=28, all-gather-start=0, all-to-all-start=192` | `413.9` | `22.65 GiB` | `window 817: compute 491, comm 221, overlap 107, exposed 114, idle 213` | **Slower (`+117.6 ms`)**: packing/slicing added `+180 ms` compute & `+200 ms` idle — dropped |
+| `--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true` | `FAILED_PRECONDITION` (`only supported on TPU v5e`) | — | — | — | **Unsupported on `v7x` as well as `v6e`** |
+| `--xla_tpu_enable_ici_ag_pipelining=true` + prefetch | `all-gather=28, all-gather-start=0` | `414.3` | `22.65 GiB` | No delta | No effect |
+
