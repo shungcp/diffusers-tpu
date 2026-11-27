@@ -74,11 +74,26 @@ def _vae_modules(vae, audio_vae, vocoder):
   return Enc(vae), Audio(audio_vae, vocoder)
 
 
+def _is_high_hbm():
+  """True on high-HBM chips (v7x: 95 GiB/device), False on v6e (32 GiB)."""
+  try:
+    d0 = jax.devices()[0]
+    limit = d0.memory_stats().get("bytes_limit", 0)
+    return limit >= 64 * (1 << 30) or "7x" in getattr(d0, "device_kind", "").lower()
+  except Exception:  # noqa: BLE001
+    return False
+
+
+def _default_resident(num_layers):
+  """Keep all blocks whole on high-HBM chips (v7x: 95 GiB -> 48), else 20 (v6e: 32 GiB)."""
+  return num_layers if _is_high_hbm() else min(20, num_layers)
+
+
 class Generator:
 
   def __init__(self, repo, mesh, height=512, width=768, frames=129, fps=24.0, steps=30,
-               guidance=3.0, stg=1.0, rescale=0.7, stg_blocks=(28,), crf=None, resident=20, modality=1.0,
-               audio_guidance=7.0, audio_stg=1.0, audio_modality=3.0):
+               guidance=3.0, stg=1.0, rescale=0.7, stg_blocks=(28,), crf=None, resident=None, modality=1.0,
+               audio_guidance=7.0, audio_stg=1.0, audio_modality=3.0, fp8=False, qk_fp8=False):
     import torch
     import torchax
     from diffusers import AutoencoderKLLTX2Audio, AutoencoderKLLTX2Video, FlowMatchEulerDiscreteScheduler
@@ -99,18 +114,32 @@ class Generator:
     self.crf = crf
     self.times = {}
     self.keep_steps = False  # tests: keep every step's packed video latents in .record
-    self.axis = mesh.axis_names[0]  # 1-D mesh: the video rows split over it (jax_sp)
+    if len(mesh.axis_names) == 2:
+      self.cfg_axis, self.axis = mesh.axis_names[0], mesh.axis_names[1]
+      self.every = tuple(mesh.axis_names)
+      assert self.rows % mesh.shape[self.cfg_axis] == 0, (
+          f"rows={self.rows} must be divisible by cfg mesh axis size {mesh.shape[self.cfg_axis]}"
+      )
+    else:
+      self.cfg_axis, self.axis = None, mesh.axis_names[0]
+      self.every = self.axis
     self.env = torchax.default_env()
 
     self.text = text_mod.TextEncoder(os.path.join(snap, "text_encoder"), os.path.join(snap, "tokenizer"),
                                      dtype=torch.bfloat16, env=self.env, mesh=mesh)
     cp, self.ccfg = jc.load(os.path.join(snap, "connectors"), jnp.bfloat16)
-    self.cparams = jc.place(cp, mesh, self.axis)
+    self.cparams = jc.place(cp, mesh, self.every)
     dp, self.cfg = jd.load(os.path.join(snap, "transformer"), jnp.bfloat16)
+    if resident is None or resident < 0:
+      resident = _default_resident(self.cfg["num_layers"])
+    self.resident = min(int(resident), self.cfg["num_layers"])
     # Blocks kept whole on every chip (evenly spaced): no all-gather for them.
-    res = set(np.linspace(0, self.cfg["num_layers"] - 1, resident).round().astype(int).tolist()) if resident else set()
-    self.blocks_fn = jax_sp.make_blocks_fn(mesh, self.cfg, dp, self.axis, res, stg_blocks)
-    self.params = jax_sp.place(dp, mesh, self.axis, res)
+    res = (set(np.linspace(0, self.cfg["num_layers"] - 1, self.resident).round().astype(int).tolist())
+           if self.resident else set())
+    self.params = jax_sp.place(dp, mesh, self.axis, res, fp8=fp8)
+    del dp
+    self.blocks_fn = jax_sp.make_blocks_fn(mesh, self.cfg, self.params, self.axis, res, stg_blocks,
+                                           cfg_axis=self.cfg_axis, qk_fp8=qk_fp8)
 
     vae = AutoencoderKLLTX2Video.from_pretrained(os.path.join(snap, "vae"), torch_dtype=torch.bfloat16).eval()
     avae = AutoencoderKLLTX2Audio.from_pretrained(os.path.join(snap, "audio_vae"), torch_dtype=torch.bfloat16).eval()
@@ -131,8 +160,8 @@ class Generator:
     (self.w_enc, f_enc), (self.w_aud, f_aud) = (_extract(m) for m in (enc, aud))
     self.w_enc, self.w_aud = (jax.tree.map(self._put, w) for w in (self.w_enc, self.w_aud))
     self._encode = jax.jit(lambda w, x: f_enc(w, (x,)))
-    # Native JAX decoder, rows split over the chips (the torchax-traced one compiled for ~140 s).
-    self.w_dec, self._decode = jax_vae.make_decoder(os.path.join(snap, "vae"), mesh, self.axis)
+    # Native JAX decoder, rows split over all chips with on-TPU uint8 conversion (4x smaller PCIe D2H).
+    self.w_dec, self._decode = jax_vae.make_decoder(os.path.join(snap, "vae"), mesh, self.every, to_uint8=True)
     self._audio = jax.jit(lambda w, z: f_aud(w, (z,)))
     self._connect = jax.jit(lambda p, h, m: jc.forward(p, self.ccfg, h, m))
 
@@ -253,8 +282,7 @@ class Generator:
   def decode(self, x, a):
     lat = np.asarray(x).transpose(0, 2, 1).reshape(1, 128, self.lf, self.lh, self.lw)
     lat = lat * self.vae_std.reshape(1, -1, 1, 1, 1) / self.vae_scaling + self.vae_mean.reshape(1, -1, 1, 1, 1)
-    video = np.asarray(self._decode(self.w_dec, self._put(jnp.asarray(lat, jnp.bfloat16))).astype(jnp.float32))[0]
-    frames = np.round(np.clip((video + 1) / 2, 0, 1) * 255).astype(np.uint8)  # [F, H, W, 3]
+    frames = np.asarray(self._decode(self.w_dec, self._put(jnp.asarray(lat, jnp.bfloat16)))[0])  # [F, H, W, 3] uint8
     al = np.asarray(a) * self.audio_std + self.audio_mean
     al = al.reshape(1, self.audio_frames, self.audio_channels, self.latent_mel).transpose(0, 2, 1, 3)
     wave = np.asarray(self._audio(self.w_aud, self._put(jnp.asarray(al, jnp.bfloat16))).astype(jnp.float32))[0]
@@ -306,7 +334,12 @@ def main():
   p.add_argument("--crf", type=int, default=None, help="image re-compression (default 33; 0 = off)")
   p.add_argument("--seed", type=int, default=10)
   p.add_argument("--runs", type=int, default=1)
-  p.add_argument("--resident", type=int, default=20, help="DiT blocks kept whole on every chip (the rest gathered)")
+  p.add_argument("--resident", type=int, default=None,
+                 help="DiT blocks kept whole on every chip (default: auto = 48 on v7x, 20 on v6e)")
+  p.add_argument("--cfg-parallel", type=int, default=None, choices=(1, 2, 4),
+                 help="CFG-parallel groups over the 4 DiT rows (default: auto = 4 on v7x, 1 on v6e)")
+  p.add_argument("--fp8", action="store_true", help="Quantize large DiT block linears to v7x float8_e4m3fn (W8A8)")
+  p.add_argument("--qk-fp8", action="store_true", help="Cast Q and K to float8_e4m3fn inside Pallas splash attention")
   p.add_argument("--output", default="ltx2.mp4")
   p.add_argument("--compile-cache-dir", default="~/.cache/ltx2_jax")
   args = p.parse_args()
@@ -318,13 +351,23 @@ def main():
     jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
     jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
   n = len(jax.devices())
-  mesh = Mesh(mesh_utils.create_device_mesh((n,)), ("sp",))
-  print(f"mesh: {n} chips, video rows split over them", flush=True)
+  cp = args.cfg_parallel
+  if cp is None:
+    cp = 4 if (_is_high_hbm() and n >= 4 and n % 4 == 0) else 1
+  if cp > 1:
+    assert n % cp == 0, f"cfg_parallel={cp} must divide device count {n}"
+    sp = n // cp
+    mesh = Mesh(mesh_utils.create_device_mesh((cp, sp)), ("cfg", "sp"))
+    print(f"mesh: {n} devices ({cp} cfg x {sp} sp)", flush=True)
+  else:
+    mesh = Mesh(mesh_utils.create_device_mesh((n,)), ("sp",))
+    print(f"mesh: {n} devices (1-D sp)", flush=True)
   t0 = time.perf_counter()
   gen = Generator(args.repo, mesh, height=args.height, width=args.width, frames=args.frames, fps=args.fps,
                   steps=args.steps, guidance=args.guidance, stg=args.stg, rescale=args.rescale, crf=args.crf,
-                  resident=args.resident)
-  print(f"load: {time.perf_counter() - t0:.1f}s", flush=True)
+                  resident=args.resident, fp8=args.fp8, qk_fp8=args.qk_fp8)
+  print(f"load: {time.perf_counter() - t0:.1f}s (resident={gen.resident}, fp8={args.fp8}, qk_fp8={args.qk_fp8})",
+        flush=True)
   image = Image.open(args.image).convert("RGB")
   for i in range(args.runs):
     t0 = time.perf_counter()

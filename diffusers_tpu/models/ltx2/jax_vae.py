@@ -107,19 +107,28 @@ def decode(params, config, z, cst=lambda t: t):
   return x
 
 
-def make_decoder(vae_dir, mesh=None, axis=None, dtype=jnp.bfloat16):
-  """(params on the mesh, jitted decode(params, z) -> [B, F, H, W, 3])."""
+def make_decoder(vae_dir, mesh=None, axis=None, dtype=jnp.bfloat16, to_uint8=False):
+  """(params on the mesh, jitted decode(params, z) -> [B, F, H, W, 3]).
+  When ``to_uint8=True``, clips and rounds to uint8 on TPU (4x smaller PCIe D2H)."""
   from jax.sharding import NamedSharding
   from jax.sharding import PartitionSpec as P
 
   params, config = load(vae_dir, dtype)
+
+  def _run(prm, z, cst=lambda t: t):
+    y = decode(prm, config, z, cst)
+    if to_uint8:
+      return jnp.round(jnp.clip((y.astype(jnp.float32) + 1.0) * 0.5, 0.0, 1.0) * 255.0).astype(jnp.uint8)
+    return y
+
   if mesh is None:
-    return params, jax.jit(lambda prm, z: decode(prm, config, z))
+    return params, jax.jit(_run)
   rep = NamedSharding(mesh, P())
   params = jax.tree.map(lambda v: jax.device_put(v, rep), params)
+  n_axis = int(np.prod([mesh.shape[a] for a in axis])) if isinstance(axis, tuple) else mesh.shape[axis]
   rows = NamedSharding(mesh, P(None, None, axis, None, None))
-  cst = lambda t: jax.lax.with_sharding_constraint(t, rows) if t.shape[2] % mesh.shape[axis] == 0 else t
-  return params, jax.jit(lambda prm, z: decode(prm, config, z, cst))
+  cst = lambda t: jax.lax.with_sharding_constraint(t, rows) if t.shape[2] % n_axis == 0 else t
+  return params, jax.jit(lambda prm, z: _run(prm, z, cst))
 
 
 def _check(vae_dir, frames=3, height=4, width=6):
