@@ -62,9 +62,13 @@ Measured, judged not worth the complexity at the time, and left here for anyone 
 
   **把每块的权重 all-gather 与计算重叠(v6e-8:最多约占一步的 27%)。** 48 块中常驻 20 块时,4 行前向 481 ms:计算 314 ms,all-gather 126 ms 且与计算零重叠,空闲 35 ms。试过的各组 libtpu flag 下 XLA 都把 all-gather 保持为同步(HLO 中 952 个普通 `all-gather`);all-gather continuation fusion 的 flag 在 v6e 上不支持。下一步可试手动在第 i 块里提前 gather 第 i+1 块。v7x 上 48 块都能整份放进每个 device,没有需要 gather 的。
 
-- **More resident blocks (28: 4-row forward 481 -> 449 ms).** The DiT alone peaks at 23.1 GiB a chip with 28 resident blocks, which does not leave room on a 32 GB v6e chip for Gemma-3 and the 129-frame VAE decode (27.6 GiB peak with 20).
+- **Weight gathers as collective-permute rings instead (tried, slower).** The permutes do run async (244 ms of overlap in two forwards), but a ring of them moves the weights at half the all-gather's speed: 613 ms (one way, 7 hops) / 580 ms (both ways, 4 hops, chunks written in place) against 481 ms. Code on the local branch `exp/ltx-ring-gather`.
 
-  **更多常驻块(28 块:4 行前向 481 -> 449 ms)。** 常驻 28 块时仅 DiT 每 chip 峰值 23.1 GiB,32 GB 的 v6e chip 上放不下 Gemma-3 和 129 帧 VAE 解码(常驻 20 块时峰值 27.6 GiB)。
+  **改用 collective-permute 环做权重 gather(试过,更慢)。** permute 确实异步(两次前向重叠 244 ms),但环形搬权重只有 all-gather 一半的速度:613 ms(单向 7 跳)/ 580 ms(双向 4 跳、直接写入目标位置),对 481 ms。代码在本地分支 `exp/ltx-ring-gather`。
+
+- **More resident blocks (24: end to end 15.39 -> 15.15 s at 29.4 GiB peak, 1.8 GB short of the limit; 28: 4-row forward 481 -> 449 ms).** The DiT alone peaks at 23.1 GiB a chip with 28 resident blocks, which does not leave room on a 32 GB v6e chip for Gemma-3 and the 129-frame VAE decode (27.6 GiB peak with 20).
+
+  **更多常驻块(24 块:端到端 15.39 -> 15.15 秒,峰值 29.4 GiB,离上限只剩 1.8 GB;28 块:4 行前向 481 -> 449 ms)。** 常驻 28 块时仅 DiT 每 chip 峰值 23.1 GiB,32 GB 的 v6e chip 上放不下 Gemma-3 和 129 帧 VAE 解码(常驻 20 块时峰值 27.6 GiB)。
 
 ## How these were found / 怎么找到的
 
