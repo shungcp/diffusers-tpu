@@ -84,9 +84,12 @@ def _is_high_hbm():
     return False
 
 
-def _default_resident(num_layers):
-  """Keep all blocks whole on high-HBM chips (v7x: 95 GiB -> 48), else 20 (v6e: 32 GiB)."""
-  return num_layers if _is_high_hbm() else min(20, num_layers)
+def _default_resident(num_layers, cfg_groups=1):
+  """Keep all blocks whole on high-HBM chips (v7x: 95 GiB -> 48); on v6e (32 GiB) 20 on one group,
+  16 with two CFG groups (each chip then holds 1/4 instead of 1/8 of the gathered blocks)."""
+  if _is_high_hbm():
+    return num_layers
+  return min(16 if cfg_groups > 1 else 20, num_layers)
 
 
 class Generator:
@@ -131,7 +134,7 @@ class Generator:
     self.cparams = jc.place(cp, mesh, self.every)
     dp, self.cfg = jd.load(os.path.join(snap, "transformer"), jnp.bfloat16)
     if resident is None or resident < 0:
-      resident = _default_resident(self.cfg["num_layers"])
+      resident = _default_resident(self.cfg["num_layers"], mesh.shape[self.cfg_axis] if self.cfg_axis else 1)
     self.resident = min(int(resident), self.cfg["num_layers"])
     # Blocks kept whole on every chip (evenly spaced): no all-gather for them.
     res = (set(np.linspace(0, self.cfg["num_layers"] - 1, self.resident).round().astype(int).tolist())
@@ -335,9 +338,9 @@ def main():
   p.add_argument("--seed", type=int, default=10)
   p.add_argument("--runs", type=int, default=1)
   p.add_argument("--resident", type=int, default=None,
-                 help="DiT blocks kept whole on every chip (default: auto = 48 on v7x, 20 on v6e)")
+                 help="DiT blocks kept whole on every chip (default: auto = 48 on v7x, 16 on a v6e-8)")
   p.add_argument("--cfg-parallel", type=int, default=None, choices=(1, 2, 4),
-                 help="CFG-parallel groups over the 4 DiT rows (default: auto = 4 on v7x, 1 on v6e)")
+                 help="CFG-parallel groups over the 4 DiT rows (default: auto = 4 on v7x, 2 on a v6e-8)")
   p.add_argument("--fp8", action="store_true", help="Quantize large DiT block linears to v7x float8_e4m3fn (W8A8)")
   p.add_argument("--qk-fp8", action="store_true", help="Cast Q and K to float8_e4m3fn inside Pallas splash attention")
   p.add_argument("--output", default="ltx2.mp4")
@@ -353,7 +356,8 @@ def main():
   n = len(jax.devices())
   cp = args.cfg_parallel
   if cp is None:
-    cp = 4 if (_is_high_hbm() and n >= 4 and n % 4 == 0) else 1
+    # v7x: 4 groups x 2; v6e-8: 2 groups x 4 (13.9 vs 14.8 s with 16 / 20 resident blocks).
+    cp = 4 if (_is_high_hbm() and n >= 4 and n % 4 == 0) else (2 if n >= 8 and n % 2 == 0 else 1)
   if cp > 1:
     assert n % cp == 0, f"cfg_parallel={cp} must divide device count {n}"
     sp = n // cp
