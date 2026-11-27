@@ -21,7 +21,7 @@ diffusers_tpu/
     wan_vae/          Wan2.1 video VAE (whole clip or chunked in time) and Wan2.2 decoder in JAX (shared)
     mova/             MOVA: JAX video experts + audio tower + bridge, TI2VA pipeline
     omnivae/          OmniVAE T2AV: JAX Z-Image video / audio towers + bridges, Qwen3.5 text, pipeline
-    ltx2/             VideoGym-LTX-2.3: JAX DiT (sequence parallel) + connectors, torchax Gemma-3 / VAEs, pipeline
+    ltx2/             VideoGym-LTX-2.3: JAX DiT (sequence parallel), connectors, video decoder; torchax Gemma-3 / encoder / audio, pipeline
 ```
 
 ## Recommended order for a new diffusers model

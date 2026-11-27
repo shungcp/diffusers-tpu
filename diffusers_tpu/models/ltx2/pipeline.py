@@ -10,7 +10,7 @@
                                        + (modality - 1)(x0_pos - x0_iso)
         video: cfg 3, stg 1, modality 1; audio (diffusers' defaults): cfg 7, stg 1, modality 3
         g <- rescale(g, x0_pos, 0.7);  v = (x - g) / sigma
-    -> LTX-2 video VAE decode, audio VAE decode + vocoder (torchax)
+    -> LTX-2 video VAE decode (JAX, rows over the chips), audio VAE decode + vocoder (torchax)
 
 Everything follows diffusers' ``LTX2ImageToVideoPipeline`` (0.42) with the
 VideoGym model card's settings; the noise comes from a CPU
@@ -29,6 +29,7 @@ import numpy as np
 from diffusers_tpu.models.ltx2 import jax_connectors as jc
 from diffusers_tpu.models.ltx2 import jax_dit as jd
 from diffusers_tpu.models.ltx2 import jax_sp
+from diffusers_tpu.models.ltx2 import jax_vae
 from diffusers_tpu.models.ltx2 import text as text_mod
 
 REPO = "OpenMOSS-Team/VideoGym-LTX-2.3"
@@ -61,15 +62,6 @@ def _vae_modules(vae, audio_vae, vocoder):
     def forward(self, x):
       return self.v.encode(x).latent_dist.mode()
 
-  class Dec(torch.nn.Module):
-
-    def __init__(self, v):
-      super().__init__()
-      self.v = v
-
-    def forward(self, z):
-      return self.v.decode(z, return_dict=False)[0]
-
   class Audio(torch.nn.Module):
 
     def __init__(self, a, voc):
@@ -79,7 +71,7 @@ def _vae_modules(vae, audio_vae, vocoder):
     def forward(self, z):
       return self.voc(self.a.decode(z, return_dict=False)[0])
 
-  return Enc(vae), Dec(vae), Audio(audio_vae, vocoder)
+  return Enc(vae), Audio(audio_vae, vocoder)
 
 
 class Generator:
@@ -135,17 +127,16 @@ class Generator:
     temporal = getattr(avae, "temporal_compression_ratio", 4)
     per_second = avae.config.sample_rate / avae.config.mel_hop_length / float(temporal)
     self.audio_frames = round(frames / fps * per_second)
-    enc, dec, aud = _vae_modules(vae, avae, voc)
-    (self.w_enc, f_enc), (self.w_dec, f_dec), (self.w_aud, f_aud) = (_extract(m) for m in (enc, dec, aud))
-    self.w_enc, self.w_dec, self.w_aud = (jax.tree.map(self._put, w) for w in (self.w_enc, self.w_dec, self.w_aud))
+    enc, aud = _vae_modules(vae, avae, voc)
+    (self.w_enc, f_enc), (self.w_aud, f_aud) = (_extract(m) for m in (enc, aud))
+    self.w_enc, self.w_aud = (jax.tree.map(self._put, w) for w in (self.w_enc, self.w_aud))
     self._encode = jax.jit(lambda w, x: f_enc(w, (x,)))
-    self._decode = jax.jit(lambda w, z: f_dec(w, (z,)))
+    # Native JAX decoder, rows split over the chips (the torchax-traced one compiled for ~140 s).
+    self.w_dec, self._decode = jax_vae.make_decoder(os.path.join(snap, "vae"), mesh, self.axis)
     self._audio = jax.jit(lambda w, z: f_aud(w, (z,)))
     self._connect = jax.jit(lambda p, h, m: jc.forward(p, self.ccfg, h, m))
 
     self.lf, self.lh, self.lw = (frames - 1) // 8 + 1, height // 32, width // 32
-    n = mesh.shape[self.axis]
-    self._wide = P(None, None, None, None, self.axis) if self.lw % n == 0 else None
     self.n_tokens = self.lf * self.lh * self.lw
     sched = FlowMatchEulerDiscreteScheduler.from_pretrained(os.path.join(snap, "scheduler"))
     from diffusers.pipelines.ltx2.pipeline_ltx2 import calculate_shift
@@ -262,11 +253,8 @@ class Generator:
   def decode(self, x, a):
     lat = np.asarray(x).transpose(0, 2, 1).reshape(1, 128, self.lf, self.lh, self.lw)
     lat = lat * self.vae_std.reshape(1, -1, 1, 1, 1) / self.vae_scaling + self.vae_mean.reshape(1, -1, 1, 1, 1)
-    # Split over the chips by latent columns (XLA partitions the convolutions spatially): replicated, the
-    # 129-frame decode does not fit beside the DiT.
-    z = self._put(jnp.asarray(lat, jnp.bfloat16), self._wide)
-    video = np.asarray(self._decode(self.w_dec, z).astype(jnp.float32))[0]
-    frames = np.round(np.clip((video + 1) / 2, 0, 1) * 255).astype(np.uint8).transpose(1, 2, 3, 0)
+    video = np.asarray(self._decode(self.w_dec, self._put(jnp.asarray(lat, jnp.bfloat16))).astype(jnp.float32))[0]
+    frames = np.round(np.clip((video + 1) / 2, 0, 1) * 255).astype(np.uint8)  # [F, H, W, 3]
     al = np.asarray(a) * self.audio_std + self.audio_mean
     al = al.reshape(1, self.audio_frames, self.audio_channels, self.latent_mel).transpose(0, 2, 1, 3)
     wave = np.asarray(self._audio(self.w_aud, self._put(jnp.asarray(al, jnp.bfloat16))).astype(jnp.float32))[0]
