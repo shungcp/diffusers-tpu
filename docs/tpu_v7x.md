@@ -243,3 +243,25 @@ Verified on `v7x-8` (`jax 0.12.0.1`, `diffusers 0.42.0.dev0`, `libtpu 0.0.52`, `
 | `--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true` | `FAILED_PRECONDITION` (`only supported on TPU v5e`) | — | — | — | **Unsupported on `v7x` as well as `v6e`** |
 | `--xla_tpu_enable_ici_ag_pipelining=true` + prefetch | `all-gather=28, all-gather-start=0` | `414.3` | `22.65 GiB` | No delta | No effect |
 
+---
+
+## 10. `MOVA-720p` (2×14B Dual-Expert Video + Audio DiT) on TPU `v7x-8` / `MOVA-720p` 在 `v7x-8` 上的优化台账
+
+Verified on `v7x-8` (`jax 0.12.0.1`, `libtpu 0.0.52`, `94.74 GiB` HBM/device) against the `v6e-8` baseline (`788 s` E2E, `15.7 s/step`, `25.0 GiB` peak) at official `1280×720×193 @ 24 fps` (`8.04 s` clip + 48 kHz audio, 50 steps, CFG=5, `S_v = 176,400` video tokens where `85.8%` of DiT FLOPs sit in video self-attention).
+
+### 10.1 Progressive Tier 1–3 Optimization Results (`1280×720×193`, 50 steps, `cfg=2 × tensor=4`)
+
+| Configuration (`v7x-8` vs `v6e-8`) | Warm E2E (s) | Encode (s) | Denoise (s) | Decode (`193f 720p + 8s 48kHz`) | Peak HBM | Load (s) | Verification / QA |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
+| `v6e-8` baseline (`cfg=1×tensor=8`, `resident=False`, BF16) | `788` (`1.00×`) | — | `~785` (`15.7 s/step`) | — | `25.0 GiB` | — | Reference (`README`) |
+| **Tier 1 (`v7x-8` auto default, Lossless BF16)**: `cfg=2×tensor=4`, auto `resident=True`, single fused 40L `shard_map`, precomputed sharded RoPE, width-sharded (`160 % 8 == 0`) on-TPU `uint8` Wan2.1 VAE | **`588.1`** (**`1.34×`**) | `0.7` | **`584.7`** (`11.69 s/step`, ~90% `K=128` MXU ceiling) | **`2.6 s`** | `68.4 GiB` | `38.5` | CPU FP32 4-dev `2×2` `shard_map` `dv=4.77e-7, da=3.58e-7`; zero width-shard seams |
+| **Tier 2 (`--fp8 --qk-fp8`)**: on-TPU W8A8 E4M3 DiT block linears + E4M3 `qk_fp8` Pallas SplashAttention | **`552.2`** (**`1.43×`**) | `0.7` | **`549.0`** (`10.98 s/step`) | **`2.5 s`** | **`38.5 GiB`** (`-29.9 GiB`) | `43.3` | Sharp 720p visual QA passed; FP8 linear `cos=0.9993` |
+| **Tier 3 (`--fp8 --lossy` w/ legacy `1024×1024×512` sparse tiles)**: `--qk-fp8 --sparse-window 12` (`45.7%` density) + audio+video TeaCache (`0.25`, respects high->low noise expert switch; `26` eval / `24` cached) | `249.0` (`3.16×`) | `0.7` | `245.8` (`8.78 s`/sparse step) | `2.5 s` | `38.7 GiB` | `40` | Audio `corr = 0.9546`; visual QA passed |
+| **Tier 3 (`--fp8 --lossy`, final `resolve_block_sizes` `5888×2048×2048` tiles)** | **`204.8`** (**`3.85×`**) | **`0.7`** | **`201.4`** (**`4.03 s/step` eff.**, `6.31 s`/sparse step) | **`2.6 s`** | **`38.7 GiB`** | **`40.7`** | **`-44.2 s`** purely from `v7x`-optimal `5888×2048` sparse tiles (`47.7%` density); audio **`corr = 0.9544`**; sharp 5-frame QA passed |
+
+- **Key Findings**:
+  1. **Wan2.1 VAE 720p width-sharding + on-TPU `uint8` (`jax_wan_vae.py`)**: 720p latent height `90 % 8 != 0` broke height sharding on 8 chips; auto-switching to `spatial_axis=3` (width `160 % 8 == 0`) with `to_uint8=True` (`NDHWC` on-TPU cast cutting PCIe D2H `4×` from `2.14 GB -> 534 MB`) decodes 193 frames of `1280×720` + 8.04 s 48 kHz audio in **`2.5–2.6 s`** warm.
+  2. **Sparse Splash tile sizing matters hugely on `v7x` (`resolve_mova_sparse_blocks`)**: Replacing hardcoded `1024×1024` (`bkvc=512`) tiles with `block_sizes.resolve_block_sizes` (`5888×2048×2048` on `v7x`) cut sparse-step latency from `8.78 s` down to **`6.31 s`** (`-44.2 s` end-to-end) with virtually identical density (`47.7%` vs `45.7%`) and identical audio correlation (`0.9544`).
+  3. **Local checkpoint directory support**: `mova/pipeline.py` now accepts both HuggingFace repo IDs and local directory paths via `--repo`.
+
+

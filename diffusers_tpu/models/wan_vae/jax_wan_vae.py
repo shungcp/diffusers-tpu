@@ -190,18 +190,21 @@ def _upsample(x, params, name, temporal, st):
 # ---------------------------------------------------------------------------
 
 
-def _constrainer(mesh, rows):
+def _constrainer(mesh, rows, spatial_axis=2):
   if mesh is None:
     return lambda t: t
-  spec = NamedSharding(mesh, P(None, None, rows, None, None))
+  if spatial_axis == 3:
+    spec = NamedSharding(mesh, P(None, None, None, rows, None))
+  else:
+    spec = NamedSharding(mesh, P(None, None, rows, None, None))
   return lambda t: jax.lax.with_sharding_constraint(t, spec)
 
 
 def encode_chunk(params, config, video, cache, *, mesh=None, rows=("cfg", "tensor"),
-                 dtype=jnp.float32):
+                 spatial_axis=2, dtype=jnp.float32):
   """(latent mean, cache) for the next frames of a clip: the first chunk is
   1 + 4k frames (``cache`` empty), later ones 4k."""
-  st = _State(_constrainer(mesh, rows), cache)
+  st = _State(_constrainer(mesh, rows, spatial_axis=spatial_axis), cache)
   x = st.constrain(video.transpose(0, 2, 3, 4, 1).astype(dtype))
   x = _conv3d(x, params, "encoder.conv_in", st)
   num_res = config["num_res_blocks"]
@@ -224,9 +227,13 @@ def encode_chunk(params, config, video, cache, *, mesh=None, rows=("cfg", "tenso
 
 
 def decode_chunk(params, config, latents, cache, *, mesh=None, rows=("cfg", "tensor"),
-                 dtype=jnp.float32):
-  """(video, cache) for the next latent frames (denormalized)."""
-  st = _State(_constrainer(mesh, rows), cache)
+                 spatial_axis=2, dtype=jnp.float32, to_uint8=False):
+  """(video, cache) for the next latent frames (denormalized).
+
+  When ``to_uint8=True``, returns ``[B, T, H, W, 3]`` ``uint8`` converted on TPU
+  (4x smaller PCIe D2H and zero host transpose/rounding).
+  """
+  st = _State(_constrainer(mesh, rows, spatial_axis=spatial_axis), cache)
   x = st.constrain(latents.transpose(0, 2, 3, 4, 1).astype(dtype))
   x = _conv3d(x, params, "post_quant_conv", st)
   x = _conv3d(x, params, "decoder.conv_in", st)
@@ -240,6 +247,9 @@ def decode_chunk(params, config, latents, cache, *, mesh=None, rows=("cfg", "ten
       x = _upsample(x, params, f"decoder.up_blocks.{i}.upsamplers.0", temporal[i], st)
   x = jax.nn.silu(_rms(x, params, "decoder.norm_out"))
   x = _conv3d(x, params, "decoder.conv_out", st)
+  if to_uint8:
+    u8 = jnp.round((jnp.clip(x.astype(jnp.float32), -1.0, 1.0) + 1.0) * 127.5).clip(0, 255).astype(jnp.uint8)
+    return u8, st.next
   return jnp.clip(x.astype(jnp.float32), -1, 1).transpose(0, 4, 1, 2, 3), st.next
 
 
@@ -265,18 +275,19 @@ def denormalize(config, latents):
   return latents * std + mean
 
 
-def make(vae_dir, mesh=None, dtype=jnp.float32, chunk=None, rows=("cfg", "tensor")):
+def make(vae_dir, mesh=None, dtype=jnp.float32, chunk=None, rows=("cfg", "tensor"),
+         spatial_axis=2, to_uint8=False):
   """(params on ``mesh``, config, encode, decode). With ``chunk`` (latent
   frames) both run that many latent frames at a time after frame 0, cache
   threaded through -- the same result in a fraction of the memory."""
   params, config = load(vae_dir, dtype)
   if mesh is not None:
     params = jax.device_put(params, NamedSharding(mesh, P()))
-  kw = dict(mesh=mesh, dtype=dtype, rows=rows)
+  kw = dict(mesh=mesh, dtype=dtype, rows=rows, spatial_axis=spatial_axis)
   enc_c = jax.jit(lambda p, v, c: encode_chunk(p, config, v, c, **kw))
-  dec_c = jax.jit(lambda p, z, c: decode_chunk(p, config, z, c, **kw))
+  dec_c = jax.jit(lambda p, z, c: decode_chunk(p, config, z, c, to_uint8=to_uint8, **kw))
 
-  def run(fn, p, x, first, step):
+  def run(fn, p, x, first, step, cat_axis=2):
     if chunk is None:
       return fn(p, x, {})[0]
     outs, cache = [], {}
@@ -285,10 +296,10 @@ def make(vae_dir, mesh=None, dtype=jnp.float32, chunk=None, rows=("cfg", "tensor
     for a, b in zip(bounds[:-1], bounds[1:]):
       out, cache = fn(p, x[:, :, a:b], cache)
       outs.append(out)
-    return jnp.concatenate(outs, 2)
+    return jnp.concatenate(outs, cat_axis)
 
-  enc = lambda p, video: run(enc_c, p, video, 1, 4 * (chunk or 1))
-  dec = lambda p, latents: run(dec_c, p, latents, 1, chunk or 1)
+  enc = lambda p, video: run(enc_c, p, video, 1, 4 * (chunk or 1), cat_axis=2)
+  dec = lambda p, latents: run(dec_c, p, latents, 1, chunk or 1, cat_axis=(1 if to_uint8 else 2))
   return params, config, enc, dec
 
 

@@ -37,23 +37,37 @@ import numpy as np
 
 
 def _read_state(folder):
-  from safetensors.numpy import load_file
+  try:
+    import ml_dtypes
+    import torch
+    from diffusers_tpu.safetensors_io import safe_open
 
-  state = {}
-  for path in sorted(glob.glob(os.path.join(folder, "*.safetensors"))):
-    for k, v in load_file(path).items():
-      state[k] = v
-  return state
+    state = {}
+    for path in sorted(glob.glob(os.path.join(folder, "*.safetensors"))):
+      with safe_open(path, framework="pt") as f:
+        for k in f.keys():
+          t = f.get_tensor(k)
+          if t.dtype == torch.bfloat16:
+            state[k] = t.view(torch.uint16).numpy().view(ml_dtypes.bfloat16)
+          else:
+            state[k] = t.float().numpy()
+    return state
+  except Exception:
+    from safetensors.numpy import load_file
 
-
-def _np32(v):
-  return np.asarray(v, np.float32) if v.dtype != np.float32 else v
+    state = {}
+    for path in sorted(glob.glob(os.path.join(folder, "*.safetensors"))):
+      for k, v in load_file(path).items():
+        state[k] = v
+    return state
 
 
 def _host(value, dtype):
   """A host (numpy) array in ``dtype``: nothing lands on a device until
   ``place`` puts it there already sharded (a 14B expert does not fit one chip)."""
-  return np.asarray(value).astype(jnp.dtype(dtype))
+  dt = jnp.dtype(dtype)
+  arr = np.asarray(value)
+  return arr if arr.dtype == dt else arr.astype(dt)
 
 
 def load_tower(folder, dtype=jnp.bfloat16):
@@ -63,7 +77,6 @@ def load_tower(folder, dtype=jnp.bfloat16):
   state = _read_state(folder)
   params = {}
   for name, value in state.items():
-    value = _np32(value)
     keep = dtype
     if name.startswith(("time_embedding.", "time_projection.")):
       keep = jnp.float32  # computed in float32, cast to bf16 afterwards (as upstream)
@@ -82,7 +95,6 @@ def load_bridge(folder, dtype=jnp.bfloat16):
     config = json.load(fh)
   params = {}
   for name, value in _read_state(folder).items():
-    value = _np32(value)
     params[name] = _host(value.T if value.ndim == 2 else value, dtype)
   return params, config
 
@@ -93,10 +105,16 @@ def load_bridge(folder, dtype=jnp.bfloat16):
 
 
 def _linear_default(x, params, name):
-  """In the weights' dtype, like a bf16 ``nn.Linear`` (the MXU still accumulates in
-  float32). Under tensor parallelism the row-split projections' partial sums
-  are then all-reduced in bf16: in float32 they were 39% of a step (150 x 1.8 GB)."""
+  """BF16/FP32 or dynamic per-token W8A8 E4M3 FP8 linear."""
   w = params[name + ".weight"]
+  if w.dtype == jnp.float8_e4m3fn:
+    f8_max = jnp.float32(448.0)
+    x32 = x.astype(jnp.float32)
+    x_scale = jnp.maximum(jnp.max(jnp.abs(x32), axis=-1, keepdims=True), jnp.float32(1e-12)) / f8_max
+    qx = jnp.clip(x32 / x_scale, -f8_max, f8_max).astype(jnp.float8_e4m3fn)
+    acc = jax.lax.dot_general(qx, w, (((x.ndim - 1,), (0,)), ((), ())), preferred_element_type=jnp.float32)
+    y = (acc * x_scale * params[name + ".scale"]).astype(x.dtype)
+    return y + params[name + ".bias"].astype(x.dtype)
   y = jnp.dot(x.astype(w.dtype), w, preferred_element_type=w.dtype)
   return y + params[name + ".bias"].astype(w.dtype)
 
@@ -280,7 +298,8 @@ def unpatchify_video(x, grid, patch, out_dim):
 
 
 def dual_step(video, vconf, audio, aconf, bridge, bconf, visual_latents, audio_latents, context,
-              t, audio_t, video_fps, *, attention=dense_attention, video_layer=None):
+              t, audio_t, video_fps, *, attention=dense_attention, video_layer=None,
+              blocks_fn=None, ropes=None):
   """``MOVA.inference_single_step``: (video velocity [B,16,T,H,W], audio velocity [B,128,L]).
 
   ``t`` / ``audio_t`` are ``time_sinusoid`` embeddings [1, 256]."""
@@ -298,17 +317,26 @@ def dual_step(video, vconf, audio, aconf, bridge, bconf, visual_latents, audio_l
   ax = jnp.dot(audio_latents.astype(dtype).transpose(0, 2, 1), audio["patch_embedding.weight"],
                preferred_element_type=jnp.float32)
   ax = (ax + audio["patch_embedding.bias"].astype(jnp.float32)).astype(dtype)
-  vhd = vconf["dim"] // vconf["num_heads"]
-  ahd = aconf["dim"] // aconf["num_heads"]
-  vcos, vsin = (jnp.asarray(a) for a in video_rope(*grid, vhd))
-  acos, asin = (jnp.asarray(a) for a in audio_rope(ax.shape[1], ahd))
-  (bvc, bvs), (bac, bas) = bridge_rope(grid, ax.shape[1], video_fps, bconf["audio_fps"], bconf["head_dim"])
-  vrope, arope = (jnp.asarray(bvc), jnp.asarray(bvs)), (jnp.asarray(bac), jnp.asarray(bas))
+  if ropes is not None:
+    vcos, vsin, acos, asin, vrope, arope = ropes
+  else:
+    vhd = vconf["dim"] // vconf["num_heads"]
+    ahd = aconf["dim"] // aconf["num_heads"]
+    vcos, vsin = (jnp.asarray(a) for a in video_rope(*grid, vhd))
+    acos, asin = (jnp.asarray(a) for a in audio_rope(ax.shape[1], ahd))
+    (bvc, bvs), (bac, bas) = bridge_rope(grid, ax.shape[1], video_fps, bconf["audio_fps"], bconf["head_dim"])
+    vrope, arope = (jnp.asarray(bvc), jnp.asarray(bvs)), (jnp.asarray(bac), jnp.asarray(bas))
   vheads, aheads = vconf["num_heads"], aconf["num_heads"]
   bvh = bconf["visual_hidden_dim"] // bconf["head_dim"]
   bah = bconf["audio_hidden_dim"] // bconf["head_dim"]
   shared = min(vconf["num_layers"], aconf["num_layers"])
-  if video_layer is not None:  # sequence parallel (``make_video_layer``)
+  if blocks_fn is not None:  # single fused shard_map over all 40 video + 30 bridge + 30 audio layers
+    vx, ax = blocks_fn(video, audio, bridge, vx, ax, vctx, actx, vtm, atm,
+                       vcos, vsin, acos, asin, vrope, arope)
+    vout = unpatchify_video(head(video, vx, vt), grid, patch, vconf["out_dim"])
+    aout = head(audio, ax, at).transpose(0, 2, 1)
+    return vout, aout
+  if video_layer is not None:  # legacy per-layer sequence parallel (``make_video_layer``)
     for i in range(vconf["num_layers"]):
       vp = {k: v for k, v in video.items() if k.startswith(f"blocks.{i}.")}
       bp = ({k: v for k, v in bridge.items() if f"_conditioners.{i}." in k} if i < shared else None)
@@ -367,19 +395,39 @@ _COLUMN = ("self_attn.q", "self_attn.k", "self_attn.v", "cross_attn.q", "cross_a
 _ROW = ("self_attn.o", "cross_attn.o", "ffn.2", "inner.o")
 
 
-def param_specs(params):
-  """Heads / FFN columns over ``tensor`` (Megatron layout); the rest replicated.
+@jax.jit
+def _quantize_w_fp8_tpu(w):
+  """Per-output-channel symmetric E4M3 quantization on TPU (5x faster than host CPU)."""
+  f8_max = jnp.float32(448.0)
+  w32 = w.astype(jnp.float32)
+  scale = jnp.maximum(jnp.max(jnp.abs(w32), axis=0, keepdims=True), jnp.float32(1e-12)) / f8_max
+  qw = jnp.clip(w32 / scale, -f8_max, f8_max).astype(jnp.float8_e4m3fn)
+  return qw, scale
 
-  The q/k RMSNorms run over the full width, so their statistic is all-reduced
-  (small); everything else of a block stays on its chip until ``o`` / ``ffn.2``.
-  """
+
+def _should_fp8(name, value):
+  return (
+      name.endswith(".weight")
+      and value.ndim == 2
+      and min(value.shape) >= 512
+      and (name.startswith("blocks.") or "_conditioners." in name)
+  )
+
+
+def param_specs(params, *, resident=False):
+  """Heads / FFN columns over ``tensor`` (Megatron layout); ``resident=True`` keeps all whole (P())."""
   from jax.sharding import PartitionSpec as P
 
+  if resident:
+    return {name: P() for name in params}
   specs = {}
   for name, value in params.items():
     base = name.rsplit(".", 1)[0]
     if any(base.endswith(c) for c in _COLUMN):
-      specs[name] = P(None, "tensor") if name.endswith(".weight") else P("tensor")
+      if name.endswith((".weight", ".scale")):
+        specs[name] = P(None, "tensor")
+      else:
+        specs[name] = P("tensor")
     elif any(base.endswith(r) for r in _ROW) and name.endswith(".weight"):
       specs[name] = P("tensor", None)
     else:
@@ -387,42 +435,118 @@ def param_specs(params):
   return specs
 
 
-def place(params, mesh):
+def place(params, mesh, *, resident=False, fp8=False):
   from jax.sharding import NamedSharding
+  from jax.sharding import PartitionSpec as P
 
-  specs = param_specs(params)
-  return {k: jax.device_put(v, NamedSharding(mesh, specs[k])) for k, v in params.items()}
+  specs = param_specs(params, resident=resident)
+  out = {}
+  for k, v in params.items():
+    if fp8 and _should_fp8(k, v):
+      w_dev = jax.device_put(v, NamedSharding(mesh, P()))
+      qw, sc = _quantize_w_fp8_tpu(w_dev)
+      del w_dev
+      out[k] = jax.device_put(qw, NamedSharding(mesh, specs[k]))
+      sc_key = k[:-len(".weight")] + ".scale"
+      sc_spec = P() if resident else (
+          P(None, "tensor") if any(k.rsplit(".", 1)[0].endswith(c) for c in _COLUMN) else P()
+      )
+      out[sc_key] = jax.device_put(sc, NamedSharding(mesh, sc_spec))
+    else:
+      out[k] = jax.device_put(v, NamedSharding(mesh, specs[k]))
+  return out
 
 
-def _splash_local(q, k, v):
-  """Device-local splash attention, [B, H, S, D]. Fixed-m softmax (exact:
-  heads outside the safe bound fall back to the online softmax), which needs
-  zero-mean keys -- softmax is invariant to that shift. 43120 x 43120 with
-  2 x 10 heads on a v6e: 45.6 -> 35.1 ms."""
-  from diffusers_tpu.kernels import block_sizes, splash
+def build_mova_sparse_kv_table(grid, window, block_q=1024, block_kv=1024, anchor_first_frame=True):
+  """Temporal-window block-sparse KV table for MOVA video grid ``(F, H, W)``."""
+  f_n, h_n, w_n = (int(grid[0]), int(grid[1]), int(grid[2]))
+  rpf = h_n * w_n
+  seq = f_n * rpf
+  bq = min(int(block_q), seq)
+  bkv = min(int(block_kv), seq)
+  num_q = -(-seq // bq)
+  num_kv = -(-seq // bkv)
+  reach = int(window) * rpf
+  table = []
+  for i in range(num_q):
+    q0, q1 = i * bq, min((i + 1) * bq, seq)
+    row = [
+        j for j in range(num_kv)
+        if (anchor_first_frame and j * bkv < rpf)
+        or (j * bkv < q1 + reach and min((j + 1) * bkv, seq) > q0 - reach)
+    ]
+    table.append(row)
+  return table
 
+
+def resolve_mova_sparse_blocks(seq, head_dim=128, block_kv=None):
+  """Resolve hardware-optimal (block_q, block_kv, block_kv_compute) for MOVA sparse_splash."""
+  if jax.devices()[0].platform != "tpu":
+    bq = min(1024, int(seq))
+    bkv = min(1024 if block_kv is None else int(block_kv), int(seq))
+    return bq, bkv, min(512, bkv)
+  from diffusers_tpu.kernels import block_sizes
+
+  blocks = block_sizes.resolve_block_sizes(
+      int(seq), int(seq), int(head_dim), {}, "residual-fixedm", block_sizes.detect_spec()
+  )
+  bq = int(blocks["block_q"])
+  bkv = int(blocks["block_kv"])
+  bkvc = int(blocks["block_kv_compute"])
+  if block_kv is not None:
+    bkv = min(int(block_kv), int(seq))
+    bkvc = min(bkvc, bkv)
+  return bq, bkv, bkvc
+
+
+def _splash_local(q, k, v, *, qk_fp8=False, block_kv=None, kv_table=None):
+  """Device-local splash attention, [B, H, S, D]. Fixed-m softmax with zero-mean keys."""
+  if jax.devices()[0].platform != "tpu":
+    sc = jnp.einsum("bhqd,bhkd->bhqk", q, k, preferred_element_type=jnp.float32) / np.sqrt(q.shape[-1])
+    if kv_table is not None:
+      sq, skv = q.shape[2], k.shape[2]
+      bq, bkv, _ = resolve_mova_sparse_blocks(sq, q.shape[-1], block_kv=block_kv)
+      mask = np.zeros((sq, skv), dtype=bool)
+      for qi, row in enumerate(kv_table):
+        q0, q1 = qi * bq, min((qi + 1) * bq, sq)
+        for kj in row:
+          k0, k1 = kj * bkv, min((kj + 1) * bkv, skv)
+          mask[q0:q1, k0:k1] = True
+      sc = jnp.where(jnp.asarray(mask)[None, None], sc, jnp.float32(-1e30))
+    w = jax.nn.softmax(sc, axis=-1).astype(v.dtype)
+    return jnp.einsum("bhqk,bhkd->bhqd", w, v, preferred_element_type=jnp.float32).astype(v.dtype)
+
+  from diffusers_tpu.kernels import block_sizes, sparse_splash, splash
+
+  k = k - jnp.mean(k, axis=2, keepdims=True)
+  if kv_table is not None:
+    bq, bkv, bkvc = resolve_mova_sparse_blocks(q.shape[2], q.shape[-1], block_kv=block_kv)
+    return sparse_splash.attention(
+        q, k, v, scale=None, block_q=bq, block_kv=bkv, block_kv_compute=bkvc,
+        use_fixed_m=True, qk_fp8=qk_fp8, kv_table=kv_table,
+    )
   blocks = block_sizes.resolve_block_sizes(q.shape[2], k.shape[2], q.shape[-1], {},
                                            "residual-fixedm", block_sizes.detect_spec())
-  k = k - jnp.mean(k, axis=2, keepdims=True)
-  return splash.attention(q, k, v, scale=None, use_fixed_m=True, **blocks)
+  if block_kv is not None:
+    bkv = min(int(block_kv), k.shape[2])
+    blocks = dict(blocks, block_kv=bkv, block_kv_compute=min(int(blocks["block_kv_compute"]), bkv))
+  return splash.attention(q, k, v, scale=None, use_fixed_m=True, qk_fp8=qk_fp8, **blocks)
 
 
-def make_attention(mesh):
+def make_attention(mesh, *, qk_fp8=False, block_kv=None):
   """[B, S, H, D] attention: the splash kernel per chip, heads over ``tensor``."""
   from jax.experimental.shard_map import shard_map
   from jax.sharding import PartitionSpec as P
 
   from diffusers_tpu.kernels import splash  # noqa: F401  (import outside any trace)
 
-  local = _splash_local
+  local = lambda q, k, v: _splash_local(q, k, v, qk_fp8=qk_fp8, block_kv=block_kv)
 
   def runner(spec):
     return shard_map(local, mesh=mesh, in_specs=(spec, spec, spec), out_specs=spec,
                      check_rep=False)
 
   split = runner(P("cfg", "tensor", None, None))
-  # Heads that do not divide over ``tensor`` (the audio tower's 12 on 8 chips)
-  # run whole on every chip of their cfg group: 403 rows, a negligible cost.
   whole = runner(P("cfg", None, None, None))
   parts = mesh.shape["tensor"]
 
@@ -434,20 +558,142 @@ def make_attention(mesh):
   return attention
 
 
-def make_video_layer(mesh, vconf, bconf):
-  """One video layer (with its bridge cross-attentions) sequence parallel over
-  ``tensor``: each chip keeps a quarter of the rows of the residual stream and
-  runs every token-wise op on them with whole weights, all-gathered layer by
-  layer from their tensor-parallel shards (they do not depend on activations,
-  so the scheduler can fetch them early). Self-attention swaps rows for heads
-  with an all-to-all each way (Ulysses); the cross-attentions to text / audio
-  keep all heads per chip; video -> audio combines each chip's partial softmax
-  over its rows of keys. Per layer this moves ~0.5 GB of weights and four
-  0.2 GB all-to-alls a chip, against three all-reduces of the 0.9 GB
-  residual stream under tensor parallelism.
+def make_dual_blocks_fn(
+    mesh,
+    vconf,
+    aconf,
+    bconf,
+    video_sample,
+    audio_sample,
+    bridge_sample,
+    *,
+    resident=False,
+    qk_fp8=False,
+    block_kv=None,
+    sparse_kv_table=None,
+):
+  """Single fused ``shard_map`` running ALL 40 video + 30 bridge + 30 audio layers.
 
-  Returns ``layer(i, video_params_i, bridge_params_i | None, vx, ax, vctx, vtm,
-  vcos, vsin, vrope, arope) -> (vx, v2a | None)``."""
+  Replaces 40 separate ``shard_map`` calls with one continuous XLA program:
+    * When ``resident=True`` (TPU ``v7x`` 95 GiB): zero weight ``all_gather``s!
+    * Supports W8A8 E4M3 FP8 weights, ``qk_fp8`` Pallas SplashAttention,
+      ``block_kv`` override, and temporal-window ``sparse_kv_table`` on the
+      85.8%-dominant video self-attention!
+  """
+  from jax.experimental.shard_map import shard_map
+  from jax.sharding import PartitionSpec as P
+
+  from diffusers_tpu.kernels import sparse_splash, splash  # noqa: F401
+
+  T = "tensor"
+  vheads = vconf["num_heads"]
+  aheads = aconf["num_heads"]
+  if vheads % mesh.shape[T]:
+    raise ValueError(f"sequence parallel needs {vheads} video heads to divide tensor={mesh.shape[T]}")
+  bvh = bconf["visual_hidden_dim"] // bconf["head_dim"]
+  bah = bconf["audio_hidden_dim"] // bconf["head_dim"]
+  n_layers = vconf["num_layers"]
+  shared = min(n_layers, aconf["num_layers"])
+
+  def linear(x, params, name):
+    w = params[name + ".weight"]
+    b = params[name + ".bias"]
+    is_fp8 = w.dtype == jnp.float8_e4m3fn
+    sc = params[name + ".scale"] if is_fp8 else None
+    if not resident:
+      if any(name.endswith(c) for c in _COLUMN):
+        w = jax.lax.all_gather(w, T, axis=1, tiled=True)
+        b = jax.lax.all_gather(b, T, axis=0, tiled=True)
+        if sc is not None:
+          sc = jax.lax.all_gather(sc, T, axis=1, tiled=True)
+      elif any(name.endswith(r) for r in _ROW):
+        w = jax.lax.all_gather(w, T, axis=0, tiled=True)
+    if is_fp8:
+      f8_max = jnp.float32(448.0)
+      x32 = x.astype(jnp.float32)
+      x_scale = jnp.maximum(jnp.max(jnp.abs(x32), axis=-1, keepdims=True), jnp.float32(1e-12)) / f8_max
+      qx = jnp.clip(x32 / x_scale, -f8_max, f8_max).astype(jnp.float8_e4m3fn)
+      acc = jax.lax.dot_general(qx, w, (((x.ndim - 1,), (0,)), ((), ())), preferred_element_type=jnp.float32)
+      y = (acc * x_scale * sc).astype(x.dtype)
+      return y + b.astype(x.dtype)
+    y = jnp.dot(x.astype(w.dtype), w, preferred_element_type=w.dtype)
+    return y + b.astype(w.dtype)
+
+  def local_dense(q, k, v):
+    out = _splash_local(*(t.transpose(0, 2, 1, 3) for t in (q, k, v)), qk_fp8=False)
+    return out.transpose(0, 2, 1, 3)
+
+  def local_video_self(q, k, v):
+    out = _splash_local(
+        *(t.transpose(0, 2, 1, 3) for t in (q, k, v)),
+        qk_fp8=qk_fp8,
+        block_kv=block_kv,
+        kv_table=sparse_kv_table,
+    )
+    return out.transpose(0, 2, 1, 3)
+
+  def ulysses_self(q, k, v):
+    to_heads = lambda t: jax.lax.all_to_all(t, T, 2, 1, tiled=True)
+    out = local_video_self(to_heads(q), to_heads(k), to_heads(v))
+    return jax.lax.all_to_all(out, T, 1, 2, tiled=True)
+
+  def video_to_audio(bp, name, ax, vx, arope, vrope):
+    y = _layer_norm(vx, w=bp[name + ".y_norm.weight"], b=bp[name + ".y_norm.bias"])
+    pre = name + ".inner."
+    q = _rms(linear(ax, bp, pre + "q"), bp[pre + "norm_q.weight"])
+    k = _rms(linear(y, bp, pre + "k"), bp[pre + "norm_k.weight"])
+    v = linear(y, bp, pre + "v")
+    b, sq, d = q.shape
+    q = _rope_half(q.reshape(b, sq, bah, -1), *arope)
+    k = _rope_half(k.reshape(b, k.shape[1], bah, -1), *vrope)
+    v = v.reshape(b, v.shape[1], bah, -1)
+    sc = jnp.einsum("bqhd,bkhd->bhqk", q, k, preferred_element_type=jnp.float32) / np.sqrt(q.shape[-1])
+    m = jax.lax.pmax(jnp.max(sc, -1, keepdims=True), T)
+    e = jnp.exp(sc - m)
+    l = jax.lax.psum(jnp.sum(e, -1, keepdims=True), T)
+    o = jax.lax.psum(jnp.einsum("bhqk,bkhd->bqhd", e.astype(v.dtype), v,
+                                preferred_element_type=jnp.float32), T)
+    o = (o / jnp.transpose(l, (0, 2, 1, 3))).astype(v.dtype).reshape(b, sq, d)
+    return linear(o, bp, pre + "o")
+
+  def body(vp, ap, bp, vx, ax, vctx, actx, vtm, atm, vcos, vsin, acos, asin, vrope, arope):
+    for i in range(n_layers):
+      if i < shared:
+        v2a = video_to_audio(bp, f"video_to_audio_conditioners.{i}", ax, vx, arope, vrope)
+        vx = vx + bridge_attend(bp, f"audio_to_video_conditioners.{i}", vx, ax, vrope, arope, bvh,
+                                local_dense, linear=linear)
+      vx = block(vp, i, vx, vctx, vtm, vcos, vsin, vheads, ulysses_self, linear=linear,
+                 cross_attention=local_dense)
+      if i < shared:
+        ax = block(ap, i, ax + v2a, actx, atm, acos, asin, aheads, local_dense, linear=linear,
+                   cross_attention=local_dense)
+    return vx, ax
+
+  vp_keys = {k for k in video_sample if k.startswith("blocks.")}
+  ap_keys = {k for k in audio_sample if k.startswith("blocks.")}
+  vp_specs = param_specs({k: video_sample[k] for k in vp_keys}, resident=resident)
+  ap_specs = param_specs({k: audio_sample[k] for k in ap_keys}, resident=resident)
+  bp_specs = param_specs(bridge_sample, resident=resident)
+  rows, batch, rep = P("cfg", T, None), P("cfg"), P()
+  in_specs = (
+      vp_specs, ap_specs, bp_specs,
+      rows, batch, batch, batch, rep, rep,
+      P(T, None), P(T, None), rep, rep,
+      (P(T, None), P(T, None)), (rep, rep),
+  )
+  out_specs = (rows, batch)
+  mapped = shard_map(body, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False)
+
+  def run(video, audio, bridge, vx, ax, vctx, actx, vtm, atm, vcos, vsin, acos, asin, vrope, arope):
+    vp = {k: video[k] for k in vp_keys}
+    ap = {k: audio[k] for k in ap_keys}
+    return mapped(vp, ap, bridge, vx, ax, vctx, actx, vtm, atm, vcos, vsin, acos, asin, vrope, arope)
+
+  return run
+
+
+def make_video_layer(mesh, vconf, bconf, *, resident=False, qk_fp8=False, block_kv=None):
+  """Legacy per-layer video sequence parallel helper (kept for backwards compatibility)."""
   from jax.experimental.shard_map import shard_map
   from jax.sharding import PartitionSpec as P
 
@@ -464,26 +710,25 @@ def make_video_layer(mesh, vconf, bconf):
   def linear(x, params, name):
     base = name
     w, b = params[name + ".weight"], params[name + ".bias"]
-    if any(base.endswith(c) for c in _COLUMN):
-      w = jax.lax.all_gather(w, T, axis=1, tiled=True)
-      b = jax.lax.all_gather(b, T, axis=0, tiled=True)
-    elif any(base.endswith(r) for r in _ROW):
-      w = jax.lax.all_gather(w, T, axis=0, tiled=True)
+    if not resident:
+      if any(base.endswith(c) for c in _COLUMN):
+        w = jax.lax.all_gather(w, T, axis=1, tiled=True)
+        b = jax.lax.all_gather(b, T, axis=0, tiled=True)
+      elif any(base.endswith(r) for r in _ROW):
+        w = jax.lax.all_gather(w, T, axis=0, tiled=True)
     y = jnp.dot(x.astype(w.dtype), w, preferred_element_type=w.dtype)
     return y + b.astype(w.dtype)
 
-  def local(q, k, v):  # [B, S, H, D], every head on this chip
-    out = _splash_local(*(t.transpose(0, 2, 1, 3) for t in (q, k, v)))
+  def local(q, k, v):
+    out = _splash_local(*(t.transpose(0, 2, 1, 3) for t in (q, k, v)), qk_fp8=qk_fp8, block_kv=block_kv)
     return out.transpose(0, 2, 1, 3)
 
-  def ulysses(q, k, v):  # rows -> heads, attend, heads -> rows
+  def ulysses(q, k, v):
     to_heads = lambda t: jax.lax.all_to_all(t, T, 2, 1, tiled=True)
     out = local(to_heads(q), to_heads(k), to_heads(v))
     return jax.lax.all_to_all(out, T, 1, 2, tiled=True)
 
   def video_to_audio(bp, name, ax, vx, arope, vrope):
-    """Audio queries over every chip's rows of video keys: partial softmax
-    statistics combined with pmax / psum (exact)."""
     y = _layer_norm(vx, w=bp[name + ".y_norm.weight"], b=bp[name + ".y_norm.bias"])
     pre = name + ".inner."
     q = _rms(linear(ax, bp, pre + "q"), bp[pre + "norm_q.weight"])
@@ -496,7 +741,7 @@ def make_video_layer(mesh, vconf, bconf):
     sc = jnp.einsum("bqhd,bkhd->bhqk", q, k, preferred_element_type=jnp.float32) / np.sqrt(q.shape[-1])
     m = jax.lax.pmax(jnp.max(sc, -1, keepdims=True), T)
     e = jnp.exp(sc - m)
-    l = jax.lax.psum(jnp.sum(e, -1, keepdims=True), T)              # [b, h, q, 1]
+    l = jax.lax.psum(jnp.sum(e, -1, keepdims=True), T)
     o = jax.lax.psum(jnp.einsum("bhqk,bkhd->bqhd", e.astype(v.dtype), v,
                                 preferred_element_type=jnp.float32), T)
     o = (o / jnp.transpose(l, (0, 2, 1, 3))).astype(v.dtype).reshape(b, sq, d)
@@ -518,7 +763,7 @@ def make_video_layer(mesh, vconf, bconf):
   def layer(i, vp, bp, vx, ax, vctx, vtm, vcos, vsin, vrope, arope):
     key = (i, bp is not None)
     if key not in cache:
-      specs = lambda d: {k: v for k, v in param_specs(d).items()}
+      specs = lambda d: {k: v for k, v in param_specs(d, resident=resident).items()}
       in_specs = (specs(vp), specs(bp) if bp is not None else None, rows, batch, batch, rep,
                   P(T, None), P(T, None), (P(T, None), P(T, None)), (rep, rep))
       out_specs = (rows, batch if bp is not None else None)

@@ -30,6 +30,9 @@ Newest first. Each entry links a date to what changed.
 
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-27** — **MOVA-720p on TPU `v7x-8`: `788 s -> 588.1 s` lossless / `552.2 s` FP8 / `204.8 s` (`3.85×`) `--fp8 --lossy`** ([usage](#run-mova--运行-mova), [v7x ledger](docs/tpu_v7x.md#10-mova-720p-214b-dual-expert-video--audio-dit-on-tpu-v7x-8--mova-720p-在-v7x-8-上的优化台账)): on `>=64 GiB` `v7x-8`, auto `cfg=2 × tensor=4` + `resident=True` (eliminating 640 weight all-gathers/step), single fused 40-layer `shard_map`, precomputed sharded RoPE, fast `ml_dtypes` loader, and Wan2.1 VAE width-sharding (`160 % 8 == 0`, fixing 720p `90 % 8 != 0`) + on-TPU `uint8` D2H (`2.14 GB -> 534 MB`, **193-frame 720p + 8s 48kHz audio decode in `2.5–2.6 s`** warm). Verified at official `1280×720×193` (50 steps, CFG 5): **Tier 1 lossless BF16 `588.1 s`** (`68.4 GiB` HBM, CPU FP32 `4.77e-7`); **Tier 2 `--fp8 --qk-fp8` `552.2 s`** (`38.5 GiB` HBM, `-29.9 GiB`); **Tier 3 `--fp8 --lossy`** (hardware-optimal `5888×2048×2048` temporal-window `sparse_splash` `--sparse-window 12` + expert-boundary-safe audio+video TeaCache) **`204.8 s`** (**`3.85×`** vs `v6e-8`, `38.7 GiB` HBM, audio `corr 0.9544`).
+
+  **2026-11-27** — **MOVA-720p TPU `v7x-8` 优化:`788 s -> 588.1 s` 无损 / `552.2 s` FP8 / `204.8 s`（`3.85×`）`--fp8 --lossy`**([用法](#run-mova--运行-mova),[台账](docs/tpu_v7x.md#10-mova-720p-214b-dual-expert-video--audio-dit-on-tpu-v7x-8--mova-720p-在-v7x-8-上的优化台账)):在 `>=64 GiB` `v7x-8` 上自动启用 `cfg=2 × tensor=4` + `resident=True`(消除每步 640 次权重 all-gather)、40 层单融合 `shard_map`、预计算分片 RoPE、修复 720p Wan2.1 VAE 宽度分片(`160 % 8 == 0`)与 TPU 端直出 `uint8`(193 帧 720p + 8 s 48 kHz 音频热解码仅 **`2.5–2.6 s`**)。官方 `1280×720×193`(50 步,CFG 5)实测:**Tier 1 无损 BF16 `588.1 s`**(峰值 `68.4 GiB`,CPU FP32 `4.77e-7`);**Tier 2 `--fp8 --qk-fp8` `552.2 s`**(峰值 `38.5 GiB`,省 `29.9 GiB`);**Tier 3 `--fp8 --lossy`**(`v7x` 最优 `5888×2048×2048` 滑窗 `sparse_splash` `--sparse-window 12` + 遵守高低噪专家边界的音视频 TeaCache)**`204.8 s`**(较 `v6e-8` 提速 **`3.85×`**,峰值 `38.7 GiB`,音频相关性 `0.9544`)。
 - **2026-11-27** — **VideoGym-LTX-2.3 native `torch_tpu` `4×2` backend on TPU `v7x-8`** ([usage](#run-videogym-ltx-23--运行-videogym-ltx-23), [v7x ledger](docs/tpu_v7x.md#9-videogym-ltx-23-22b-audio-video-dit-on-tpu-v7x-8--videogym-ltx-23-在-v7x-8-上的优化台账)): added pure-PyTorch 48-block `ltx2/torch_dit.py` + 8-rank `torchrun` `4×2` (`cfg=4 × sp=2`, physical-chip-aligned 3 intra-chip collectives/block, 0 inter-chip ICI) `torchtpu_ltx2.py` + `scripts/run_ltx2_torchtpu.sh` with `DT_AOT_PERSIST` (`1.45–1.77 s` warm load), `use_fixed_m=True` Pallas Splash `jax_op`, on-device W8A8 FP8 (`pallas::ltx2_fp8_linear_v1`), and fast `--encode-only`/`--decode-latents` Stage 0/3 (skipping 44 GB DiT load). Verified 30-step Maze E2E on `v7x-8`: **BF16** `0.650 s/step` (`10.88 s` load, **`PSNR 38.32 dB`** vs JAX `1×8`); **`--fp8`** **`0.295 s/step`** (**`2.20×`** faster than TT BF16, `8.86 s` steady / `11.81 s` warm incl. AOT load, `10.46 s` load, **`PSNR 36.71 dB`** vs JAX BF16); CPU FP32 `max|d|=6.26e-7`.
 
   **2026-11-27** — **VideoGym-LTX-2.3 新增原生 `torch_tpu` `4×2` 后端(TPU `v7x-8`)**([用法](#run-videogym-ltx-23--运行-videogym-ltx-23),[台账](docs/tpu_v7x.md#9-videogym-ltx-23-22b-audio-video-dit-on-tpu-v7x-8--videogym-ltx-23-在-v7x-8-上的优化台账)):新增纯 PyTorch 48 层 `ltx2/torch_dit.py` + 8 进程 `torchrun` `4×2`(`cfg=4 × sp=2` 物理双核对齐,每层仅 3 次片内通信、0 次跨片 ICI)`torchtpu_ltx2.py` + `scripts/run_ltx2_torchtpu.sh`,支持 `DT_AOT_PERSIST`(热加载 `1.45–1.77 s`)、fixed-m Pallas Splash `jax_op`、TPU 端 W8A8 FP8 与 `--encode-only`/`--decode-latents` 轻量 Stage 0/3。`v7x-8` 30 步迷宫端到端实测:**BF16** `0.650 s/步`(加载 `10.88 s`,对比 JAX `1×8` **`PSNR 38.32 dB`**);**`--fp8`** **`0.295 s/步`(**较 TT BF16 提速 `2.20×`**,30 步稳态 `8.86 s` / 含热加载 `11.81 s`,加载 `10.46 s`,对比 JAX BF16 **`PSNR 36.71 dB`**);CPU FP32 对齐 `max|d|=6.26e-7`。
@@ -722,12 +725,21 @@ hf download OpenMOSS-Team/MOVA-360p
 bash scripts/run_mova.sh --image ref.jpg --prompt "A man in a blue blazer speaks in a quiet room ..."   # 352x640, 8 s, all chips
 bash scripts/run_mova.sh --image ref.jpg --prompt "..." --cfg 2      # 8 chips: CFG branches on two groups of 4
 hf download OpenMOSS-Team/MOVA-720p
-bash scripts/run_mova.sh --repo OpenMOSS-Team/MOVA-720p --height 720 --width 1280 --image ref.jpg --prompt "..."   # 720p
+bash scripts/run_mova.sh --repo OpenMOSS-Team/MOVA-720p --height 720 --width 1280 --image ref.jpg --prompt "..."   # 720p lossless (auto resident=True on v7x)
+bash scripts/run_mova.sh --repo OpenMOSS-Team/MOVA-720p --height 720 --width 1280 --fp8 --qk-fp8 --image ref.jpg --prompt "..."  # FP8 + 38.5 GiB HBM
+bash scripts/run_mova.sh --repo OpenMOSS-Team/MOVA-720p --height 720 --width 1280 --fp8 --lossy --image ref.jpg --prompt "..."   # 204.8 s (3.85x vs v6e-8)
 ```
 
-The reference image is center-cropped to the output size (352x640 by default) as in the official script. Output: H.264 + AAC (48 kHz) mp4. `--frames`, `--steps`, `--cfg-scale`, `--seed` as in the official CLI.
+The reference image is center-cropped to the output size (352x640 by default) as in the official script. Output: H.264 + AAC (48 kHz) mp4. `--frames`, `--steps`, `--cfg-scale`, `--seed` as in the official CLI; `--repo` accepts either a HuggingFace repo ID or a local snapshot directory. Full `v7x-8` optimization ledger: [docs/tpu_v7x.md (Section 10)](docs/tpu_v7x.md#10-mova-720p-214b-dual-expert-video--audio-dit-on-tpu-v7x-8--mova-720p-在-v7x-8-上的优化台账).
 
-参考图按官方脚本居中裁剪到输出尺寸(默认 352x640)。输出 H.264 + AAC(48 kHz)mp4。`--frames`、`--steps`、`--cfg-scale`、`--seed` 与官方一致。
+参考图按官方脚本居中裁剪到输出尺寸(默认 352x640)。输出 H.264 + AAC(48 kHz)mp4。`--frames`、`--steps`、`--cfg-scale`、`--seed` 与官方一致;`--repo` 支持 HuggingFace 仓库 ID 或本地目录路径。完整 `v7x-8` 优化台账见 [docs/tpu_v7x.md 第 10 节](docs/tpu_v7x.md#10-mova-720p-214b-dual-expert-video--audio-dit-on-tpu-v7x-8--mova-720p-在-v7x-8-上的优化台账)。
+
+| MOVA-720p (`1280×720×193 @ 24 fps`, 50 steps, CFG 5) | Warm E2E | Denoise | Decode (`193f + 8s 48kHz`) | Peak HBM |
+|---|---|---|---|---|
+| `v6e-8` baseline (`cfg=1×tensor=8`, BF16) | `788 s` (`1.00×`) | `~785 s` (`15.7 s/step`) | — | `25.0 GiB` |
+| **`v7x-8` Tier 1 lossless BF16** (auto `cfg=2×4`, `resident=True`, fused 40L `shard_map`) | **`588.1 s`** (`1.34×`) | `584.7 s` (`11.69 s/step`) | **`2.6 s`** (width-sharded `uint8`) | `68.4 GiB` |
+| **`v7x-8` Tier 2 `--fp8 --qk-fp8`** (W8A8 E4M3 DiT + FP8 QK Splash) | **`552.2 s`** (`1.43×`) | `549.0 s` (`10.98 s/step`) | **`2.5 s`** | **`38.5 GiB`** (`-29.9 GiB`) |
+| **`v7x-8` Tier 3 `--fp8 --lossy`** (`5888×2048` `--sparse-window 12` + TeaCache) | **`204.8 s`** (**`3.85×`**) | **`201.4 s`** (**`4.03 s/step` eff.**) | **`2.6 s`** (audio `corr 0.9544`) | **`38.7 GiB`** |
 
 ---
 
