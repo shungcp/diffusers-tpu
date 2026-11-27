@@ -75,6 +75,65 @@ def load(folder, dtype=jnp.bfloat16, num_layers=None):
   return top, config
 
 
+@jax.jit
+def _quantize_w_fp8_tpu(w):
+  f8_max = jnp.float32(448.0)
+  w32 = w.astype(jnp.float32)
+  scale = jnp.maximum(jnp.max(jnp.abs(w32), axis=0), jnp.float32(1e-12)) / f8_max
+  qw = jnp.clip(w32 / scale[None, :], -f8_max, f8_max).astype(jnp.float8_e4m3fn)
+  return qw, scale
+
+
+def quantize_fp8(params, mesh=None, specs=None):
+  """Quantize large 2-D block linear weights ([in, out], min dim >= 512) to
+  native v7x ``float8_e4m3fn`` with per-output-channel float32 scales.
+
+  When ``mesh`` and ``specs`` (from ``jax_sp.param_specs``) are provided, each
+  weight is quantized on-TPU per tensor and placed directly at its target
+  sharding (~1 s instead of ~150 s on host CPU, zero extra peak HBM).
+  """
+  if mesh is not None and specs is not None:
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    rep = NamedSharding(mesh, P())
+    out = {k: jax.device_put(v, NamedSharding(mesh, specs[k])) for k, v in params.items() if k != "blocks"}
+    blocks = []
+    for i, blk in enumerate(params["blocks"]):
+      nb = {}
+      bs = specs["blocks"][i]
+      for k, v in blk.items():
+        if v.ndim == 2 and k.endswith(".weight") and min(v.shape) >= 512:
+          # Quantize on-device (replicated temporarily for one matrix: <= 128 MB) then shard.
+          qw, sc = _quantize_w_fp8_tpu(jax.device_put(v, jax.devices()[0]))
+          nb[k] = jax.device_put(qw, NamedSharding(mesh, bs[k]))
+          nb[k[:-len(".weight")] + ".scale"] = jax.device_put(sc, rep)
+        else:
+          nb[k] = jax.device_put(v, NamedSharding(mesh, bs[k]))
+      blocks.append(nb)
+    out["blocks"] = blocks
+    return out
+
+  f8_max = np.float32(448.0)
+  f8_dt = np.dtype(jnp.float8_e4m3fn)
+  out = {k: v for k, v in params.items() if k != "blocks"}
+  blocks = []
+  for blk in params["blocks"]:
+    nb = {}
+    for k, v in blk.items():
+      if v.ndim == 2 and k.endswith(".weight") and min(v.shape) >= 512:
+        w32 = np.asarray(v, dtype=np.float32)
+        scale = np.maximum(np.max(np.abs(w32), axis=0), np.float32(1e-12)) / f8_max
+        qw = np.clip(w32 / scale[None, :], -f8_max, f8_max).astype(f8_dt)
+        nb[k] = qw
+        nb[k[:-len(".weight")] + ".scale"] = scale.astype(np.float32)
+      else:
+        nb[k] = v
+    blocks.append(nb)
+  out["blocks"] = blocks
+  return out
+
+
 # ---------------------------------------------------------------------------
 # small layers
 # ---------------------------------------------------------------------------
@@ -82,6 +141,14 @@ def load(folder, dtype=jnp.bfloat16, num_layers=None):
 
 def _linear(x, p, name):
   w = p[name + ".weight"]
+  if w.dtype == jnp.float8_e4m3fn:
+    f8_max = jnp.float32(448.0)
+    x32 = x.astype(jnp.float32)
+    x_scale = jnp.maximum(jnp.max(jnp.abs(x32), axis=-1, keepdims=True), jnp.float32(1e-12)) / f8_max
+    qx = jnp.clip(x32 / x_scale, -f8_max, f8_max).astype(jnp.float8_e4m3fn)
+    acc = jax.lax.dot_general(qx, w, (((x.ndim - 1,), (0,)), ((), ())), preferred_element_type=jnp.float32)
+    y = (acc * x_scale * p[name + ".scale"]).astype(x.dtype)
+    return y + p[name + ".bias"].astype(x.dtype)
   y = jnp.dot(x.astype(w.dtype), w, preferred_element_type=jnp.float32).astype(w.dtype)
   return y + p[name + ".bias"].astype(w.dtype)
 

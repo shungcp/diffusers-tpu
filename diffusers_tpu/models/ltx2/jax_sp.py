@@ -23,7 +23,7 @@ from diffusers_tpu.models.ltx2 import jax_dit as jd
 
 
 def _gathered(name, v, n):
-  return v.ndim == 2 and name.endswith(".weight") and v.shape[0] % n == 0 and v.shape[0] >= 512
+  return n > 1 and v.ndim == 2 and name.endswith(".weight") and v.shape[0] % n == 0 and v.shape[0] >= 512
 
 
 def param_specs(params, axis, n, resident=()):
@@ -35,29 +35,43 @@ def param_specs(params, axis, n, resident=()):
   return out
 
 
-def place(params, mesh, axis="sp", resident=()):
+def place(params, mesh, axis="sp", resident=(), fp8=False):
   from jax.sharding import NamedSharding
 
+  if axis not in mesh.axis_names:
+    axis = mesh.axis_names[-1]
   specs = param_specs(params, axis, mesh.shape[axis], resident)
+  if fp8:
+    return jd.quantize_fp8(params, mesh=mesh, specs=specs)
   return jax.tree.map(lambda v, s: jax.device_put(v, NamedSharding(mesh, s)), params, specs)
 
 
-def _splash(q, k, v):
+def _splash(q, k, v, qk_fp8=False):
   if jax.default_backend() == "cpu" or q.shape[2] % 128 or k.shape[2] % 128:  # tests / small sizes
     t = lambda z: z.transpose(0, 2, 1, 3)
     return t(jd.dense_attention(t(q), t(k), t(v)))
   from diffusers_tpu.kernels import block_sizes, splash
 
-  blocks = block_sizes.resolve_block_sizes(q.shape[2], k.shape[2], q.shape[-1], {}, "residual",
+  mode = "residual-qkfp8" if qk_fp8 else "residual"
+  blocks = block_sizes.resolve_block_sizes(q.shape[2], k.shape[2], q.shape[-1], {}, mode,
                                            block_sizes.detect_spec())
-  return splash.attention(q, k, v, scale=None, **blocks)
+  return splash.attention(q, k, v, scale=None, qk_fp8=qk_fp8, **blocks)
 
 
-def _attentions(axis):
+def _attentions(axis, sp_size=2, qk_fp8=False):
+  if sp_size <= 1:
+    def video_self_local(q, k, v, bias=None):
+      q, k, v = (t.transpose(0, 2, 1, 3) for t in (q, k, v))
+      return _splash(q, k, v, qk_fp8=qk_fp8).transpose(0, 2, 1, 3)
+
+    dense = jd.dense_attention
+    return {"video_self": video_self_local, "audio_self": dense, "video_text": dense, "audio_text": dense,
+            "a2v": dense, "v2a": dense}
+
   def video_self(q, k, v, bias=None):  # Ulysses: [B, S/n, H, D] -> [B, S, H/n, D] and back
     a2a = lambda t: jax.lax.all_to_all(t, axis, 2, 1, tiled=True)
     q, k, v = (a2a(t).transpose(0, 2, 1, 3) for t in (q, k, v))
-    o = _splash(q, k, v).transpose(0, 2, 1, 3)
+    o = _splash(q, k, v, qk_fp8=qk_fp8).transpose(0, 2, 1, 3)
     return jax.lax.all_to_all(o, axis, 1, 2, tiled=True)
 
   def v2a(q, k, v, bias=None):  # replicated audio queries, this chip's video keys
@@ -74,8 +88,10 @@ def _attentions(axis):
           "a2v": dense, "v2a": v2a}
 
 
-def make_blocks_fn(mesh, cfg, params, axis="sp", resident=(), stg_blocks=()):
-  """``blocks_fn`` for ``jax_dit.forward``: x rows split over ``axis``."""
+def make_blocks_fn(mesh, cfg, params, axis="sp", resident=(), stg_blocks=(),
+                   cfg_axis=None, qk_fp8=False):
+  """``blocks_fn`` for ``jax_dit.forward``: x rows split over ``axis`` (and
+  optionally CFG rows split over ``cfg_axis`` on a 2-D ``("cfg", "sp")`` mesh)."""
   from jax.experimental.shard_map import shard_map
   from jax.sharding import PartitionSpec as P
 
@@ -83,12 +99,20 @@ def make_blocks_fn(mesh, cfg, params, axis="sp", resident=(), stg_blocks=()):
   # JAX config, which mid-trace makes the next call retrace and recompile.
   from diffusers_tpu.kernels import block_sizes, splash  # noqa: F401
 
-  n = mesh.shape[axis]
-  specs = param_specs(params, axis, n, resident)["blocks"]
-  attention = _attentions(axis)
-  rows = P(None, axis, None)
-  rope_specs = {"video": (P(axis, None, None),) * 2, "ca_video": (P(axis, None, None),) * 2,
-                "audio": (P(),) * 2, "ca_audio": (P(),) * 2}
+  if cfg_axis is None and len(mesh.axis_names) == 2:
+    cfg_axis, axis = mesh.axis_names[0], mesh.axis_names[1]
+  elif axis not in mesh.axis_names:
+    axis = mesh.axis_names[-1]
+  sp_size = mesh.shape[axis]
+  c_ax = cfg_axis if (cfg_axis is not None and mesh.shape[cfg_axis] > 1) else None
+  s_ax = axis if sp_size > 1 else None
+
+  specs = param_specs(params, axis, sp_size, resident)["blocks"]
+  attention = _attentions(axis, sp_size=sp_size, qk_fp8=qk_fp8)
+  rows = P(c_ax, s_ax, None)
+  aud_spec = P(c_ax, None, None)
+  vid_rope = (P(s_ax, None, None),) * 2
+  rope_specs = {"video": vid_rope, "ca_video": vid_rope, "audio": (P(),) * 2, "ca_audio": (P(),) * 2}
   stg_set = set(stg_blocks)
 
   def body(blocks, x, a, ctx, actx, cond, rope, stg, iso):
@@ -100,18 +124,18 @@ def make_blocks_fn(mesh, cfg, params, axis="sp", resident=(), stg_blocks=()):
     return x, a
 
   def blocks_fn(blocks, x, a, ctx, actx, cond, rope, stg, iso=None):
-    cond_specs = {k: P() for k in cond}
+    cond_specs = {k: P(c_ax) for k in cond}
     if cond.get("token_t") is not None:
-      cond_specs["token_t"] = P(axis)
+      cond_specs["token_t"] = P(s_ax)
     else:
       cond = dict(cond)
       cond.pop("token_t", None)
       cond_specs.pop("token_t", None)
-    stg_spec = None if stg is None else P()
-    iso_spec = None if iso is None else P()
+    stg_spec = None if stg is None else P(c_ax)
+    iso_spec = None if iso is None else P(c_ax)
     fn = shard_map(body, mesh=mesh,
-                   in_specs=(specs, rows, P(), P(), P(), cond_specs, rope_specs, stg_spec, iso_spec),
-                   out_specs=(rows, P()), check_rep=False)
+                   in_specs=(specs, rows, aud_spec, aud_spec, aud_spec, cond_specs, rope_specs, stg_spec, iso_spec),
+                   out_specs=(rows, aud_spec), check_rep=False)
     return fn(blocks, x, a, ctx, actx, cond, rope, stg, iso)
 
   return blocks_fn
