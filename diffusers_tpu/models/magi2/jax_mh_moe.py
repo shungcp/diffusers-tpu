@@ -383,6 +383,18 @@ def _grouped_swiglu_ffn(
     xs_in = jnp.pad(xs, ((0, pad_m), (0, 0))) if pad_m else xs
     xs_in = xs_in.astype(out_dt)
 
+    # FP8 accumulation / LHS-quantization mode for TPU v7x benchmarking:
+    # - "w8a16": FP8 weights (2x HBM BW), BF16 MXU dot, zero online VPU quant
+    # - "w8a8_bf16": W8A8 FP8 with BF16 acc (gmm_v2's built-in VPU mitigation)
+    # - "w8a8_fp32": W8A8 FP8 with FP32 acc (original behavior)
+    fp8_mode = os.environ.get("DT_MAGI2_FP8_MODE", "w8a16").strip().lower()
+    is_fp8 = w_gu_scale is not None
+    quantize_lhs = is_fp8 and (fp8_mode != "w8a16")
+    if is_fp8 and fp8_mode == "w8a8_bf16":
+      gmm_acc_dtype = None  # gmm_v2 selects bf16 acc when W8A8 is active
+    else:
+      gmm_acc_dtype = jnp.dtype(jnp.float32)
+
     h = _gmm_v2.gmm_v2(
         xs_in,
         w_gu,
@@ -390,8 +402,8 @@ def _grouped_swiglu_ffn(
         rhs_scale=w_gu_scale,
         fuse_act="swigluoai",
         preferred_element_type=out_dt,
-        acc_dtype=jnp.dtype(jnp.float32),
-        maybe_quantize_lhs=(w_gu_scale is not None),
+        acc_dtype=gmm_acc_dtype,
+        maybe_quantize_lhs=quantize_lhs,
         zero_initialize=zero_initialize,
         tile_info=_magi2_gmm_tile_fn,
     )
@@ -401,8 +413,8 @@ def _grouped_swiglu_ffn(
         group_sizes,
         rhs_scale=w_down_scale,
         preferred_element_type=out_dt,
-        acc_dtype=jnp.dtype(jnp.float32),
-        maybe_quantize_lhs=(w_down_scale is not None),
+        acc_dtype=gmm_acc_dtype,
+        maybe_quantize_lhs=(w_down_scale is not None) and (fp8_mode != "w8a16"),
         zero_initialize=zero_initialize,
         tile_info=_magi2_gmm_tile_fn,
     )
@@ -714,16 +726,34 @@ def mh_moe_forward_ag(
     y_h_local = lax.psum_scatter(y_partial, axis_name, scatter_dimension=0, tiled=True)
     return None, y_h_local
 
-  scan_inputs = (
-      x_by_head_local,
-      topk_idx_local,
-      topk_probs_local,
-      w_gate_up_local,
-      w_down_local,
-      w_gate_up_scale_local,
-      w_down_scale_local,
-  )
-  _, y_by_head_local = lax.scan(_head_body, None, scan_inputs)  # (H, S_local, d_head)
+  if os.environ.get("DT_MAGI2_UNROLL_HEADS", "1").strip() == "1":
+    head_outs = []
+    for h_idx in range(num_heads):
+      _, y_h = _head_body(
+          None,
+          (
+              x_by_head_local[h_idx],
+              topk_idx_local[h_idx],
+              topk_probs_local[h_idx],
+              w_gate_up_local[h_idx],
+              w_down_local[h_idx],
+              None if w_gate_up_scale_local is None else w_gate_up_scale_local[h_idx],
+              None if w_down_scale_local is None else w_down_scale_local[h_idx],
+          ),
+      )
+      head_outs.append(y_h)
+    y_by_head_local = jnp.stack(head_outs, axis=0)
+  else:
+    scan_inputs = (
+        x_by_head_local,
+        topk_idx_local,
+        topk_probs_local,
+        w_gate_up_local,
+        w_down_local,
+        w_gate_up_scale_local,
+        w_down_scale_local,
+    )
+    _, y_by_head_local = lax.scan(_head_body, None, scan_inputs)  # (H, S_local, d_head)
   return jnp.transpose(y_by_head_local, (1, 0, 2)).reshape(s_local, num_heads * d_head)
 
 

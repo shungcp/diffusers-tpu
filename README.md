@@ -30,6 +30,9 @@ Newest first. Each entry links a date to what changed.
 
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-27** — **MAGI-2-preview Round 2 on TPU `v7x-8` (3-framework parity + MoE head unroll + native `torch_tpu` Stage 2 1080p Refiner)** ([usage](#run-magi-2-preview--运行-magi-2-preview), [v7x ledger](docs/tpu_v7x.md#8-magi-2-preview-11393b-multi-head-latent-moe--1080p-refiner-on-tpu-v7x-8--magi-2-preview-端到端优化台账)): unrolling the 4 MoE heads (`DT_MAGI2_UNROLL_HEADS=1`, now default) lets XLA overlap `all_gather` with `gmm_v2` for a **+14.5% bit-exact lossless** Stage 1 540p speedup (**`3.213 -> 2.805 s/step` BF16**, `cos=1.000000`, `rel_l2=0.0000`; **`2.789 s/step`** with default `w8a16` FP8 saving `25 GiB` HBM); adding temporal-window block-sparse Splash+Sink (`--sparse-window 6`) and fixing `torchax` half-seq `cond-only` CFG skip brings 100-step `540p --lossy --sparse-window 6` warm denoise down to **`106.28 s` (Native JAX)**, **`106.75 s` (`torchax`, within `0.4%` of JAX)**, and **`140.05 s` (`torch_tpu`, `5.3 s` warm `DT_AOT_PERSIST` load)**; Stage 2 `1080p` Refiner adds `--refiner-radius 1,2,2` (**`8.51 s/step`** JAX, `cos=0.9973`) and a **native pure-PyTorch `torch_tpu` 6.72B Refiner** (`DP=2 × CP=4`, **`11.10 s/step`** warm `r=2,2,2` / **`9.00 s/step`** `r=1,2,2`, CPU FP32 `cos=1.000000000` vs JAX).
+
+  **2026-11-27** — **MAGI-2-preview TPU `v7x-8` 第二轮优化(三框架能力对齐 + MoE Head 展开 + 原生 `torch_tpu` Stage 2 1080p Refiner)**([用法](#run-magi-2-preview--运行-magi-2-preview),[台账](docs/tpu_v7x.md#8-magi-2-preview-11393b-multi-head-latent-moe--1080p-refiner-on-tpu-v7x-8--magi-2-preview-端到端优化台账)):展开 4 个 MoE head(`DT_MAGI2_UNROLL_HEADS=1`,现已默认开启)让 XLA 重叠 `all_gather` 与 `gmm_v2`,在比特级完全一致(`cos=1.000000`,`rel_l2=0.0000`)下为 540p Stage 1 带来 **+14.5% 无损提速**(**`3.213 -> 2.805 s/步` BF16**;默认 `w8a16` FP8 **`2.789 s/步`** 且省 `25 GiB` 显存);新增时序滑窗稀疏 Splash+Sink(`--sparse-window 6`)并修复 `torchax` 半序列 `cond-only` CFG 跳过后,100 步 `540p --lossy --sparse-window 6` 暖态去噪降至 **Native JAX `106.28 s`**、**`torchax` `106.75 s`(距 JAX 仅 `0.4%`)**、**`torch_tpu` `140.05 s`**(`DT_AOT_PERSIST` 热加载仅 `5.3 s`);Stage 2 `1080p` Refiner 新增 `--refiner-radius 1,2,2`(JAX **`8.51 s/步`**,`cos=0.9973`)并补齐 **原生纯 PyTorch `torch_tpu` 6.72B Refiner**(`DP=2 × CP=4`,`r=2,2,2` 暖态 **`11.10 s/步`**、`r=1,2,2` **`9.00 s/步`**,CPU FP32 对齐 JAX `cos=1.000000000`)。
 - **2026-11-27** — **VideoGym-LTX-2.3 on a v6e-8: 15.0 -> 13.9 s.** Taken from the v7x work: the video is converted to uint8 on the chips (decode 0.84 -> 0.62 s), and the four DiT rows run as two CFG groups of four chips (each group 2 rows, the gathered blocks split 4 ways, 16 blocks resident instead of 20), now the v6e-8 default: 0.44 s a step, 27.3 GiB peak, error against the official float32 run unchanged (latents 1.8e-2 vs official bfloat16 2.2e-2, frames 46.4 vs 45.1 dB). `--fp8` is slower on a v6e (16.9 s; no fp8 MXU) and lossy.
 
   **2026-11-27** — **VideoGym-LTX-2.3 在 v6e-8 上 15.0 -> 13.9 秒。** 借鉴 v7x 的改动:视频在 chip 上转成 uint8(解码 0.84 -> 0.62 秒),四行 DiT 分成两个 CFG 组、每组 4 个 chip(每组 2 行,gather 的块按 4 份切,常驻 16 块而非 20),现为 v6e-8 默认:每步 0.44 秒,峰值 27.3 GiB,对官方 fp32 的误差不变(latent 1.8e-2,官方 bf16 2.2e-2;帧 46.4 对 45.1 dB)。`--fp8` 在 v6e 上更慢(16.9 秒;没有 fp8 MXU)且有损。
@@ -809,21 +812,22 @@ bash scripts/run_magi2_jax_server.sh --requests reqs.jsonl --resolution 540p --l
 # Priority 2: torchax (PyTorch DiT traced through JAX/shard_map/lax.scan)
 bash scripts/run_magi2_torchax.sh 540p --fp8 --prompt "..."
 
-# Priority 3: torch_tpu (8-rank torchrun, spmd_safe + Pallas jax_op + DT_AOT_PERSIST + E2E MP4)
+# Priority 3: torch_tpu (8-rank torchrun, spmd_safe + Pallas jax_op + DT_AOT_PERSIST + E2E MP4 + native 1080p Refiner)
 bash scripts/run_magi2_torchtpu.sh --mode bench --resolution 540p --fp8
-bash scripts/run_magi2_torchtpu.sh --mode denoise --resolution 540p --fp8 --steps 100 \
+bash scripts/run_magi2_torchtpu.sh --mode denoise --resolution 540p --fp8 --lossy --steps 100 \
   --prompt "A red fox trotting through snow at golden hour" --enhance --decode-mp4
+bash scripts/run_magi2_torchtpu.sh --mode denoise --resolution 1080p --fp8 --lossy --refiner-qk-fp8 --decode-mp4 --prompt "..."
 ```
 
 | MAGI-2-preview on TPU v7x-8 (10 s, CFG=2) | Native JAX | torchax | torch_tpu |
 |---|---|---|---|
 | Stage 1 `272p BF16` (`113.93B`, `S=29,664`) | `0.960 s/step` | `0.960 s/step` | **`0.923 s/step`** |
-| Stage 1 `272p FP8-W8A8` | — | `0.963 s/step` | **`0.717–0.829 s/step`** (`1.45 s` warm `DT_AOT_PERSIST`) |
-| Stage 1 `540p BF16` (`113.93B`, `S=115,680`, lossless) | `3.18–3.42 s/step` (`67.7 GiB` HBM) | `3.728 s/step` | **`3.331 s/step`** |
-| Stage 1 `540p FP8-W8A8` (lossless) | `3.430 s/step` (`42.7 GiB` HBM) | `3.745 s/step` | **`3.248 s/step`** |
-| Stage 1 `540p BF16 --lossy` (100 steps I2V, TeaCache + late `cond-only` CFG skip) | **`1.266 s/step` eff.** (`129.76 s` denoise / `181.23 s` warm E2E, **`2.61×`**, PSNR `22.62 dB`, audio corr `0.9793`) | — | — |
-| Stage 2 `1080p` Refiner (`6.72B`, 5 steps, default BF16 `DP=2×CP=4` lossless) | **`10.56 s/step`** (`53.38 s` / 5 steps, **`8.27×`** vs `87.35 s`, `cos=0.999999`) | — | — |
-| Stage 2 `1080p` Refiner (`--refiner-qk-fp8`, opt-in) | **`10.15 s/step`** (`50.75 s` warm / 5 steps, **`8.61×`**) | — | — |
+| Stage 1 `272p FP8` | — | `0.963 s/step` | **`0.717–0.829 s/step`** (`1.45 s` warm `DT_AOT_PERSIST`) |
+| Stage 1 `540p BF16` (`113.93B`, lossless, unrolled MoE default) | **`2.805 s/step`** (`+14.5%` bit-exact, `67.8 GiB` HBM) | `3.728 s/step` | `3.331 s/step` |
+| Stage 1 `540p FP8` (`w8a16` default, lossless) | **`2.789 s/step`** (`42.8 GiB` HBM, `-25 GiB`) | `3.745 s/step` | `3.248 s/step` |
+| Stage 1 `540p --lossy` + `--sparse-window 6` (100 steps warm) | **`106.28 s`** (`1.063 s/step` eff., **`3.02×`**, FP8 `42.8 GiB`) | **`106.75 s`** (`1.068 s/step` eff., **`3.49×`**, `0.4%` vs JAX) | **`140.05 s`** (`1.401 s/step` eff., **`2.53×`**, `5.3 s` AOT load) |
+| Stage 2 `1080p` Refiner (`6.72B`, 5 steps, `DP=2×CP=4`, `r=2,2,2`) | **`10.56 s/step` BF16** / **`10.15–10.37 s/step` `qk_fp8`** | — | **`11.10 s/step`** (`57.10 s` warm / 5 steps, `qk_fp8`, `DT_AOT_PERSIST`) |
+| Stage 2 `1080p` Refiner (`--refiner-qk-fp8 --refiner-radius 1,2,2`) | **`8.51 s/step`** (`~42.5 s` warm, `cos=0.9973`) | — | **`9.00 s/step`** (`~46 s` warm, `cos=0.9970`) |
 | Stage 3a `TurboVAED` 8-chip sharded decode (`540p` / `1080p` warm) | **`0.72 s`** (`1.80×`) / **`3.88 s`** (`3.09×`, bit-exact `PSNR=∞`) | — | Uses JAX Stage 3 via `--decode-mp4` |
 | Stage 0a `Wan2.2` I2V ref encode / Stage 0b `Qwen3.5` `--uncond-cache` | **`0.29 s`** cache (`22.7 ms` warm) / **`1.62 ms`** disk hit | — | Uses JAX Stage 0 via `--prompt --enhance` |
 | Resident Multi-Request Server (`run_magi2_jax_server.sh`) | **`41.80 GiB` HBM/chip** (all 4 BF16 models, `33.65 s` warm startup once, `0 s` reload) | — | — |

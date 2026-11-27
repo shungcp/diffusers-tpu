@@ -110,16 +110,21 @@ export PYTHONPATH="$R/compat/torchvision_stub:$R:/workspace/shun/tokamax${PYTHON
 
 # Optional Stage 3 (8-chip TurboVAED + Oobleck stereo audio -> playable MP4) after torch_tpu releases libtpu
 if [ "$DECODE_MP4" = "1" ]; then
+  REF_NPZ="$OUT_DIR/${TAG}_refiner_latents.npz"
   LAT_NPZ="$OUT_DIR/${TAG}_stage1_latents.npz"
-  if [ ! -f "$LAT_NPZ" ]; then
-    echo "[run_magi2_torchtpu] ERROR: expected latents at $LAT_NPZ (pass --mode denoise with --decode-mp4)" >&2
+  if [ -f "$REF_NPZ" ]; then
+    DEC_NPZ="$REF_NPZ"
+  elif [ -f "$LAT_NPZ" ]; then
+    DEC_NPZ="$LAT_NPZ"
+  else
+    echo "[run_magi2_torchtpu] ERROR: expected latents at $REF_NPZ or $LAT_NPZ (pass --mode denoise with --decode-mp4)" >&2
     exit 1
   fi
-  echo "[run_magi2_torchtpu] Stage 3: Decoding $LAT_NPZ -> $OUT_DIR/${TAG}.mp4 (8-chip TurboVAED + Oobleck) ..."
+  echo "[run_magi2_torchtpu] Stage 3: Decoding $DEC_NPZ -> $OUT_DIR/${TAG}.mp4 (8-chip TurboVAED + Oobleck) ..."
   TORCH_DEVICE_BACKEND_AUTOLOAD=0 PYTHONPATH="$R" "$JAX_PY" -u -m diffusers_tpu.models.magi2.jax_pipeline \
     --model-dir "$MAGI2_CKPT_ROOT" \
     --resolution "$RES" \
-    --load-stage1-latents "$LAT_NPZ" \
+    --load-stage1-latents "$DEC_NPZ" \
     --no-refiner \
     --out "$OUT_DIR" \
     --tag "$TAG" \

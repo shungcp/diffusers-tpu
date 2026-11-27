@@ -673,8 +673,10 @@ def residual_attention(
     use_fixed_m: bool = False,
     qk_fp8: bool = False,
     mk: jax.Array | None = None,
+    kv_table=None,
+    kv_table_dyn=None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-  """Device-local residual attention over one KV shard for ring merge.
+  """Device-local residual attention over one KV shard for ring merge or sink.
 
   Args:
     query: ``(B, heads, seq_q, dim)`` device-local.
@@ -695,6 +697,10 @@ def residual_attention(
       bound (``fixed_m_bound.ring_fixed_m_operands``). Build it outside
       any vmap so it stays unmapped (a mapped operand slows the
       pallas_call ~1.6x at batch 2).
+    kv_table: Optional static block-sparsity table (per Q block, sorted list of
+      KV blocks to visit, or ``(classes, head_class)``). ``None`` visits all.
+    kv_table_dyn: Optional traced ``(table, counts)`` arrays used instead of
+      ``kv_table``.
 
   Returns:
     ``(o_unnorm, m, l)`` where ``o_unnorm`` is ``(B, heads, seq_q, dim)``
@@ -731,6 +737,8 @@ def residual_attention(
         use_fixed_m=use_fixed_m,
         emit_residuals=True,
         qk_fp8=qk_fp8,
+        kv_table=kv_table,
+        kv_table_dyn=kv_table_dyn,
     )
     # o_un (h, dim, seq) -> (h, seq, dim); m, l (h, NUM_SUBLANES, seq) -> row 0.
     o_un = jnp.swapaxes(o_un, 1, 2)[:, :q_orig_len, :]

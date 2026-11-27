@@ -47,6 +47,7 @@ try:
   import jax.numpy as jnp
   from ...kernels import block_sizes as _block_sizes
   from ...kernels import fixed_m_bound as _fixed_m_bound
+  from ...kernels import sparse_splash as _sparse_splash
   from ...kernels import splash as _splash
 except ImportError:  # pragma: no cover - allows syntax checks without JAX installed
   jax = None  # type: ignore[assignment]
@@ -54,6 +55,7 @@ except ImportError:  # pragma: no cover - allows syntax checks without JAX insta
   jnp = None  # type: ignore[assignment]
   _block_sizes = None  # type: ignore[assignment]
   _fixed_m_bound = None  # type: ignore[assignment]
+  _sparse_splash = None  # type: ignore[assignment]
   _splash = None  # type: ignore[assignment]
 
 from .config import Magi2PreviewConfig
@@ -180,6 +182,53 @@ def apply_residual_attention_sink(
   return (o_unnorm * alpha) / (l * alpha + sink_w)
 
 
+def build_magi2_sparse_kv_table(
+    seq_len: int,
+    n_vid: int,
+    rows_per_frame: int,
+    window: int,
+    *,
+    block_q: int = 1024,
+    block_kv: int = 1024,
+    anchor_first_frame: bool = True,
+) -> list[list[int]]:
+  """Build a per-Q-block sorted KV block table for one MAGI-2 packed segment.
+
+  MAGI-2 packs each CFG segment as ``[video (0..n_vid), audio, text, ref?]``
+  where video tokens are contiguous in raster ``(t, h, w)`` order with
+  ``rows_per_frame = h * w``.
+
+  Every audio, text, and I2V reference row keeps 100% full bidirectional
+  attention. Video Q-block ``[q0, q1)`` attends to video KV-block ``[k0, k1)``
+  if within ``±window`` latent frames (plus optional frame-0 anchor for global
+  temporal/I2V consistency).
+  """
+  bq = min(int(block_q), int(seq_len))
+  bkv = min(int(block_kv), int(seq_len))
+  num_q = -(-int(seq_len) // bq)
+  num_kv = -(-int(seq_len) // bkv)
+  reach = int(window) * int(rows_per_frame)
+  rpf = int(rows_per_frame)
+  v_end = int(n_vid)
+  table: list[list[int]] = []
+  for i in range(num_q):
+    q0 = i * bq
+    q1 = min((i + 1) * bq, seq_len)
+    row: list[int] = []
+    for j in range(num_kv):
+      k0 = j * bkv
+      k1 = min((j + 1) * bkv, seq_len)
+      if (
+          q1 > v_end
+          or k1 > v_end
+          or (anchor_first_frame and k0 < rpf)
+          or (k0 < q1 + reach and k1 > q0 - reach)
+      ):
+        row.append(j)
+    table.append(row)
+  return table
+
+
 def _sdpa_with_sink_single_segment(
     q_seg: Any,
     k_seg: Any,
@@ -187,17 +236,23 @@ def _sdpa_with_sink_single_segment(
     sinks_local: Any | None,
     *,
     use_splash: bool,
+    kv_table: list[list[int]] | None = None,
+    sparse_block_q: int = 1024,
+    sparse_block_kv: int = 1024,
 ) -> Any:
-  """Single-sample bidirectional SDPA + optional Attention Sink.
+  """Single-sample bidirectional SDPA + optional Attention Sink & block-sparsity.
 
   Args:
     q_seg: ``(1, H_q_local, S, D)``
     k_seg: ``(1, H_kv_local, S, D)``
     v_seg: ``(1, H_kv_local, S, D)``
     sinks_local: ``(sink_num, H_q_local)`` float32 or ``None``.
-    use_splash: If True, run TPU Pallas ``splash.residual_attention``
-      (NEVER mean-centering K, since softmax with a fixed sink logit is not
+    use_splash: If True, run TPU Pallas ``splash.residual_attention`` (or
+      ``sparse_splash.residual_attention`` when ``kv_table`` is provided; NEVER
+      mean-centering K, since softmax with a fixed sink logit is not
       shift-invariant in K!). If False, run exact float32 reference attention.
+    kv_table: Optional static block-sparsity table (per Q block, sorted list of
+      KV block indices to visit). ``None`` runs dense attention.
   """
   hq = q_seg.shape[1]
   hkv = k_seg.shape[1]
@@ -210,27 +265,44 @@ def _sdpa_with_sink_single_segment(
   if use_splash and _splash is not None and head_dim % 128 == 0:
     if hq % hkv != 0:
       raise ValueError(f"num_heads_q={hq} must be divisible by num_heads_kv={hkv}")
-    try:
-      blocks = _block_sizes.resolve_block_sizes(
-          seq_len, seq_len, head_dim, {}, "residual", _block_sizes.detect_spec()
+    if kv_table is not None and _sparse_splash is not None:
+      bq = min(int(sparse_block_q), seq_len)
+      bkv = min(int(sparse_block_kv), seq_len)
+      bkvc = min(512, bkv)
+      # IMPORTANT: Do NOT subtract mean(k) and keep use_fixed_m=False for sink.
+      o_unnorm, m, l = _sparse_splash.residual_attention(
+          q_seg.astype(jnp.bfloat16),
+          k_seg.astype(jnp.bfloat16),
+          v_seg.astype(jnp.bfloat16),
+          scale=scale,
+          block_q=bq,
+          block_kv=bkv,
+          block_kv_compute=bkvc,
+          use_fixed_m=False,
+          kv_table=kv_table,
       )
-    except Exception:
-      blocks = {
-          "block_q": min(1024, seq_len),
-          "block_kv": min(1024, seq_len),
-          "block_kv_compute": min(512, seq_len),
-      }
-    # IMPORTANT: Do NOT subtract mean(k) here! With an attention sink,
-    # shifting K shifts QK^T relative to the fixed sink logit s_h.
-    # Also keep use_fixed_m=False so m is exact online rowmax.
-    o_unnorm, m, l = _splash.residual_attention(
-        q_seg.astype(jnp.bfloat16),
-        k_seg.astype(jnp.bfloat16),
-        v_seg.astype(jnp.bfloat16),
-        scale=scale,
-        use_fixed_m=False,
-        **blocks,
-    )
+    else:
+      try:
+        blocks = _block_sizes.resolve_block_sizes(
+            seq_len, seq_len, head_dim, {}, "residual", _block_sizes.detect_spec()
+        )
+      except Exception:
+        blocks = {
+            "block_q": min(1024, seq_len),
+            "block_kv": min(1024, seq_len),
+            "block_kv_compute": min(512, seq_len),
+        }
+      # IMPORTANT: Do NOT subtract mean(k) here! With an attention sink,
+      # shifting K shifts QK^T relative to the fixed sink logit s_h.
+      # Also keep use_fixed_m=False so m is exact online rowmax.
+      o_unnorm, m, l = _splash.residual_attention(
+          q_seg.astype(jnp.bfloat16),
+          k_seg.astype(jnp.bfloat16),
+          v_seg.astype(jnp.bfloat16),
+          scale=scale,
+          use_fixed_m=False,
+          **blocks,
+      )
     if sinks_local is not None:
       o_f32 = apply_residual_attention_sink(o_unnorm, m, l, sinks_local)
     else:
@@ -254,6 +326,16 @@ def _sdpa_with_sink_single_segment(
       )
       * jnp.float32(scale)
   )
+  if kv_table is not None:
+    bq = min(int(sparse_block_q), seq_len)
+    bkv = min(int(sparse_block_kv), seq_len)
+    mask_np = np.zeros((seq_len, seq_len), dtype=np.bool_)
+    for qi, kv_list in enumerate(kv_table):
+      q0, q1 = qi * bq, min((qi + 1) * bq, seq_len)
+      for kj in kv_list:
+        k0, k1 = kj * bkv, min((kj + 1) * bkv, seq_len)
+        mask_np[q0:q1, k0:k1] = True
+    logits = jnp.where(jnp.asarray(mask_np)[None, None, :, :], logits, jnp.float32(-1e9))
   lse = jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
   probs = jnp.exp(logits - lse)
   o_std = jnp.einsum(
@@ -551,6 +633,7 @@ def _build_modules():
         cp_size: int = 1,
         axis_name: str = "tp",
         use_splash: bool = False,
+        sparse_kv_tables: Sequence[list[list[int]] | None] | None = None,
     ) -> Any:
       s_local = x_sorted.shape[0]
       act_dtype = x_sorted.dtype
@@ -632,7 +715,7 @@ def _build_modules():
       h_q_local = q_full.shape[1]
       seg_outs = []
       offset = 0
-      for seg_len in sample_lens:
+      for seg_i, seg_len in enumerate(sample_lens):
         if seg_len <= 0:
           continue
         end = offset + seg_len
@@ -643,8 +726,18 @@ def _build_modules():
         q_s = jnp.transpose(q_full[offset:end], (1, 0, 2))[None, ...]  # (1, H_loc, seg, D)
         k_s = jnp.transpose(k_full[offset:end], (1, 0, 2))[None, ...]
         v_s = jnp.transpose(v_full[offset:end], (1, 0, 2))[None, ...]
+        seg_table = (
+            sparse_kv_tables[seg_i]
+            if (sparse_kv_tables is not None and seg_i < len(sparse_kv_tables))
+            else None
+        )
         o_s = _sdpa_with_sink_single_segment(
-            q_s, k_s, v_s, sinks_local, use_splash=use_splash
+            q_s,
+            k_s,
+            v_s,
+            sinks_local,
+            use_splash=use_splash,
+            kv_table=seg_table,
         )
         seg_outs.append(jnp.transpose(o_s[0], (1, 0, 2)))  # (seg, H_loc, D)
         offset = end
@@ -891,6 +984,7 @@ def _build_modules():
         use_splash: bool = False,
         moe_mode: str | None = None,
         capacity_factor: float | None = None,
+        sparse_kv_tables: Sequence[list[list[int]] | None] | None = None,
     ) -> Any:
       c = self.config
       s_local = hidden_states.shape[0]
@@ -927,6 +1021,7 @@ def _build_modules():
             cp_size=cp_size,
             axis_name=axis_name,
             use_splash=use_splash,
+            sparse_kv_tables=sparse_kv_tables,
         )
         s_mid_flat, mlp_in, post_mix_m, comb_mix_m = mhc_fused_post_pre_tokamax(
             attn_out,
@@ -977,6 +1072,7 @@ def _build_modules():
           cp_size=cp_size,
           axis_name=axis_name,
           use_splash=use_splash,
+          sparse_kv_tables=sparse_kv_tables,
       )
       s_mid = mhc_post(
           s,
@@ -1328,6 +1424,7 @@ def make_jitted_forward(
     capacity_factor: float | None = None,
     scan_layers: bool = True,
     release_model_moe: bool = False,
+    sparse_kv_tables: Sequence[list[list[int]] | None] | None = None,
 ):
   """Compile MAGI-2 Preview forward with ``nnx.split``/``nnx.merge`` inside ``jax.jit``.
 
@@ -1453,8 +1550,13 @@ def make_jitted_forward(
   m_dtype = model.dtype
   splash_flag = _resolve_use_splash(use_splash)
 
-  def _compile_for_lens(target_lens: tuple[int, ...]):
+  def _compile_for_lens(
+      target_lens: tuple[int, ...],
+      *,
+      sparse_kv_tables: Sequence[list[list[int]] | None] | None = None,
+  ):
     t_lens = tuple(int(v) for v in target_lens)
+    t_tables = tuple(sparse_kv_tables) if sparse_kv_tables is not None else None
 
     def _run_local(st, x_l, rope_l, mod_l, time_l, *, _cp: int):
       pre_s, layer_ss, post_s = st
@@ -1506,6 +1608,7 @@ def make_jitted_forward(
                 use_splash=splash_flag,
                 moe_mode=moe_mode,
                 capacity_factor=capacity_factor,
+                sparse_kv_tables=t_tables,
             )
             return nxt, None
 
@@ -1525,6 +1628,7 @@ def make_jitted_forward(
               use_splash=splash_flag,
               moe_mode=moe_mode,
               capacity_factor=capacity_factor,
+              sparse_kv_tables=t_tables,
           )
 
       x_seq = x_sorted[inv_perm_local]
@@ -1552,7 +1656,7 @@ def make_jitted_forward(
 
     return _single_scanned
 
-  primary_fn = _compile_for_lens(seg_lens)
+  primary_fn = _compile_for_lens(seg_lens, sparse_kv_tables=sparse_kv_tables)
   primary_fn.bind_sample_lens = _compile_for_lens
   return primary_fn, packed_state
 

@@ -169,18 +169,21 @@ Full end-to-end 4-phase optimization of Sand.ai **MAGI-2-preview** (113.93B / 5.
 | **Phase 3** (`53b5c95`) | Stage 1 `540p` 100-step I2V `--lossy` (Audio+Video TeaCache `0.30` + late-step half-seq `cond-only` CFG skip `after=0.65`) | `318–338 s` lossless (`3.18–3.38 s/step`) | **`129.76 s`** (`1.266 s/step` eff.; `29` full + `17` cond-only @ `1.97 s` + `54` cached); warm E2E **`181.23 s`** | **`2.51×–2.61×`** | Case 2 Barista QA vs lossless: Video **`PSNR = 22.62 dB`** (`mean\|d\|=7.60/255`), Dialogue Audio **`-23.1 vs -23.5 dBFS`**, 50 ms speech envelope **corr `0.9793`** |
 | **Phase 4** (`ffc4f17`) | Native JAX Resident Server (`jax_server.py`, `--requests` JSONL) | Cold reload per request (`33–320 s` startup + re-JIT) | **All 4 models BF16 resident in `41.80 GiB / 94.74 GiB` HBM/chip** (`33.65 s` warm startup once); req #2 zero-reload via `bind_sample_lens` (`s3v=0.19 s`, `s3a=0.04 s`) | **`316×` s3v / `363×` s3a** warm; **0 s** reload | Verified 2 distinct prompt lengths (`cafe` + `fox`) with zero extra HBM weight copies |
 | **Phase 4** (`ffc4f17`) | `torch_tpu` E2E (`run_magi2_torchtpu.sh --prompt --enhance --decode-mp4`) + shared rank-0 `DT_AOT_PERSIST` (`272p FP8`) | `32.57 s` cold compile / `9.18 s` warm Inductor+XLA; manual 3-step CLI | **`1.45 s`** compile via `DT_AOT_PERSIST` (`178 MiB` rank-0 bins: `mm 35M`, `moe 141M`, `post 2.7M`); **`0.717 s/step`** denoise + full MP4 mux | **`22.5×`** vs cold / **`6.3×`** vs warm Inductor+XLA | Identical cross-process latent stats (`video std=1.9196`, `audio std=0.6711`) |
+| **Phase 5** (Round 2) | Stage 1 Multi-Head MoE head-loop unroll (`DT_MAGI2_UNROLL_HEADS=1`, default ON) + default `DT_MAGI2_FP8_MODE=w8a16` (`540p`, `S=119,808`) | `3.213 s/step` BF16 / `3.231 s/step` FP8 `w8a8_fp32` | **`2.805 s/step` BF16** (`+14.5%` lossless) / **`2.789 s/step` FP8 `w8a16`** (`42.82 GiB` HBM, `-25 GiB`) | **`1.145×` lossless** / **`1.152×` FP8** | BF16 unroll **`cos=1.000000`, `rel_l2=0.0000`** (bit-exact); FP8 `w8a16` best parity (`video 0.9663`, `audio 0.9727`) |
+| **Phase 5** (Round 2) | Stage 1 `540p` 100-step `--lossy --sparse-window 6` (temporal block-sparse Splash+Sink `45.6%` density) across **Native JAX / `torchax` / `torch_tpu`** | `321 s` lossless (`JAX`) / `373 s` (`torchax`) / `355 s` (`torch_tpu`) | **JAX warm `106.28 s`** (`1.063 s/step`, `42.82 GiB` FP8) / **`torchax` warm `106.75 s`** (`1.068 s/step`, `0.4%` vs JAX!) / **`torch_tpu` warm `140.05 s`** (`5.29 s` AOT load) | **`3.02×` JAX / `3.49×` torchax / `2.53×` torch_tpu** | Visual 5-frame QA passed across all 3 backends; JAX `fp8_sw6 vs bf16_sw6` PSNR `25.37 dB` (`frame 0 = 46.78 dB`) |
+| **Phase 5** (Round 2) | Stage 2 `1080p` Refiner `--refiner-radius 1,2,2` (75 vs 125 blocks) + **native `torch_tpu` Stage 2 Refiner** (`6.72B`, `DP=2×CP=4`, `DT_AOT_PERSIST`) | JAX `10.37 s/step` (`r=2,2,2`); `torch_tpu` had no Stage 2 Refiner | **JAX `r=1,2,2`: `8.51 s/step`** (`1.22×`, `cos=0.9973`); **Native `torch_tpu` `r=2,2,2`: `11.10 s/step`** (`57.10 s` warm / 5 steps, `1.6 s` AOT load) & **`r=1,2,2`: `9.00 s/step`** (`cos=0.9970`) | **`1.22×–1.23×`** (`r=1,2,2`); `torch_tpu` within `6.5%` of JAX | CPU FP32 `torch_refiner_dit` vs `jax_refiner_dit` `cos=1.000000000` (`max\|d\|=1.13e-6`); TPU zero anomalies |
 
 ### 8.2 Three-Backend Stage 1 + Stage 2 Performance Summary (`v7x-8`, 10 s Audio+Video, CFG=2)
 
 | Configuration (`v7x-8`) | Native JAX | `torchax` | `torch_tpu` (`8-rank`, `spmd_safe`) |
 | :--- | :---: | :---: | :---: |
 | Stage 1 `272p BF16` (`S=29,664`) | `0.960 s/step` | `0.960 s/step` | **`0.923 s/step`** |
-| Stage 1 `272p FP8-W8A8` | — | `0.963 s/step` | **`0.717–0.829 s/step`** (`1.45 s` warm `DT_AOT_PERSIST` compile) |
-| Stage 1 `540p BF16` (`S=115,680`, lossless) | `3.415 s/step` (`67.7 GiB` peak) | `3.728 s/step` | **`3.331 s/step`** |
-| Stage 1 `540p FP8-W8A8` (lossless) | `3.430 s/step` (`42.7 GiB` HBM, `PSNR 20.83 dB`) | `3.745 s/step` | **`3.248 s/step`** |
-| Stage 1 `540p BF16 --lossy` (100 steps I2V E2E) | **`1.266 s/step` eff. (`129.76 s` denoise / `181.23 s` warm E2E)** | — | — |
-| Stage 2 `1080p` Refiner (`1088×1920 @ 25 fps`, 5 steps, default BF16 `DP=2×CP=4`) | **`10.56 s/step` (`53.38 s` / 5 steps, `8.27×` lossless)** | — | — |
-| Stage 2 `1080p` Refiner (`--refiner-qk-fp8`, 5 steps) | **`10.15 s/step` (`50.75 s` warm, `8.61×`)** | — | — |
+| Stage 1 `272p FP8` | — | `0.963 s/step` | **`0.717–0.829 s/step`** (`1.45 s` warm `DT_AOT_PERSIST` compile) |
+| Stage 1 `540p BF16` (`S=115k–120k`, lossless, default unrolled MoE) | **`2.805 s/step`** (`67.8 GiB` peak) | `3.728 s/step` (pre-unroll) | `3.331 s/step` |
+| Stage 1 `540p FP8` (`w8a16` default, lossless) | **`2.789 s/step`** (`42.8 GiB` HBM, `-25 GiB`) | `3.745 s/step` (pre-unroll) | `3.248 s/step` |
+| Stage 1 `540p --lossy` / `--lossy --sparse-window 6` (100 steps warm) | **`106.28 s`** (`1.063 s/step` eff., **`3.02×`**, FP8 `42.8 GiB`) | **`106.75 s`** (`1.068 s/step` eff., **`3.49×`**, `52.1 GiB`) | **`140.05 s`** (`1.401 s/step` eff., **`2.53×`**, `5.3–6.4 s` AOT load) |
+| Stage 2 `1080p` Refiner (`6.72B`, 5 steps, `DP=2×CP=4`, `r=2,2,2`) | **`10.56 s/step` BF16** / **`10.15–10.37 s/step` `--refiner-qk-fp8`** | — | **`11.10 s/step`** (`57.10 s` warm / 5 steps, `qk_fp8`, `DT_AOT_PERSIST`) |
+| Stage 2 `1080p` Refiner (`--refiner-qk-fp8 --refiner-radius 1,2,2`) | **`8.51 s/step`** (`~42.5 s` warm, `cos=0.9973`) | — | **`9.00 s/step`** (`~46 s` warm, `cos=0.9970`) |
 
 ### 8.3 Key Engineering Decisions & Data-Driven Drops / 关键工程决策与实测否决项
 

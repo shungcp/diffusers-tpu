@@ -30,7 +30,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import torch
@@ -408,6 +408,7 @@ def make_torchax_jitted_forward(
     use_tokamax: bool | None = None,
     dtype: torch.dtype = torch.bfloat16,
     fp8_moe: bool = False,
+    sparse_kv_tables: Sequence[list[list[int]] | None] | None = None,
 ):
   """Compile ``Magi2PreviewTransformerTorch`` under ``torchax`` + ``shard_map`` + ``lax.scan``.
 
@@ -458,248 +459,269 @@ def make_torchax_jitted_forward(
     out_j = jax.lax.all_to_all(x_4d, axis_name, split_axis=0, concat_axis=1)
     return env.j2t_iso(out_j.reshape(s_loc, cp_size * h_loc, d))
 
-  def _attn_with_sink_hook(q_t, k_t, v_t, sinks_t, slens, _scale):
-    q_j, k_j, v_j, sinks_j = env.t2j_iso((q_t, k_t, v_t, sinks_t))
-    s_total, h_loc, d = q_j.shape
-    if cp_size > 1:
-      rank = jax.lax.axis_index(axis_name)
-      sinks_loc = jax.lax.dynamic_slice_in_dim(
-          sinks_j, rank * h_loc, h_loc, axis=1
-      )
-    else:
-      sinks_loc = sinks_j
-
-    # (S_total, H_loc, D) -> (1, H_loc, S_total, D)
-    q_bhsd = jnp.swapaxes(q_j, 0, 1)[None, :, :, :]
-    k_bhsd = jnp.swapaxes(k_j, 0, 1)[None, :, :, :]
-    v_bhsd = jnp.swapaxes(v_j, 0, 1)[None, :, :, :]
-
-    outs = []
-    offset = 0
-    for sl in slens:
-      o_seg = _sdpa_with_sink_single_segment(
-          q_bhsd[:, :, offset : offset + sl, :],
-          k_bhsd[:, :, offset : offset + sl, :],
-          v_bhsd[:, :, offset : offset + sl, :],
-          sinks_loc,
-          use_splash=use_splash,
-      )
-      outs.append(jnp.swapaxes(o_seg[0], 0, 1))  # (sl, H_loc, D)
-      offset += sl
-    if offset < s_total:
-      outs.append(jnp.zeros((s_total - offset, h_loc, d), dtype=q_j.dtype))
-    out_j = outs[0] if len(outs) == 1 else jnp.concatenate(outs, axis=0)
-    return env.j2t_iso(out_j)
-
-  def _mh_moe_hook(x_t, gate_t, bias_t, wgu_t, wdn_t, wgus_t, wdns_t):
-    x_j, gate_j, bias_j, wgu_j, wdn_j = env.t2j_iso(
-        (x_t, gate_t, bias_t, wgu_t, wdn_t)
-    )
-    wgus_j = env.t2j_iso(wgus_t) if wgus_t is not None else None
-    wdns_j = env.t2j_iso(wdns_t) if wdns_t is not None else None
-    out_j = mh_moe_forward_local(
-        x_j,
-        gate_j,
-        bias_j,
-        wgu_j,
-        wdn_j,
-        num_heads=config.moe_num_heads,
-        num_experts=config.moe_num_experts,
-        top_k=config.moe_top_k,
-        ep_size=cp_size,
-        axis_name=axis_name,
-        mode=moe_mode,
-        capacity_factor=capacity_factor,
-        route_norm=config.moe_route_norm,
-        route_scale=config.moe_route_scale,
-        w_gate_up_scale_local=wgus_j,
-        w_down_scale_local=wdns_j,
-    )
-    return env.j2t_iso(out_j)
-
-  def _mhc_pre_hook(
-      s_flat_t, norm_w_t, phi_t, a_pre_t, a_post_t, a_res_t, b_pre_t, b_post_t, b_res_t
+  def _compile_for_lens(
+      target_lens: tuple[int, ...],
+      *,
+      sparse_kv_tables: Sequence[list[list[int]] | None] | None = None,
   ):
-    s_j, nw_j, phi_j, ap_j, apo_j, ar_j, bp_j, bpo_j, br_j = env.t2j_iso((
+    t_lens = tuple(int(v) for v in target_lens)
+    t_tables = tuple(sparse_kv_tables) if sparse_kv_tables is not None else None
+
+    def _attn_with_sink_hook(q_t, k_t, v_t, sinks_t, slens, _scale):
+      q_j, k_j, v_j, sinks_j = env.t2j_iso((q_t, k_t, v_t, sinks_t))
+      s_total, h_loc, d = q_j.shape
+      if cp_size > 1:
+        rank = jax.lax.axis_index(axis_name)
+        sinks_loc = jax.lax.dynamic_slice_in_dim(
+            sinks_j, rank * h_loc, h_loc, axis=1
+        )
+      else:
+        sinks_loc = sinks_j
+
+      # (S_total, H_loc, D) -> (1, H_loc, S_total, D)
+      q_bhsd = jnp.swapaxes(q_j, 0, 1)[None, :, :, :]
+      k_bhsd = jnp.swapaxes(k_j, 0, 1)[None, :, :, :]
+      v_bhsd = jnp.swapaxes(v_j, 0, 1)[None, :, :, :]
+
+      outs = []
+      offset = 0
+      for seg_i, sl in enumerate(slens):
+        seg_table = (
+            t_tables[seg_i]
+            if (t_tables is not None and seg_i < len(t_tables))
+            else None
+        )
+        o_seg = _sdpa_with_sink_single_segment(
+            q_bhsd[:, :, offset : offset + sl, :],
+            k_bhsd[:, :, offset : offset + sl, :],
+            v_bhsd[:, :, offset : offset + sl, :],
+            sinks_loc,
+            use_splash=use_splash,
+            kv_table=seg_table,
+        )
+        outs.append(jnp.swapaxes(o_seg[0], 0, 1))  # (sl, H_loc, D)
+        offset += sl
+      if offset < s_total:
+        outs.append(jnp.zeros((s_total - offset, h_loc, d), dtype=q_j.dtype))
+      out_j = outs[0] if len(outs) == 1 else jnp.concatenate(outs, axis=0)
+      return env.j2t_iso(out_j)
+
+    def _mh_moe_hook(x_t, gate_t, bias_t, wgu_t, wdn_t, wgus_t, wdns_t):
+      x_j, gate_j, bias_j, wgu_j, wdn_j = env.t2j_iso(
+          (x_t, gate_t, bias_t, wgu_t, wdn_t)
+      )
+      wgus_j = env.t2j_iso(wgus_t) if wgus_t is not None else None
+      wdns_j = env.t2j_iso(wdns_t) if wdns_t is not None else None
+      out_j = mh_moe_forward_local(
+          x_j,
+          gate_j,
+          bias_j,
+          wgu_j,
+          wdn_j,
+          num_heads=config.moe_num_heads,
+          num_experts=config.moe_num_experts,
+          top_k=config.moe_top_k,
+          ep_size=cp_size,
+          axis_name=axis_name,
+          mode=moe_mode,
+          capacity_factor=capacity_factor,
+          route_norm=config.moe_route_norm,
+          route_scale=config.moe_route_scale,
+          w_gate_up_scale_local=wgus_j,
+          w_down_scale_local=wdns_j,
+      )
+      return env.j2t_iso(out_j)
+
+    def _mhc_pre_hook(
         s_flat_t, norm_w_t, phi_t, a_pre_t, a_post_t, a_res_t, b_pre_t, b_post_t, b_res_t
-    ))
-    x_in, pm, cm = mhc_pre_tokamax(
-        s_j, nw_j, phi_j, ap_j, bp_j, apo_j, bpo_j, ar_j, br_j,
-        n_stream=config.mhc_num_stream,
-        eps=config.rms_norm_eps,
-        sinkhorn_iters=config.mhc_sinkhorn_iters,
-        sinkhorn_eps=config.mhc_sinkhorn_eps,
-    )
-    return env.j2t_iso(x_in), env.j2t_iso(pm), env.j2t_iso(cm)
+    ):
+      s_j, nw_j, phi_j, ap_j, apo_j, ar_j, bp_j, bpo_j, br_j = env.t2j_iso((
+          s_flat_t, norm_w_t, phi_t, a_pre_t, a_post_t, a_res_t, b_pre_t, b_post_t, b_res_t
+      ))
+      x_in, pm, cm = mhc_pre_tokamax(
+          s_j, nw_j, phi_j, ap_j, bp_j, apo_j, bpo_j, ar_j, br_j,
+          n_stream=config.mhc_num_stream,
+          eps=config.rms_norm_eps,
+          sinkhorn_iters=config.mhc_sinkhorn_iters,
+          sinkhorn_eps=config.mhc_sinkhorn_eps,
+      )
+      return env.j2t_iso(x_in), env.j2t_iso(pm), env.j2t_iso(cm)
 
-  def _mhc_post_hook(s_flat_t, sub_out_t, pm_t, cm_t):
-    s_j, sub_j, pm_j, cm_j = env.t2j_iso((s_flat_t, sub_out_t, pm_t, cm_t))
-    out_j = mhc_post_tokamax(sub_j, s_j, pm_j, cm_j)
-    return env.j2t_iso(out_j)
+    def _mhc_post_hook(s_flat_t, sub_out_t, pm_t, cm_t):
+      s_j, sub_j, pm_j, cm_j = env.t2j_iso((s_flat_t, sub_out_t, pm_t, cm_t))
+      out_j = mhc_post_tokamax(sub_j, s_j, pm_j, cm_j)
+      return env.j2t_iso(out_j)
 
-  def _mhc_fpp_hook(
-      s_flat_t, sub_out_t, pm_t, cm_t,
-      norm_w_t, phi_t, a_pre_t, a_post_t, a_res_t, b_pre_t, b_post_t, b_res_t,
-  ):
-    (
-        s_j, sub_j, pm_j, cm_j,
-        nw_j, phi_j, ap_j, apo_j, ar_j, bp_j, bpo_j, br_j,
-    ) = env.t2j_iso((
+    def _mhc_fpp_hook(
         s_flat_t, sub_out_t, pm_t, cm_t,
         norm_w_t, phi_t, a_pre_t, a_post_t, a_res_t, b_pre_t, b_post_t, b_res_t,
-    ))
-    s_mid, x_next, pm_next, cm_next = mhc_fused_post_pre_tokamax(
-        sub_j, s_j, pm_j, cm_j,
-        nw_j, phi_j, ap_j, bp_j, apo_j, bpo_j, ar_j, br_j,
-        n_stream=config.mhc_num_stream,
-        eps=config.rms_norm_eps,
-        sinkhorn_iters=config.mhc_sinkhorn_iters,
-        sinkhorn_eps=config.mhc_sinkhorn_eps,
-    )
-    return (
-        env.j2t_iso(s_mid),
-        env.j2t_iso(x_next),
-        env.j2t_iso(pm_next),
-        env.j2t_iso(cm_next),
-    )
-
-  hooks = Magi2TpuHooks(
-      attn_with_sink=_attn_with_sink_hook,
-      grouped_linear=_grouped_linear_hook,
-      mh_moe_routed=_mh_moe_hook,
-      mhc_pre=_mhc_pre_hook if tokamax_mhc else None,
-      mhc_post=_mhc_post_hook if tokamax_mhc else None,
-      mhc_fused_post_pre=_mhc_fpp_hook if tokamax_mhc else None,
-      ulysses_scatter_head_gather_seq=_ulysses_s2h_hook if cp_size > 1 else None,
-      ulysses_scatter_seq_gather_head=_ulysses_h2s_hook if cp_size > 1 else None,
-      ep_size=cp_size,
-  )
-
-  def _run_local(st, x_l, rope_l, mod_l, time_l):
-    # 1. PreAdapter + timestep injection + 3D RoPE + modality sort (via torchax)
-    with env:
-      x_t = env.j2t_iso(x_l)
-      rope_in_t = env.j2t_iso(rope_l)
-      mod_in_t = env.j2t_iso(mod_l)
-      time_t = env.j2t_iso(time_l) if (has_time and time_l is not None) else None
-
-      mod_ids_t = torch.where(
-          mod_in_t == 3, torch.full_like(mod_in_t, 2), mod_in_t
-      ).to(torch.int64)
-      if rope_in_t.shape[-1] == 9:
-        from .torch_preview_dit import compute_3d_rope_96_torch
-        rope_96_t = compute_3d_rope_96_torch(rope_in_t, config.rope_temperature)
-      else:
-        rope_96_t = rope_in_t.float()
-
-      if embedded_input:
-        x_emb_t = x_t.float()
-      else:
-        pre_t = {k: env.j2t_iso(v) for k, v in st["pre"].items()}
-        x_emb_t = torch.func.functional_call(tpl_pre, pre_t, (x_t, mod_ids_t))
-
-      if time_t is not None:
-        t_dim = time_t.shape[-1]
-        x_emb_t = torch.cat((time_t.float(), x_emb_t[:, t_dim:]), dim=-1)
-      x_act_t = x_emb_t.to(dtype)
-
-      perm_t = torch.argsort(mod_ids_t, stable=True)
-      inv_perm_t = torch.zeros_like(perm_t).scatter(
-          0,
-          perm_t,
-          torch.arange(perm_t.shape[0], device=perm_t.device, dtype=perm_t.dtype),
-      )
-      mod_s_t = mod_ids_t.index_select(0, perm_t)
-      gs_t = torch.stack([
-          (mod_s_t == 0).sum(),
-          (mod_s_t == 1).sum(),
-          (mod_s_t == 2).sum(),
-      ]).to(torch.int32)
-      x_s_t = x_act_t.index_select(0, perm_t)
-
-      # Layers 0, 1 (MM Dense)
-      for li in (0, 1):
-        p_t = {k: env.j2t_iso(v) for k, v in st["mm"][li].items()}
-        x_s_t = torch.func.functional_call(
-            tpl_mm,
-            p_t,
-            (x_s_t, rope_96_t, mod_s_t, gs_t, perm_t, inv_perm_t, sample_lens),
-            {"hooks": hooks},
-        )
-
-      # Extract pure JAX tensors before entering jax.lax.scan (no leaked torchax tracers!).
-      x_s_j, rope_96_j, mod_s_j, gs_j, perm_j, inv_perm_j, mod_ids_j = env.t2j_iso((
-          x_s_t, rope_96_t, mod_s_t, gs_t, perm_t, inv_perm_t, mod_ids_t
+    ):
+      (
+          s_j, sub_j, pm_j, cm_j,
+          nw_j, phi_j, ap_j, apo_j, ar_j, bp_j, bpo_j, br_j,
+      ) = env.t2j_iso((
+          s_flat_t, sub_out_t, pm_t, cm_t,
+          norm_w_t, phi_t, a_pre_t, a_post_t, a_res_t, b_pre_t, b_post_t, b_res_t,
       ))
+      s_mid, x_next, pm_next, cm_next = mhc_fused_post_pre_tokamax(
+          sub_j, s_j, pm_j, cm_j,
+          nw_j, phi_j, ap_j, bp_j, apo_j, bpo_j, ar_j, br_j,
+          n_stream=config.mhc_num_stream,
+          eps=config.rms_norm_eps,
+          sinkhorn_iters=config.mhc_sinkhorn_iters,
+          sinkhorn_eps=config.mhc_sinkhorn_eps,
+      )
+      return (
+          env.j2t_iso(s_mid),
+          env.j2t_iso(x_next),
+          env.j2t_iso(pm_next),
+          env.j2t_iso(cm_next),
+      )
 
-    # 2. Layers 2..37 (36 identical Multi-Head MoE layers via jax.lax.scan!)
-    def _moe_scan_step(carry_j, one_layer_j):
+    hooks = Magi2TpuHooks(
+        attn_with_sink=_attn_with_sink_hook,
+        grouped_linear=_grouped_linear_hook,
+        mh_moe_routed=_mh_moe_hook,
+        mhc_pre=_mhc_pre_hook if tokamax_mhc else None,
+        mhc_post=_mhc_post_hook if tokamax_mhc else None,
+        mhc_fused_post_pre=_mhc_fpp_hook if tokamax_mhc else None,
+        ulysses_scatter_head_gather_seq=_ulysses_s2h_hook if cp_size > 1 else None,
+        ulysses_scatter_seq_gather_head=_ulysses_h2s_hook if cp_size > 1 else None,
+        ep_size=cp_size,
+    )
+
+    def _run_local(st, x_l, rope_l, mod_l, time_l):
+      # 1. PreAdapter + timestep injection + 3D RoPE + modality sort (via torchax)
       with env:
-        p_t = {}
-        for k, v in one_layer_j.items():
-          v_use = v[0] if k in _MOE_SHARDED_KEYS else v
-          p_t[k] = env.j2t_iso(v_use)
-        out_t = torch.func.functional_call(
-            tpl_moe,
-            p_t,
-            (
-                env.j2t_iso(carry_j),
-                env.j2t_iso(rope_96_j),
-                env.j2t_iso(mod_s_j),
-                env.j2t_iso(gs_j),
-                env.j2t_iso(perm_j),
-                env.j2t_iso(inv_perm_j),
-                sample_lens,
-            ),
-            {"hooks": hooks},
+        x_t = env.j2t_iso(x_l)
+        rope_in_t = env.j2t_iso(rope_l)
+        mod_in_t = env.j2t_iso(mod_l)
+        time_t = env.j2t_iso(time_l) if (has_time and time_l is not None) else None
+
+        mod_ids_t = torch.where(
+            mod_in_t == 3, torch.full_like(mod_in_t, 2), mod_in_t
+        ).to(torch.int64)
+        if rope_in_t.shape[-1] == 9:
+          from .torch_preview_dit import compute_3d_rope_96_torch
+          rope_96_t = compute_3d_rope_96_torch(rope_in_t, config.rope_temperature)
+        else:
+          rope_96_t = rope_in_t.float()
+
+        if embedded_input:
+          x_emb_t = x_t.float()
+        else:
+          pre_t = {k: env.j2t_iso(v) for k, v in st["pre"].items()}
+          x_emb_t = torch.func.functional_call(tpl_pre, pre_t, (x_t, mod_ids_t))
+
+        if time_t is not None:
+          t_dim = time_t.shape[-1]
+          x_emb_t = torch.cat((time_t.float(), x_emb_t[:, t_dim:]), dim=-1)
+        x_act_t = x_emb_t.to(dtype)
+
+        perm_t = torch.argsort(mod_ids_t, stable=True)
+        inv_perm_t = torch.zeros_like(perm_t).scatter(
+            0,
+            perm_t,
+            torch.arange(perm_t.shape[0], device=perm_t.device, dtype=perm_t.dtype),
         )
-        return env.t2j_iso(out_t), None
+        mod_s_t = mod_ids_t.index_select(0, perm_t)
+        gs_t = torch.stack([
+            (mod_s_t == 0).sum(),
+            (mod_s_t == 1).sum(),
+            (mod_s_t == 2).sum(),
+        ]).to(torch.int32)
+        x_s_t = x_act_t.index_select(0, perm_t)
 
-    x_s_j, _ = jax.lax.scan(_moe_scan_step, x_s_j, st["moe_stacked"])
+        # Layers 0, 1 (MM Dense)
+        for li in (0, 1):
+          p_t = {k: env.j2t_iso(v) for k, v in st["mm"][li].items()}
+          x_s_t = torch.func.functional_call(
+              tpl_mm,
+              p_t,
+              (x_s_t, rope_96_t, mod_s_t, gs_t, perm_t, inv_perm_t, t_lens),
+              {"hooks": hooks},
+          )
 
-    # 3. Layers 38, 39 (MM Dense) + unpermute + PostAdapter
-    with env:
-      x_s_t = env.j2t_iso(x_s_j)
-      rope_96_t = env.j2t_iso(rope_96_j)
-      mod_s_t = env.j2t_iso(mod_s_j)
-      gs_t = env.j2t_iso(gs_j)
-      perm_t = env.j2t_iso(perm_j)
-      inv_perm_t = env.j2t_iso(inv_perm_j)
-      mod_ids_t = env.j2t_iso(mod_ids_j)
+        # Extract pure JAX tensors before entering jax.lax.scan (no leaked torchax tracers!).
+        x_s_j, rope_96_j, mod_s_j, gs_j, perm_j, inv_perm_j, mod_ids_j = env.t2j_iso((
+            x_s_t, rope_96_t, mod_s_t, gs_t, perm_t, inv_perm_t, mod_ids_t
+        ))
 
-      for li in (38, 39):
-        p_t = {k: env.j2t_iso(v) for k, v in st["mm"][li].items()}
-        x_s_t = torch.func.functional_call(
-            tpl_mm,
-            p_t,
-            (x_s_t, rope_96_t, mod_s_t, gs_t, perm_t, inv_perm_t, sample_lens),
-            {"hooks": hooks},
-        )
-      x_seq_t = x_s_t.index_select(0, inv_perm_t)
-      post_t = {k: env.j2t_iso(v) for k, v in st["post"].items()}
-      out_t = torch.func.functional_call(tpl_post, post_t, (x_seq_t, mod_ids_t))
-      return env.t2j_iso(out_t)
+      # 2. Layers 2..37 (36 identical Multi-Head MoE layers via jax.lax.scan!)
+      def _moe_scan_step(carry_j, one_layer_j):
+        with env:
+          p_t = {}
+          for k, v in one_layer_j.items():
+            v_use = v[0] if k in _MOE_SHARDED_KEYS else v
+            p_t[k] = env.j2t_iso(v_use)
+          out_t = torch.func.functional_call(
+              tpl_moe,
+              p_t,
+              (
+                  env.j2t_iso(carry_j),
+                  env.j2t_iso(rope_96_j),
+                  env.j2t_iso(mod_s_j),
+                  env.j2t_iso(gs_j),
+                  env.j2t_iso(perm_j),
+                  env.j2t_iso(inv_perm_j),
+                  t_lens,
+              ),
+              {"hooks": hooks},
+          )
+          return env.t2j_iso(out_t), None
 
-  if mesh is not None and cp_size > 1:
-    st_specs = _build_packed_param_specs(packed_params, axis_name)
-    in_specs = (
-        st_specs,
-        P(axis_name, None),
-        P(axis_name, None),
-        P(axis_name,),
-        P(axis_name, None) if has_time else P(),
-    )
-    out_spec = P(axis_name, None)
-    sharded = jax.shard_map(
-        _run_local,
-        mesh=mesh,
-        in_specs=in_specs,
-        out_specs=out_spec,
-        check_vma=False,
-    )
-    return jax.jit(sharded), packed_params
+      x_s_j, _ = jax.lax.scan(_moe_scan_step, x_s_j, st["moe_stacked"])
 
-  return jax.jit(_run_local), packed_params
+      # 3. Layers 38, 39 (MM Dense) + unpermute + PostAdapter
+      with env:
+        x_s_t = env.j2t_iso(x_s_j)
+        rope_96_t = env.j2t_iso(rope_96_j)
+        mod_s_t = env.j2t_iso(mod_s_j)
+        gs_t = env.j2t_iso(gs_j)
+        perm_t = env.j2t_iso(perm_j)
+        inv_perm_t = env.j2t_iso(inv_perm_j)
+        mod_ids_t = env.j2t_iso(mod_ids_j)
+
+        for li in (38, 39):
+          p_t = {k: env.j2t_iso(v) for k, v in st["mm"][li].items()}
+          x_s_t = torch.func.functional_call(
+              tpl_mm,
+              p_t,
+              (x_s_t, rope_96_t, mod_s_t, gs_t, perm_t, inv_perm_t, t_lens),
+              {"hooks": hooks},
+          )
+        x_seq_t = x_s_t.index_select(0, inv_perm_t)
+        post_t = {k: env.j2t_iso(v) for k, v in st["post"].items()}
+        out_t = torch.func.functional_call(tpl_post, post_t, (x_seq_t, mod_ids_t))
+        return env.t2j_iso(out_t)
+
+    if mesh is not None and cp_size > 1:
+      st_specs = _build_packed_param_specs(packed_params, axis_name)
+      in_specs = (
+          st_specs,
+          P(axis_name, None),
+          P(axis_name, None),
+          P(axis_name,),
+          P(axis_name, None) if has_time else P(),
+      )
+      out_spec = P(axis_name, None)
+      sharded = jax.shard_map(
+          _run_local,
+          mesh=mesh,
+          in_specs=in_specs,
+          out_specs=out_spec,
+          check_vma=False,
+      )
+      return jax.jit(sharded)
+
+    return jax.jit(_run_local)
+
+  primary_fn = _compile_for_lens(
+      tuple(int(v) for v in sample_lens),
+      sparse_kv_tables=sparse_kv_tables,
+  )
+  primary_fn.bind_sample_lens = _compile_for_lens
+  return primary_fn, packed_params
 
 
 class _TorchaxPreAdapterShim:
@@ -770,13 +792,16 @@ def make_torchax_preview_step_fn(
     use_splash: bool | None = None,
     moe_mode: str | None = None,
     capacity_factor: float | None = None,
+    sparse_window: int = 0,
 ):
   """Fused ``jax.jit`` CFG step around :func:`make_torchax_jitted_forward`."""
   from jax import lax
+  from .jax_preview_dit import build_magi2_sparse_kv_table
   from .rope_and_ops import sinusoidal_embedding_1d
 
   t_v, h_v, w_v = video_thw
   n_vid = t_v * h_v * w_v
+  rpf = h_v * w_v
   s_cond, s_uncond = int(sample_lens[0]), int(sample_lens[1])
   seg_lens = (s_cond, s_uncond)
   ax = model.axis_name
@@ -805,85 +830,190 @@ def make_torchax_preview_step_fn(
   seq_sharding = NamedSharding(mesh, P(ax, None)) if (mesh is not None and cp_size > 1) else None
   rep_sharding = NamedSharding(mesh, P()) if (mesh is not None and cp_size > 1) else None
 
-  @jax.jit
-  def _step_fn(
-      st,
-      latent_ncthw,
-      audio_btc,
-      raw_t_scalar,
-      video_cfg,
-      audio_cfg,
-      txt_cond_emb,
-      ref_cond_emb,
-      txt_uncond_emb,
-      ref_uncond_emb,
-      pad_emb,
-      rope_all,
-      mod_all,
-      time_kind_all,
-  ):
-    pre_s = st["pre"]
-    v_flat = jnp.transpose(latent_ncthw[0], (1, 2, 3, 0)).reshape(n_vid, v_ch)
-    if seq_sharding is not None and (n_vid % cp_size == 0):
-      v_flat = lax.with_sharding_constraint(v_flat, seq_sharding)
-    v_emb = (
-        jnp.matmul(v_flat.astype(jnp.float32), pre_s["video_embedder.weight"].T, precision=lax.Precision.HIGHEST)
-        + pre_s["video_embedder.bias"]
-    ).astype(model_dtype)
-    a_emb = (
-        jnp.matmul(audio_btc[0].astype(jnp.float32), pre_s["audio_embedder.weight"].T, precision=lax.Precision.HIGHEST)
-        + pre_s["audio_embedder.bias"]
-    ).astype(model_dtype)
+  def _make_full_step(cfn, *, return_delta: bool):
+    @jax.jit
+    def _fn(
+        st,
+        latent_ncthw,
+        audio_btc,
+        raw_t_scalar,
+        video_cfg,
+        audio_cfg,
+        txt_cond_emb,
+        ref_cond_emb,
+        txt_uncond_emb,
+        ref_uncond_emb,
+        pad_emb,
+        rope_all,
+        mod_all,
+        time_kind_all,
+    ):
+      pre_s = st["pre"]
+      v_flat = jnp.transpose(latent_ncthw[0], (1, 2, 3, 0)).reshape(n_vid, v_ch)
+      if seq_sharding is not None and (n_vid % cp_size == 0):
+        v_flat = lax.with_sharding_constraint(v_flat, seq_sharding)
+      v_emb = (
+          jnp.matmul(v_flat.astype(jnp.float32), pre_s["video_embedder.weight"].T, precision=lax.Precision.HIGHEST)
+          + pre_s["video_embedder.bias"]
+      ).astype(model_dtype)
+      a_emb = (
+          jnp.matmul(audio_btc[0].astype(jnp.float32), pre_s["audio_embedder.weight"].T, precision=lax.Precision.HIGHEST)
+          + pre_s["audio_embedder.bias"]
+      ).astype(model_dtype)
 
-    parts = [v_emb, a_emb, txt_cond_emb]
-    if ref_cond_emb.shape[0] > 0:
-      parts.append(ref_cond_emb)
-    parts.extend([v_emb, a_emb, txt_uncond_emb])
-    if ref_uncond_emb.shape[0] > 0:
-      parts.append(ref_uncond_emb)
-    if pad_emb.shape[0] > 0:
-      parts.append(pad_emb)
-    x_emb = jnp.concatenate(parts, axis=0)
-    if seq_sharding is not None:
-      x_emb = lax.with_sharding_constraint(x_emb, seq_sharding)
-
-    if time_dim > 0:
-      emb_noisy = sinusoidal_embedding_1d(raw_t_scalar, dim=time_dim)
-      emb_clean = sinusoidal_embedding_1d(jnp.float32(0.0), dim=time_dim)
-      emb_zero = jnp.zeros((time_dim,), dtype=jnp.float32)
-      time_all = jnp.where(
-          (time_kind_all == 2)[:, None],
-          emb_noisy[None, :],
-          jnp.where(
-              (time_kind_all == 1)[:, None],
-              emb_clean[None, :],
-              emb_zero[None, :],
-          ),
-      )
+      parts = [v_emb, a_emb, txt_cond_emb]
+      if ref_cond_emb.shape[0] > 0:
+        parts.append(ref_cond_emb)
+      parts.extend([v_emb, a_emb, txt_uncond_emb])
+      if ref_uncond_emb.shape[0] > 0:
+        parts.append(ref_uncond_emb)
+      if pad_emb.shape[0] > 0:
+        parts.append(pad_emb)
+      x_emb = jnp.concatenate(parts, axis=0)
       if seq_sharding is not None:
-        time_all = lax.with_sharding_constraint(time_all, seq_sharding)
-    else:
-      time_all = None
+        x_emb = lax.with_sharding_constraint(x_emb, seq_sharding)
 
-    out_all = core_fn(st, x_emb, rope_all, mod_all, time_all)
+      if time_dim > 0:
+        emb_noisy = sinusoidal_embedding_1d(raw_t_scalar, dim=time_dim)
+        emb_clean = sinusoidal_embedding_1d(jnp.float32(0.0), dim=time_dim)
+        emb_zero = jnp.zeros((time_dim,), dtype=jnp.float32)
+        time_all = jnp.where(
+            (time_kind_all == 2)[:, None],
+            emb_noisy[None, :],
+            jnp.where(
+                (time_kind_all == 1)[:, None],
+                emb_clean[None, :],
+                emb_zero[None, :],
+            ),
+        )
+        if seq_sharding is not None:
+          time_all = lax.with_sharding_constraint(time_all, seq_sharding)
+      else:
+        time_all = None
 
-    cond_v = jnp.transpose(
-        out_all[0:n_vid, :v_ch].reshape(t_v, h_v, w_v, v_ch), (3, 0, 1, 2)
-    )[None, ...]
-    cond_a = out_all[n_vid : n_vid + n_aud, :a_ch][None, ...]
+      out_all = cfn(st, x_emb, rope_all, mod_all, time_all)
 
-    uncond_v = jnp.transpose(
-        out_all[s_cond : s_cond + n_vid, :v_ch].reshape(t_v, h_v, w_v, v_ch),
-        (3, 0, 1, 2),
-    )[None, ...]
-    uncond_a = out_all[s_cond + n_vid : s_cond + n_vid + n_aud, :a_ch][None, ...]
+      cond_v = jnp.transpose(
+          out_all[0:n_vid, :v_ch].reshape(t_v, h_v, w_v, v_ch), (3, 0, 1, 2)
+      )[None, ...]
+      cond_a = out_all[n_vid : n_vid + n_aud, :a_ch][None, ...]
 
-    v_cfg_video = uncond_v + video_cfg * (cond_v - uncond_v)
-    v_cfg_audio = uncond_a + audio_cfg * (cond_a - uncond_a)
-    if rep_sharding is not None:
-      v_cfg_video = lax.with_sharding_constraint(v_cfg_video, rep_sharding)
-      v_cfg_audio = lax.with_sharding_constraint(v_cfg_audio, rep_sharding)
-    return v_cfg_video, v_cfg_audio
+      uncond_v = jnp.transpose(
+          out_all[s_cond : s_cond + n_vid, :v_ch].reshape(t_v, h_v, w_v, v_ch),
+          (3, 0, 1, 2),
+      )[None, ...]
+      uncond_a = out_all[s_cond + n_vid : s_cond + n_vid + n_aud, :a_ch][None, ...]
+
+      delta_v = cond_v - uncond_v
+      delta_a = cond_a - uncond_a
+      v_cfg_video = uncond_v + video_cfg * delta_v
+      v_cfg_audio = uncond_a + audio_cfg * delta_a
+      if rep_sharding is not None:
+        v_cfg_video = lax.with_sharding_constraint(v_cfg_video, rep_sharding)
+        v_cfg_audio = lax.with_sharding_constraint(v_cfg_audio, rep_sharding)
+        if return_delta:
+          delta_v = lax.with_sharding_constraint(delta_v, rep_sharding)
+          delta_a = lax.with_sharding_constraint(delta_a, rep_sharding)
+      if return_delta:
+        return v_cfg_video, v_cfg_audio, delta_v, delta_a
+      return v_cfg_video, v_cfg_audio
+
+    return _fn
+
+  def _make_cond_step(cfn_cond):
+    @jax.jit
+    def _cfn(
+        st,
+        latent_ncthw,
+        audio_btc,
+        raw_t_scalar,
+        video_cfg,
+        audio_cfg,
+        delta_decay,
+        cached_delta_v,
+        cached_delta_a,
+        txt_cond_emb,
+        ref_cond_emb,
+        pad_cond_emb,
+        rope_cond,
+        mod_cond,
+        time_kind_cond,
+    ):
+      pre_s = st["pre"]
+      v_flat = jnp.transpose(latent_ncthw[0], (1, 2, 3, 0)).reshape(n_vid, v_ch)
+      if seq_sharding is not None and (n_vid % cp_size == 0):
+        v_flat = lax.with_sharding_constraint(v_flat, seq_sharding)
+      v_emb = (
+          jnp.matmul(v_flat.astype(jnp.float32), pre_s["video_embedder.weight"].T, precision=lax.Precision.HIGHEST)
+          + pre_s["video_embedder.bias"]
+      ).astype(model_dtype)
+      a_emb = (
+          jnp.matmul(audio_btc[0].astype(jnp.float32), pre_s["audio_embedder.weight"].T, precision=lax.Precision.HIGHEST)
+          + pre_s["audio_embedder.bias"]
+      ).astype(model_dtype)
+
+      parts = [v_emb, a_emb, txt_cond_emb]
+      if ref_cond_emb.shape[0] > 0:
+        parts.append(ref_cond_emb)
+      if pad_cond_emb.shape[0] > 0:
+        parts.append(pad_cond_emb)
+      x_emb = jnp.concatenate(parts, axis=0)
+      if seq_sharding is not None:
+        x_emb = lax.with_sharding_constraint(x_emb, seq_sharding)
+
+      if time_dim > 0:
+        emb_noisy = sinusoidal_embedding_1d(raw_t_scalar, dim=time_dim)
+        emb_clean = sinusoidal_embedding_1d(jnp.float32(0.0), dim=time_dim)
+        emb_zero = jnp.zeros((time_dim,), dtype=jnp.float32)
+        time_all = jnp.where(
+            (time_kind_cond == 2)[:, None],
+            emb_noisy[None, :],
+            jnp.where(
+                (time_kind_cond == 1)[:, None],
+                emb_clean[None, :],
+                emb_zero[None, :],
+            ),
+        )
+        if seq_sharding is not None:
+          time_all = lax.with_sharding_constraint(time_all, seq_sharding)
+      else:
+        time_all = None
+
+      out_c = cfn_cond(st, x_emb, rope_cond, mod_cond, time_all)
+      cond_v = jnp.transpose(
+          out_c[0:n_vid, :v_ch].reshape(t_v, h_v, w_v, v_ch), (3, 0, 1, 2)
+      )[None, ...]
+      cond_a = out_c[n_vid : n_vid + n_aud, :a_ch][None, ...]
+      v_cfg_video = cond_v + (video_cfg - jnp.float32(1.0)) * delta_decay * cached_delta_v
+      v_cfg_audio = cond_a + (audio_cfg - jnp.float32(1.0)) * delta_decay * cached_delta_a
+      if rep_sharding is not None:
+        v_cfg_video = lax.with_sharding_constraint(v_cfg_video, rep_sharding)
+        v_cfg_audio = lax.with_sharding_constraint(v_cfg_audio, rep_sharding)
+      return v_cfg_video, v_cfg_audio
+
+    return _cfn
+
+  _step_fn = _make_full_step(core_fn, return_delta=False)
+  _step_fn.step_with_delta_fn = _make_full_step(core_fn, return_delta=True)
+  _step_fn.cond_step_fn = _make_cond_step(core_fn.bind_sample_lens((s_cond,)))
+  _step_fn.core_fn = core_fn
+
+  if sparse_window > 0:
+    tbl_cond = build_magi2_sparse_kv_table(s_cond, n_vid, rpf, sparse_window)
+    tbl_uncond = build_magi2_sparse_kv_table(s_uncond, n_vid, rpf, sparse_window)
+    core_sp_full = core_fn.bind_sample_lens(seg_lens, sparse_kv_tables=(tbl_cond, tbl_uncond))
+    core_sp_cond = core_fn.bind_sample_lens((s_cond,), sparse_kv_tables=(tbl_cond,))
+    _step_fn.sparse_step_fn = _make_full_step(core_sp_full, return_delta=False)
+    _step_fn.sparse_step_with_delta_fn = _make_full_step(core_sp_full, return_delta=True)
+    _step_fn.sparse_cond_step_fn = _make_cond_step(core_sp_cond)
+    kept = sum(len(r) for r in tbl_cond)
+    tot = len(tbl_cond) * (-(-s_cond // min(1024, s_cond)))
+    _step_fn.sparse_density = kept / max(1, tot)
+  else:
+    _step_fn.sparse_step_fn = None
+    _step_fn.sparse_step_with_delta_fn = None
+    _step_fn.sparse_cond_step_fn = None
+    _step_fn.sparse_density = 1.0
 
   return _step_fn, core_state
 

@@ -308,6 +308,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
       action="store_true",
       help="Use E4M3 FP8 QK^T inside the Stage 2 Refiner GQA+W-coalesced Pallas kernel.",
   )
+  ap.add_argument(
+      "--refiner-radius",
+      default="",
+      help=(
+          "Optional Stage 2 Refiner 3D block-grid radius 'rt,rh,rw' (default '2,2,2' = 125 blocks, "
+          "lossless; e.g. '1,2,2' = 75 blocks for ~1.6x faster lossy attention)."
+      ),
+  )
 
   # Noise & reproducibility
   ap.add_argument("--seed", type=int, default=42, help="PRNG seed for initial latents.")
@@ -393,6 +401,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
           "Fraction of Stage 1 steps after which to run half-sequence cond-only DiT with "
           "smoothly decayed cached CFG delta (1.0 disables; --lossy uses 0.65)."
       ),
+  )
+  ap.add_argument(
+      "--sparse-window",
+      type=int,
+      default=0,
+      help=(
+          "Optional Stage 1 temporal-window block-sparse Splash+Sink attention radius in latent frames "
+          "(0 disables = dense; e.g. 6 keeps ±6 latent frames + frame-0 anchor + 100%% global audio/text/ref)."
+      ),
+  )
+  ap.add_argument(
+      "--sparse-dense-steps",
+      type=int,
+      default=15,
+      help="Number of initial Stage 1 steps kept dense before switching to --sparse-window (default: 15).",
   )
   ap.add_argument(
       "--warmup",
@@ -885,7 +908,6 @@ def build_preview_packing_plan(
       "time_kind_all": time_kind_all,
   }
 
-
 def _make_preview_step_fn(
     model: Any,
     *,
@@ -896,6 +918,7 @@ def _make_preview_step_fn(
     use_splash: bool | None = None,
     moe_mode: str | None = None,
     capacity_factor: float | None = None,
+    sparse_window: int = 0,
 ):
   """Build a single fused ``jax.jit`` step around ``Magi2PreviewTransformer``.
 
@@ -910,11 +933,12 @@ def _make_preview_step_fn(
   from flax import nnx
   from jax.sharding import NamedSharding, PartitionSpec as P
 
-  from .jax_preview_dit import make_jitted_forward
+  from .jax_preview_dit import build_magi2_sparse_kv_table, make_jitted_forward
   from .rope_and_ops import sinusoidal_embedding_1d
 
   t_v, h_v, w_v = video_thw
   n_vid = t_v * h_v * w_v
+  rpf = h_v * w_v
   s_cond, s_uncond = int(sample_lens[0]), int(sample_lens[1])
   seg_lens = (s_cond, s_uncond)
   ax = model.axis_name
@@ -946,166 +970,94 @@ def _make_preview_step_fn(
     seq_sharding = None
     rep_sharding = None
 
-  @jax.jit
-  def _step_fn(
-      st,
-      latent_ncthw,
-      audio_btc,
-      raw_t_scalar,
-      video_cfg,
-      audio_cfg,
-      txt_cond_emb,
-      ref_cond_emb,
-      txt_uncond_emb,
-      ref_uncond_emb,
-      pad_emb,
-      rope_all,
-      mod_all,
-      time_kind_all,
-  ):
-    pre_s, core_s = st
-    pre_mod = nnx.merge(pre_gd, pre_s)
-    v_flat = jnp.transpose(latent_ncthw[0], (1, 2, 3, 0)).reshape(n_vid, v_ch)
-    if seq_sharding is not None and (n_vid % cp_size == 0):
-      v_flat = lax.with_sharding_constraint(v_flat, seq_sharding)
-    v_emb = pre_mod.embed_video(v_flat).astype(model_dtype)
-    a_emb = pre_mod.embed_audio(audio_btc[0]).astype(model_dtype)
-
-    parts = [v_emb, a_emb, txt_cond_emb]
-    if ref_cond_emb.shape[0] > 0:
-      parts.append(ref_cond_emb)
-    parts.extend([v_emb, a_emb, txt_uncond_emb])
-    if ref_uncond_emb.shape[0] > 0:
-      parts.append(ref_uncond_emb)
-    if pad_emb.shape[0] > 0:
-      parts.append(pad_emb)
-    x_emb = jnp.concatenate(parts, axis=0)
-    if seq_sharding is not None:
-      x_emb = lax.with_sharding_constraint(x_emb, seq_sharding)
-
-    if time_dim > 0:
-      emb_noisy = sinusoidal_embedding_1d(raw_t_scalar, dim=time_dim)
-      emb_clean = sinusoidal_embedding_1d(jnp.float32(0.0), dim=time_dim)
-      emb_zero = jnp.zeros((time_dim,), dtype=jnp.float32)
-      time_all = jnp.where(
-          (time_kind_all == 2)[:, None],
-          emb_noisy[None, :],
-          jnp.where(
-              (time_kind_all == 1)[:, None],
-              emb_clean[None, :],
-              emb_zero[None, :],
-          ),
-      )
-      if seq_sharding is not None:
-        time_all = lax.with_sharding_constraint(time_all, seq_sharding)
-    else:
-      time_all = None
-
-    out_all = core_fn(core_s, x_emb, rope_all, mod_all, time_all)
-
-    cond_v = jnp.transpose(
-        out_all[0:n_vid, :v_ch].reshape(t_v, h_v, w_v, v_ch), (3, 0, 1, 2)
-    )[None, ...]
-    cond_a = out_all[n_vid : n_vid + n_aud, :a_ch][None, ...]
-
-    uncond_v = jnp.transpose(
-        out_all[s_cond : s_cond + n_vid, :v_ch].reshape(t_v, h_v, w_v, v_ch),
-        (3, 0, 1, 2),
-    )[None, ...]
-    uncond_a = out_all[s_cond + n_vid : s_cond + n_vid + n_aud, :a_ch][None, ...]
-
-    delta_v = cond_v - uncond_v
-    delta_a = cond_a - uncond_a
-    v_cfg_video = uncond_v + video_cfg * delta_v
-    v_cfg_audio = uncond_a + audio_cfg * delta_a
-    if rep_sharding is not None:
-      v_cfg_video = lax.with_sharding_constraint(v_cfg_video, rep_sharding)
-      v_cfg_audio = lax.with_sharding_constraint(v_cfg_audio, rep_sharding)
-    return v_cfg_video, v_cfg_audio
-
-  @jax.jit
-  def _step_with_delta_fn(
-      st,
-      latent_ncthw,
-      audio_btc,
-      raw_t_scalar,
-      video_cfg,
-      audio_cfg,
-      txt_cond_emb,
-      ref_cond_emb,
-      txt_uncond_emb,
-      ref_uncond_emb,
-      pad_emb,
-      rope_all,
-      mod_all,
-      time_kind_all,
-  ):
-    pre_s, core_s = st
-    pre_mod = nnx.merge(pre_gd, pre_s)
-    v_flat = jnp.transpose(latent_ncthw[0], (1, 2, 3, 0)).reshape(n_vid, v_ch)
-    if seq_sharding is not None and (n_vid % cp_size == 0):
-      v_flat = lax.with_sharding_constraint(v_flat, seq_sharding)
-    v_emb = pre_mod.embed_video(v_flat).astype(model_dtype)
-    a_emb = pre_mod.embed_audio(audio_btc[0]).astype(model_dtype)
-
-    parts = [v_emb, a_emb, txt_cond_emb]
-    if ref_cond_emb.shape[0] > 0:
-      parts.append(ref_cond_emb)
-    parts.extend([v_emb, a_emb, txt_uncond_emb])
-    if ref_uncond_emb.shape[0] > 0:
-      parts.append(ref_uncond_emb)
-    if pad_emb.shape[0] > 0:
-      parts.append(pad_emb)
-    x_emb = jnp.concatenate(parts, axis=0)
-    if seq_sharding is not None:
-      x_emb = lax.with_sharding_constraint(x_emb, seq_sharding)
-
-    if time_dim > 0:
-      emb_noisy = sinusoidal_embedding_1d(raw_t_scalar, dim=time_dim)
-      emb_clean = sinusoidal_embedding_1d(jnp.float32(0.0), dim=time_dim)
-      emb_zero = jnp.zeros((time_dim,), dtype=jnp.float32)
-      time_all = jnp.where(
-          (time_kind_all == 2)[:, None],
-          emb_noisy[None, :],
-          jnp.where(
-              (time_kind_all == 1)[:, None],
-              emb_clean[None, :],
-              emb_zero[None, :],
-          ),
-      )
-      if seq_sharding is not None:
-        time_all = lax.with_sharding_constraint(time_all, seq_sharding)
-    else:
-      time_all = None
-
-    out_all = core_fn(core_s, x_emb, rope_all, mod_all, time_all)
-    cond_v = jnp.transpose(
-        out_all[0:n_vid, :v_ch].reshape(t_v, h_v, w_v, v_ch), (3, 0, 1, 2)
-    )[None, ...]
-    cond_a = out_all[n_vid : n_vid + n_aud, :a_ch][None, ...]
-    uncond_v = jnp.transpose(
-        out_all[s_cond : s_cond + n_vid, :v_ch].reshape(t_v, h_v, w_v, v_ch),
-        (3, 0, 1, 2),
-    )[None, ...]
-    uncond_a = out_all[s_cond + n_vid : s_cond + n_vid + n_aud, :a_ch][None, ...]
-
-    delta_v = cond_v - uncond_v
-    delta_a = cond_a - uncond_a
-    v_cfg_video = uncond_v + video_cfg * delta_v
-    v_cfg_audio = uncond_a + audio_cfg * delta_a
-    if rep_sharding is not None:
-      v_cfg_video = lax.with_sharding_constraint(v_cfg_video, rep_sharding)
-      v_cfg_audio = lax.with_sharding_constraint(v_cfg_audio, rep_sharding)
-      delta_v = lax.with_sharding_constraint(delta_v, rep_sharding)
-      delta_a = lax.with_sharding_constraint(delta_a, rep_sharding)
-    return v_cfg_video, v_cfg_audio, delta_v, delta_a
-
-  cond_step_fn = None
-  if hasattr(core_fn, "bind_sample_lens"):
-    core_cond_fn = core_fn.bind_sample_lens((s_cond,))
-
+  def _make_full_step(cfn, *, return_delta: bool):
     @jax.jit
-    def _cond_step_fn(
+    def _fn(
+        st,
+        latent_ncthw,
+        audio_btc,
+        raw_t_scalar,
+        video_cfg,
+        audio_cfg,
+        txt_cond_emb,
+        ref_cond_emb,
+        txt_uncond_emb,
+        ref_uncond_emb,
+        pad_emb,
+        rope_all,
+        mod_all,
+        time_kind_all,
+    ):
+      pre_s, core_s = st
+      pre_mod = nnx.merge(pre_gd, pre_s)
+      v_flat = jnp.transpose(latent_ncthw[0], (1, 2, 3, 0)).reshape(n_vid, v_ch)
+      if seq_sharding is not None and (n_vid % cp_size == 0):
+        v_flat = lax.with_sharding_constraint(v_flat, seq_sharding)
+      v_emb = pre_mod.embed_video(v_flat).astype(model_dtype)
+      a_emb = pre_mod.embed_audio(audio_btc[0]).astype(model_dtype)
+
+      parts = [v_emb, a_emb, txt_cond_emb]
+      if ref_cond_emb.shape[0] > 0:
+        parts.append(ref_cond_emb)
+      parts.extend([v_emb, a_emb, txt_uncond_emb])
+      if ref_uncond_emb.shape[0] > 0:
+        parts.append(ref_uncond_emb)
+      if pad_emb.shape[0] > 0:
+        parts.append(pad_emb)
+      x_emb = jnp.concatenate(parts, axis=0)
+      if seq_sharding is not None:
+        x_emb = lax.with_sharding_constraint(x_emb, seq_sharding)
+
+      if time_dim > 0:
+        emb_noisy = sinusoidal_embedding_1d(raw_t_scalar, dim=time_dim)
+        emb_clean = sinusoidal_embedding_1d(jnp.float32(0.0), dim=time_dim)
+        emb_zero = jnp.zeros((time_dim,), dtype=jnp.float32)
+        time_all = jnp.where(
+            (time_kind_all == 2)[:, None],
+            emb_noisy[None, :],
+            jnp.where(
+                (time_kind_all == 1)[:, None],
+                emb_clean[None, :],
+                emb_zero[None, :],
+            ),
+        )
+        if seq_sharding is not None:
+          time_all = lax.with_sharding_constraint(time_all, seq_sharding)
+      else:
+        time_all = None
+
+      out_all = cfn(core_s, x_emb, rope_all, mod_all, time_all)
+
+      cond_v = jnp.transpose(
+          out_all[0:n_vid, :v_ch].reshape(t_v, h_v, w_v, v_ch), (3, 0, 1, 2)
+      )[None, ...]
+      cond_a = out_all[n_vid : n_vid + n_aud, :a_ch][None, ...]
+
+      uncond_v = jnp.transpose(
+          out_all[s_cond : s_cond + n_vid, :v_ch].reshape(t_v, h_v, w_v, v_ch),
+          (3, 0, 1, 2),
+      )[None, ...]
+      uncond_a = out_all[s_cond + n_vid : s_cond + n_vid + n_aud, :a_ch][None, ...]
+
+      delta_v = cond_v - uncond_v
+      delta_a = cond_a - uncond_a
+      v_cfg_video = uncond_v + video_cfg * delta_v
+      v_cfg_audio = uncond_a + audio_cfg * delta_a
+      if rep_sharding is not None:
+        v_cfg_video = lax.with_sharding_constraint(v_cfg_video, rep_sharding)
+        v_cfg_audio = lax.with_sharding_constraint(v_cfg_audio, rep_sharding)
+        if return_delta:
+          delta_v = lax.with_sharding_constraint(delta_v, rep_sharding)
+          delta_a = lax.with_sharding_constraint(delta_a, rep_sharding)
+      if return_delta:
+        return v_cfg_video, v_cfg_audio, delta_v, delta_a
+      return v_cfg_video, v_cfg_audio
+
+    return _fn
+
+  def _make_cond_step(cfn_cond):
+    @jax.jit
+    def _cfn(
         st,
         latent_ncthw,
         audio_btc,
@@ -1157,7 +1109,7 @@ def _make_preview_step_fn(
       else:
         time_all = None
 
-      out_c = core_cond_fn(core_s, x_emb, rope_cond, mod_cond, time_all)
+      out_c = cfn_cond(core_s, x_emb, rope_cond, mod_cond, time_all)
       cond_v = jnp.transpose(
           out_c[0:n_vid, :v_ch].reshape(t_v, h_v, w_v, v_ch), (3, 0, 1, 2)
       )[None, ...]
@@ -1169,11 +1121,34 @@ def _make_preview_step_fn(
         v_cfg_audio = lax.with_sharding_constraint(v_cfg_audio, rep_sharding)
       return v_cfg_video, v_cfg_audio
 
-    cond_step_fn = _cond_step_fn
+    return _cfn
 
-  _step_fn.step_with_delta_fn = _step_with_delta_fn
-  _step_fn.cond_step_fn = cond_step_fn
+  _step_fn = _make_full_step(core_fn, return_delta=False)
+  _step_fn.step_with_delta_fn = _make_full_step(core_fn, return_delta=True)
+  _step_fn.cond_step_fn = (
+      _make_cond_step(core_fn.bind_sample_lens((s_cond,)))
+      if hasattr(core_fn, "bind_sample_lens")
+      else None
+  )
   _step_fn.core_fn = core_fn
+
+  if sparse_window > 0 and hasattr(core_fn, "bind_sample_lens"):
+    tbl_cond = build_magi2_sparse_kv_table(s_cond, n_vid, rpf, sparse_window)
+    tbl_uncond = build_magi2_sparse_kv_table(s_uncond, n_vid, rpf, sparse_window)
+    core_sp_full = core_fn.bind_sample_lens(seg_lens, sparse_kv_tables=(tbl_cond, tbl_uncond))
+    core_sp_cond = core_fn.bind_sample_lens((s_cond,), sparse_kv_tables=(tbl_cond,))
+    _step_fn.sparse_step_fn = _make_full_step(core_sp_full, return_delta=False)
+    _step_fn.sparse_step_with_delta_fn = _make_full_step(core_sp_full, return_delta=True)
+    _step_fn.sparse_cond_step_fn = _make_cond_step(core_sp_cond)
+    kept = sum(len(r) for r in tbl_cond)
+    tot = len(tbl_cond) * (-(-s_cond // min(1024, s_cond)))
+    _step_fn.sparse_density = kept / max(1, tot)
+  else:
+    _step_fn.sparse_step_fn = None
+    _step_fn.sparse_step_with_delta_fn = None
+    _step_fn.sparse_cond_step_fn = None
+    _step_fn.sparse_density = 1.0
+
   return _step_fn, state
 
 
@@ -1911,6 +1886,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             use_splash=(False if args.dense_attention else None),
             moe_mode=args.moe_mode,
             capacity_factor=args.capacity_factor,
+            sparse_window=args.sparse_window,
         )
       else:
         preview_step_fn, preview_state = _make_preview_step_fn(
@@ -1922,6 +1898,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             use_splash=(False if args.dense_attention else None),
             moe_mode=args.moe_mode,
             capacity_factor=args.capacity_factor,
+            sparse_window=args.sparse_window,
         )
 
       video_cfg_j = jax.device_put(jnp.float32(args.video_cfg), rep_sharding)
@@ -1946,6 +1923,11 @@ def main(argv: Sequence[str] | None = None) -> None:
           and getattr(preview_step_fn, "cond_step_fn", None) is not None
           and getattr(preview_step_fn, "step_with_delta_fn", None) is not None
       )
+      use_sparse_attn = (
+          int(args.sparse_window) > 0
+          and getattr(preview_step_fn, "sparse_step_fn", None) is not None
+      )
+      sparse_dense_steps = max(0, int(args.sparse_dense_steps))
       cond_aux_arrays: list[Any] = []
       if use_cfg_skip:
         s_cond_len = int(plan["sample_lens"][0])
@@ -1979,11 +1961,17 @@ def main(argv: Sequence[str] | None = None) -> None:
           )
           return rv, ra
 
-      if use_step_cache or use_cfg_skip:
+      if use_step_cache or use_cfg_skip or use_sparse_attn:
+        sp_info = (
+            f", sparse_window=±{args.sparse_window} (dense_steps={sparse_dense_steps}, "
+            f"density={getattr(preview_step_fn, 'sparse_density', 1.0):.1%})"
+            if use_sparse_attn
+            else ""
+        )
         print(
             f"[magi2] Stage 1 accel enabled: step_cache_thresh={cache_thresh:.3f} "
-            f"(max_skip={args.step_cache_max_skip}, warmup={args.step_cache_warmup:.2f}, "
-            f"tail={args.step_cache_tail:.2f}), cfg_skip_after={cfg_skip_after:.2f}",
+            f"(max_skip={args.step_cache_max_skip}, warmup={cache_warmup_frac:.2f}, "
+            f"tail={cache_tail_frac:.2f}), cfg_skip_after={cfg_skip_after:.2f}{sp_info}",
             flush=True,
         )
 
@@ -2088,6 +2076,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             jax.profiler.start_trace(prof_dir)
 
           t_s = time.perf_counter()
+          step_is_sparse = use_sparse_attn and step_idx >= sparse_dense_steps
           can_cache = (
               use_step_cache
               and prev_v_cfg is not None
@@ -2105,7 +2094,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             frac_late = (step_idx - cfg_skip_step) / max(1, n_steps_tot - cfg_skip_step)
             decay_val = max(0.30, 1.0 - 0.70 * frac_late)
             decay_j = jax.device_put(jnp.float32(decay_val), rep_sharding)
-            v_cfg_video, v_cfg_audio = preview_step_fn.cond_step_fn(
+            _cond_fn = (
+                preview_step_fn.sparse_cond_step_fn
+                if step_is_sparse
+                else preview_step_fn.cond_step_fn
+            )
+            v_cfg_video, v_cfg_audio = _cond_fn(
                 preview_state,
                 latent_v,
                 latent_a,
@@ -2136,8 +2130,13 @@ def main(argv: Sequence[str] | None = None) -> None:
             consec_skips = 0
             prev_v_cfg, prev_a_cfg = v_cfg_video, v_cfg_audio
           elif use_cfg_skip:
+            _delta_fn = (
+                preview_step_fn.sparse_step_with_delta_fn
+                if step_is_sparse
+                else preview_step_fn.step_with_delta_fn
+            )
             v_cfg_video, v_cfg_audio, cached_delta_v, cached_delta_a = (
-                preview_step_fn.step_with_delta_fn(
+                _delta_fn(
                     preview_state,
                     latent_v,
                     latent_a,
@@ -2168,7 +2167,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             consec_skips = 0
             prev_v_cfg, prev_a_cfg = v_cfg_video, v_cfg_audio
           else:
-            v_cfg_video, v_cfg_audio = preview_step_fn(
+            _full_fn = (
+                preview_step_fn.sparse_step_fn
+                if step_is_sparse
+                else preview_step_fn
+            )
+            v_cfg_video, v_cfg_audio = _full_fn(
                 preview_state,
                 latent_v,
                 latent_a,
@@ -2449,11 +2453,19 @@ def main(argv: Sequence[str] | None = None) -> None:
         math.ceil(max_txt / block_vol) * block_vol if max_txt > 0 else 0
     )
 
+    refiner_radius: tuple[int, int, int] | None = None
+    if args.refiner_radius.strip():
+      parts_r = [int(p.strip()) for p in args.refiner_radius.split(",")]
+      if len(parts_r) != 3 or any(v < 0 for v in parts_r):
+        raise ValueError(f"--refiner-radius must be 'rt,rh,rw' (got {args.refiner_radius!r})")
+      refiner_radius = (parts_r[0], parts_r[1], parts_r[2])
+
     layout_cond = build_refiner_attention_layout(
         target_thw,
         n_text=l_cond,
         n_audio=0,
         config=refiner_cfg,
+        radius=refiner_radius,
         tail_bucket_len=tail_bucket if tail_bucket > 0 else None,
         cp_size=ref_cp,
         build_flat_tables=need_flat_tables,
@@ -2463,12 +2475,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         n_text=l_uncond,
         n_audio=0,
         config=refiner_cfg,
+        radius=refiner_radius,
         tail_bucket_len=tail_bucket if tail_bucket > 0 else None,
         cp_size=ref_cp,
         build_flat_tables=need_flat_tables,
     )
     print(
-        f"[magi2] Stage 2 layout: grid={layout_cond.block_grid_thw} "
+        f"[magi2] Stage 2 layout: grid={layout_cond.block_grid_thw} radius={layout_cond.radius} "
         f"n_vid_pad={layout_cond.n_vid_pad} n_tail_pad={layout_cond.n_tail_pad} "
         f"total_seq={layout_cond.total_seq_len} (cond_txt={l_cond}, uncond_txt={l_uncond})",
         flush=True,

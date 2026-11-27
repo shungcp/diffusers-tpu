@@ -157,6 +157,90 @@ def get_splash_sink_op(seq_len: int):
   return op
 
 
+def get_sparse_splash_sink_op(
+    seq_len: int,
+    n_vid: int,
+    rows_per_frame: int,
+    window: int,
+    *,
+    block_q: int = 1024,
+    block_kv: int = 1024,
+    anchor_first_frame: bool = True,
+):
+  """Register and return ``pallas::magi2_sparse_splash_sink_...`` with exact Attention Sink."""
+  bq = min(int(block_q), int(seq_len))
+  bkv = min(int(block_kv), int(seq_len))
+  bkv_c = min(512, bkv)
+  key = (
+      "sparse_splash_sink",
+      int(seq_len),
+      int(n_vid),
+      int(rows_per_frame),
+      int(window),
+      bq,
+      bkv,
+      bool(anchor_first_frame),
+  )
+  if key in _REG:
+    return _REG[key]
+
+  from ..kernels import sparse_splash as _sparse_splash
+  from ..models.magi2.jax_preview_dit import (
+      apply_residual_attention_sink,
+      build_magi2_sparse_kv_table,
+  )
+
+  kv_table = build_magi2_sparse_kv_table(
+      int(seq_len),
+      int(n_vid),
+      int(rows_per_frame),
+      int(window),
+      block_q=bq,
+      block_kv=bkv,
+      anchor_first_frame=anchor_first_frame,
+  )
+
+  def fn(
+      q: jax.Array,
+      k: jax.Array,
+      v: jax.Array,
+      sinks_loc: jax.Array,
+  ) -> jax.Array:
+    out_dtype = q.dtype
+    scale = q.shape[-1] ** -0.5
+    q_b = jnp.swapaxes(q, 0, 1)[None, :, :, :]
+    k_b = jnp.swapaxes(k, 0, 1)[None, :, :, :]
+    v_b = jnp.swapaxes(v, 0, 1)[None, :, :, :]
+    o_unnorm, m_b2, l_b2 = _sparse_splash.residual_attention(
+        q_b,
+        k_b,
+        v_b,
+        scale=scale,
+        block_q=bq,
+        block_kv=bkv,
+        block_kv_compute=bkv_c,
+        use_fixed_m=False,
+        kv_table=kv_table,
+    )
+    o_b = apply_residual_attention_sink(o_unnorm, m_b2, l_b2, sinks_loc).astype(out_dtype)
+    return jnp.swapaxes(o_b[0], 0, 1)
+
+  aff = 1 if anchor_first_frame else 0
+  op_name = (
+      f"pallas::magi2_sparse_splash_sink_s{int(seq_len)}_v{int(n_vid)}"
+      f"_r{int(rows_per_frame)}_w{int(window)}_a{aff}_q{bq}_kv{bkv}"
+  )
+  op = torch.tpu.pallas.jax_op(op_name, fn)
+
+  @op.register_fake
+  def _fake(q, k, v, sinks_loc):
+    del k, v, sinks_loc
+    return torch.empty_like(q, memory_format=torch.contiguous_format)
+
+  _REG[key] = op
+  return op
+
+
 # ---------------------------------------------------------------------------
 # 3. Single-Head Local-32-Expert Zero-Cumsum Sliced-AG + Dual-TC gmm_v2
 # ---------------------------------------------------------------------------
@@ -517,6 +601,7 @@ def build_torchtpu_hooks(
     cap_factor: float | None = None,
     fp8_moe: bool = False,
     use_splash: bool = True,
+    sparse_spec: tuple[int, int, int] | None = None,
 ) -> Magi2TpuHooks:
   """Pre-register all ``jax_op`` kernels and build :class:`Magi2TpuHooks` for ``torch_tpu``."""
   if cap_factor is None:
@@ -530,7 +615,17 @@ def build_torchtpu_hooks(
       and hasattr(torch.tpu.ops, "ragged_dot")
   )
   grouped_op = None if use_native_ragged else get_grouped_linear_op()
-  splash_ops = {int(sl): get_splash_sink_op(int(sl)) for sl in set(sample_lens)} if use_splash else {}
+  if use_splash:
+    if sparse_spec is not None:
+      sp_n_vid, sp_rpf, sp_win = sparse_spec
+      splash_ops = {
+          int(sl): get_sparse_splash_sink_op(int(sl), sp_n_vid, sp_rpf, sp_win)
+          for sl in set(sample_lens)
+      }
+    else:
+      splash_ops = {int(sl): get_splash_sink_op(int(sl)) for sl in set(sample_lens)}
+  else:
+    splash_ops = {}
   moe_op = get_moe_local_head_op(
       s_total,
       e_local=e_local,
@@ -544,9 +639,10 @@ def build_torchtpu_hooks(
   route_op = get_route_mh_moe_op(top_k=top_k, route_scale=route_scale)
 
   if rank == 0:
+    sp_tag = f"sparse(w={sparse_spec[2]})" if sparse_spec is not None else "dense"
     print(
         f"[magi2_kernels_tt] hooks: grouped={'native_ragged' if use_native_ragged else 'gmm_v2'} "
-        f"splash={use_splash} moe={'fp8' if fp8_moe else 'bf16'} "
+        f"splash={use_splash}({sp_tag}) moe={'fp8' if fp8_moe else 'bf16'} "
         f"mhc_tokamax={mhc_pre_op is not None} route_highest={route_op is not None} "
         f"fp32_mm_highest={fp32_mm_op is not None}",
         flush=True,
@@ -680,4 +776,139 @@ def build_torchtpu_hooks(
       ep_reduce_scatter=_ep_reduce_scatter if world > 1 else None,
       ep_rank=rank,
       ep_size=world,
+  )
+
+
+# ---------------------------------------------------------------------------
+# 8. Stage 2 1080p Refiner Single-Chip Pallas Block-Grid GQA Attention & Hooks
+# ---------------------------------------------------------------------------
+
+
+def get_refiner_block_grid_attn_op(layout: Any, *, qk_fp8: bool = False):
+  """Register and return ``pallas::magi2_refiner_gqa_wcoal_...`` wrapping the exact JAX kernel."""
+  nt, nh, nw = layout.block_grid_thw
+  rt, rh, rw = layout.radius
+  key = (
+      "refiner_gqa_wcoal",
+      (nt, nh, nw),
+      (rt, rh, rw),
+      int(layout.block_vol),
+      int(layout.n_vid_pad),
+      int(layout.n_tail_pad),
+      bool(qk_fp8),
+  )
+  if key in _REG:
+    return _REG[key]
+
+  from ..models.magi2.jax_refiner_dit import _gqa_wcoal_block_grid_attention
+
+  def fn(
+      q: jax.Array,
+      k: jax.Array,
+      v: jax.Array,
+      kv_blen: jax.Array,
+  ) -> jax.Array:
+    scale = q.shape[-1] ** -0.5
+    return _gqa_wcoal_block_grid_attention(
+        q,
+        k,
+        v,
+        kv_blen,
+        layout=layout,
+        scale=scale,
+        qk_fp8=qk_fp8,
+    )
+
+  fp8_tag = "fp8" if qk_fp8 else "bf16"
+  op_name = (
+      f"pallas::magi2_refiner_gqa_wcoal_{fp8_tag}_g{nt}x{nh}x{nw}"
+      f"_r{rt}x{rh}x{rw}_v{int(layout.n_vid_pad)}_t{int(layout.n_tail_pad)}"
+  )
+  op = torch.tpu.pallas.jax_op(op_name, fn)
+
+  @op.register_fake
+  def _fake(q, k, v, kv_blen):
+    del k, v, kv_blen
+    return torch.empty_like(q, memory_format=torch.contiguous_format)
+
+  _REG[key] = op
+  return op
+
+
+def build_refiner_torchtpu_hooks(
+    *,
+    rank: int,
+    cp_size: int,
+    cp_group_name: str,
+    layout: Any,
+    qk_fp8: bool = False,
+):
+  """Pre-register Stage 2 Refiner Pallas ops and build :class:`Magi2RefinerTpuHooks`."""
+  from ..models.magi2.torch_refiner_dit import Magi2RefinerTpuHooks
+
+  use_native_ragged = (
+      os.environ.get("DT_MAGI2_TT_GROUPED_IMPL", "native").strip().lower() == "native"
+      and hasattr(torch, "tpu")
+      and hasattr(torch.tpu, "ops")
+      and hasattr(torch.tpu.ops, "ragged_dot")
+  )
+  grouped_op = None if use_native_ragged else get_grouped_linear_op()
+  attn_op = get_refiner_block_grid_attn_op(layout, qk_fp8=qk_fp8)
+  fp32_mm_op = get_fp32_matmul_highest_op()
+
+  if rank == 0:
+    print(
+        f"[magi2_kernels_tt] refiner hooks: cp={cp_size} "
+        f"grouped={'native_ragged' if use_native_ragged else 'gmm_v2'} "
+        f"attn=gqa_wcoal({'fp8' if qk_fp8 else 'bf16'}) radius={layout.radius}",
+        flush=True,
+    )
+
+  def _grouped_linear(x, w, group_sizes, mod_ids):
+    if use_native_ragged:
+      return torch.tpu.ops.ragged_dot(
+          x.contiguous(), w.contiguous(), group_sizes.to(torch.int32).contiguous()
+      )
+    if w.shape[1] % 128 == 0 and w.shape[2] % 128 == 0:
+      return grouped_op(x.contiguous(), w.contiguous(), group_sizes.to(torch.int32).contiguous())
+    out = torch.zeros((x.shape[0], w.shape[2]), device=x.device, dtype=x.dtype)
+    for m in range(w.shape[0]):
+      mask = (mod_ids == m).unsqueeze(-1)
+      out = torch.where(mask, torch.matmul(x, w[m]), out)
+    return out
+
+  def _ulysses_s2h(x):
+    # (S_loc, H, D) -> (S_total, H_loc, D) across cp_group_name (CP=4 -> 32Q->8Q, 8KV->2KV)
+    s_loc, h_tot, d = x.shape
+    h_loc = h_tot // cp_size
+    send = x.reshape(s_loc, cp_size, h_loc, d).permute(1, 0, 2, 3).contiguous()
+    splits = [1] * cp_size
+    recv = torch.ops._c10d_functional.all_to_all_single(send, splits, splits, cp_group_name)
+    recv = torch.ops._c10d_functional.wait_tensor(recv)
+    return recv.reshape(cp_size * s_loc, h_loc, d)
+
+  def _ulysses_h2s(x):
+    # (S_total, H_loc, D) -> (S_loc, H, D)
+    s_tot, h_loc, d = x.shape
+    s_loc = s_tot // cp_size
+    send = x.reshape(cp_size, s_loc, h_loc, d).contiguous()
+    splits = [1] * cp_size
+    recv = torch.ops._c10d_functional.all_to_all_single(send, splits, splits, cp_group_name)
+    recv = torch.ops._c10d_functional.wait_tensor(recv)
+    return recv.permute(1, 0, 2, 3).contiguous().reshape(s_loc, cp_size * h_loc, d)
+
+  def _block_grid_attn(q, k, v, kv_blen):
+    return attn_op(q.contiguous(), k.contiguous(), v.contiguous(), kv_blen.to(torch.int32).contiguous())
+
+  def _fp32_mm_highest(a, b):
+    return fp32_mm_op(a.float().contiguous(), b.float().contiguous())
+
+  return Magi2RefinerTpuHooks(
+      grouped_linear=_grouped_linear,
+      ulysses_s2h=_ulysses_s2h if cp_size > 1 else None,
+      ulysses_h2s=_ulysses_h2s if cp_size > 1 else None,
+      block_grid_attn=_block_grid_attn,
+      fp32_matmul_highest=_fp32_mm_highest if fp32_mm_op is not None else None,
+      cp_size=cp_size,
+      qk_fp8=qk_fp8,
   )
