@@ -80,21 +80,37 @@ def apply_split_rope_torch(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 
 
 def dense_attention_ltx2_torch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-  """``[B, S, H, D]`` float32-score dense attention (exact match to ``jax_dit.dense_attention``)."""
+  """``[B, S, H, D]`` dense attention (BF16 MXU matmul + FP32 softmax, FP32-exact on CPU)."""
   scale = q.shape[-1] ** -0.5
-  s = torch.einsum("bqhd,bkhd->bhqk", q.float(), k.float()) * scale
+  qt = q.transpose(1, 2)  # [B, H, Sq, D]
+  kt = k.transpose(1, 2)  # [B, H, Sk, D]
+  vt = v.transpose(1, 2)  # [B, H, Sk, D]
+  if q.dtype == torch.float32:
+    s = torch.matmul(qt, kt.transpose(-1, -2)) * scale
+    p = torch.softmax(s, dim=-1)
+    return torch.matmul(p, vt).transpose(1, 2)
+  s = torch.matmul(qt, kt.transpose(-1, -2)).float() * scale
   p = torch.softmax(s, dim=-1).to(v.dtype)
-  return torch.einsum("bhqk,bkhd->bqhd", p.float(), v.float()).to(v.dtype)
+  return torch.matmul(p, vt).transpose(1, 2)
 
 
 class LTX2LinearTorch(nn.Module):
-  """Linear layer supporting BF16/FP32 or W8A8 E4M3 FP8 (stored as ``(in, out)``)."""
+  """Linear layer supporting BF16/FP32 (optional pre-transposed ``(in, out)``) or W8A8 E4M3 FP8."""
 
-  def __init__(self, in_features: int, out_features: int, *, dtype: torch.dtype = torch.bfloat16) -> None:
+  def __init__(
+      self,
+      in_features: int,
+      out_features: int,
+      *,
+      dtype: torch.dtype = torch.bfloat16,
+      pretranspose: bool = False,
+  ) -> None:
     super().__init__()
     self.in_features = int(in_features)
     self.out_features = int(out_features)
-    self.weight = nn.Parameter(torch.empty((out_features, in_features), dtype=dtype), requires_grad=False)
+    self.pretranspose = bool(pretranspose)
+    w_shape = (in_features, out_features) if self.pretranspose else (out_features, in_features)
+    self.weight = nn.Parameter(torch.empty(w_shape, dtype=dtype), requires_grad=False)
     self.bias = nn.Parameter(torch.empty((out_features,), dtype=dtype), requires_grad=False)
     self.register_parameter("scale", None)
 
@@ -111,6 +127,8 @@ class LTX2LinearTorch(nn.Module):
       acc = torch.matmul(qx, self.weight.float())
       y = (acc * x_scale * self.scale).to(x.dtype)
       return y + self.bias.to(x.dtype)
+    if self.pretranspose:
+      return torch.matmul(x.to(self.weight.dtype), self.weight) + self.bias.to(self.weight.dtype)
     return F.linear(x.to(self.weight.dtype), self.weight, self.bias.to(self.weight.dtype))
 
 
@@ -401,7 +419,16 @@ def _quantize_w_fp8_torch(w_out_in: torch.Tensor) -> tuple[torch.Tensor, torch.T
   return qw, scale
 
 
-def _set_ltx2_param(model: LTX2TransformerTorch, key: str, tensor: torch.Tensor, *, fp8: bool, device: torch.device | None, h2d_fn: Any) -> bool:
+def _set_ltx2_param(
+    model: LTX2TransformerTorch,
+    key: str,
+    tensor: torch.Tensor,
+    *,
+    fp8: bool,
+    pretranspose_bf16: bool = False,
+    device: torch.device | None,
+    h2d_fn: Any,
+) -> bool:
   """Map one diffusers ``transformer/*.safetensors`` key into ``model``."""
   def _place(t: torch.Tensor) -> torch.Tensor:
     if device is None:
@@ -417,8 +444,15 @@ def _set_ltx2_param(model: LTX2TransformerTorch, key: str, tensor: torch.Tensor,
         del t_dev
         lin.weight = nn.Parameter(qw, requires_grad=False)
         lin.scale = nn.Parameter(sc, requires_grad=False)
+        lin.pretranspose = True
       else:
-        lin.weight = nn.Parameter(_place(t.to(model.dtype)), requires_grad=False)
+        t_dev = _place(t.to(model.dtype))
+        if pretranspose_bf16 and t.ndim == 2:
+          t_dev = t_dev.t().contiguous()
+          lin.pretranspose = True
+        else:
+          lin.pretranspose = False
+        lin.weight = nn.Parameter(t_dev, requires_grad=False)
         lin.scale = None
     elif suffix == "bias":
       lin.bias = nn.Parameter(_place(t.to(model.dtype)), requires_grad=False)
@@ -497,6 +531,7 @@ def load_torch_ltx2_dit(
     *,
     dtype: torch.dtype = torch.bfloat16,
     fp8: bool = False,
+    pretranspose_bf16: bool = False,
     device: torch.device | None = None,
     h2d_fn: Callable[[torch.Tensor, torch.device], torch.Tensor] | None = None,
     sync_fn: Callable[[], None] | None = None,
@@ -521,7 +556,9 @@ def load_torch_ltx2_dit(
     with safe_open(shard_path, framework="pt") as reader:
       for key in reader.keys():
         t = reader.get_tensor(key)
-        if _set_ltx2_param(model, key, t, fp8=fp8, device=device, h2d_fn=h2d_fn):
+        if _set_ltx2_param(
+            model, key, t, fp8=fp8, pretranspose_bf16=pretranspose_bf16, device=device, h2d_fn=h2d_fn
+        ):
           loaded += 1
         else:
           skipped += 1
@@ -530,8 +567,8 @@ def load_torch_ltx2_dit(
 
   if verbose:
     print(
-        f"[torch_ltx2_dit] Loaded {loaded} tensors (skipped {skipped}, dtype={dtype}, fp8={fp8}) "
-        f"in {time.perf_counter() - t0:.2f}s",
+        f"[torch_ltx2_dit] Loaded {loaded} tensors (skipped {skipped}, dtype={dtype}, "
+        f"fp8={fp8}, pretranspose_bf16={pretranspose_bf16}) in {time.perf_counter() - t0:.2f}s",
         flush=True,
     )
   return model

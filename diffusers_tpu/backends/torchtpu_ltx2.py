@@ -42,6 +42,7 @@ from ..models.ltx2 import jax_dit as _jd  # noqa: E402
 from ..models.ltx2.torch_dit import (  # noqa: E402
     LTX2TpuHooks,
     LTX2TransformerTorch,
+    layer_norm_no_affine_torch,
     load_torch_ltx2_dit,
 )
 
@@ -325,6 +326,44 @@ def _wrap_spmd_compile(fn, *, use_spmd_safe: bool = True):
   return torch.compile(fn, backend="tpu", fullgraph=True, dynamic=False)
 
 
+def _top_ltx2_pre(
+    proj_in, audio_proj_in,
+    time_embed, audio_time_embed, prompt_adaln, audio_prompt_adaln,
+    av_v_ss, av_v_g, av_a_ss, av_a_g,
+    x_full, a_full, sp_idx, tv, tt, rows_per_group: int,
+):
+  x_loc = x_full.index_select(1, sp_idx).to(torch.bfloat16)
+  a_loc = a_full.to(torch.bfloat16)
+  if rows_per_group > 1:
+    x_loc = x_loc.repeat(rows_per_group, 1, 1)
+    a_loc = a_loc.repeat(rows_per_group, 1, 1)
+  b = tv.shape[0]
+  dt = x_loc.dtype
+  temb, emb = time_embed(tv.reshape(-1), dt)
+  temb_a, emb_a = audio_time_embed(tt, dt)
+  tp, _ = prompt_adaln(tt, dt)
+  tpa, _ = audio_prompt_adaln(tt, dt)
+  cav, _ = av_v_ss(tt, dt)
+  cavg, _ = av_v_g(tt, dt)
+  caa, _ = av_a_ss(tt, dt)
+  caag, _ = av_a_g(tt, dt)
+  x = proj_in(x_loc)
+  a = audio_proj_in(a_loc)
+  return (
+      x, a,
+      temb.reshape(b, -1, temb.shape[-1]),
+      emb.reshape(b, -1, emb.shape[-1]),
+      temb_a.reshape(b, -1, temb_a.shape[-1]),
+      emb_a.reshape(b, -1, emb_a.shape[-1]),
+      tp.reshape(b, -1, tp.shape[-1]),
+      tpa.reshape(b, -1, tpa.shape[-1]),
+      cav.reshape(b, -1, cav.shape[-1]),
+      cavg.reshape(b, -1, cavg.shape[-1]),
+      caa.reshape(b, -1, caa.shape[-1]),
+      caag.reshape(b, -1, caag.shape[-1]),
+  )
+
+
 def _top_ltx2_group(
     mods,
     x, a, ctx, actx,
@@ -346,6 +385,65 @@ def _top_ltx2_group(
         hooks=_ACTIVE_LTX2_HOOKS,
     )
   return x, a
+
+
+def _top_ltx2_post(proj_out, audio_proj_out, ss_table, audio_ss_table, x, a, emb, emb_a, token_t):
+  emb_tok = emb.index_select(1, token_t)
+  sh_v = ss_table[0].to(emb_tok.dtype) + emb_tok
+  sc_v = ss_table[1].to(emb_tok.dtype) + emb_tok
+  px = proj_out(layer_norm_no_affine_torch(x) * (1.0 + sc_v) + sh_v)
+  sh_a = audio_ss_table[0].to(emb_a.dtype) + emb_a
+  sc_a = audio_ss_table[1].to(emb_a.dtype) + emb_a
+  pa = audio_proj_out(layer_norm_no_affine_torch(a) * (1.0 + sc_a) + sh_a)
+  return px, pa
+
+
+def _guide_x0_torch(
+    sample: torch.Tensor,
+    out_4: torch.Tensor,
+    s_cur: torch.Tensor,
+    cfg: float,
+    stg: float,
+    mod: float,
+    rescale: float,
+) -> torch.Tensor:
+  x0 = sample - out_4.float() * s_cur
+  neg, pos, pst, iso = x0[0:1], x0[1:2], x0[2:3], x0[3:4]
+  g = pos + (cfg - 1.0) * (pos - neg) + stg * (pos - pst)
+  if mod != 1.0:
+    g = g + (mod - 1.0) * (pos - iso)
+  if rescale > 0.0:
+    n_dof = float(pos.shape[1] * pos.shape[2] - 1)
+    mp = pos.mean(dim=(1, 2), keepdim=True)
+    mg = g.mean(dim=(1, 2), keepdim=True)
+    std_p = torch.sqrt(((pos - mp) ** 2).sum(dim=(1, 2), keepdim=True) / n_dof)
+    std_g = torch.sqrt(((g - mg) ** 2).sum(dim=(1, 2), keepdim=True) / n_dof)
+    g = rescale * (g * (std_p / std_g)) + (1.0 - rescale) * g
+  return (sample - g) / s_cur
+
+
+def _top_ltx2_euler_step(
+    x: torch.Tensor,
+    a: torch.Tensor,
+    pv_4: torch.Tensor,
+    pa_4: torch.Tensor,
+    first_t: torch.Tensor,
+    s_cur: torch.Tensor,
+    ds: torch.Tensor,
+    cfg_v: float,
+    stg_v: float,
+    mod_v: float,
+    cfg_a: float,
+    stg_a: float,
+    mod_a: float,
+    rescale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  v = _guide_x0_torch(x, pv_4, s_cur, cfg_v, stg_v, mod_v, rescale)
+  va = _guide_x0_torch(a, pa_4, s_cur, cfg_a, stg_a, mod_a, rescale)
+  x_new = x + ds * v
+  x_out = first_t * x + (1.0 - first_t) * x_new
+  a_out = a + ds * va
+  return x_out, a_out
 
 
 class CompiledLTX2RunnerTT:
@@ -376,21 +474,48 @@ class CompiledLTX2RunnerTT:
         f"num_layers={len(model.blocks)} must be divisible by aot_group={self.aot_group}"
     )
 
+    self._blk_chunks = [
+        [model.blocks[i] for i in range(s, s + self.aot_group)]
+        for s in range(0, len(model.blocks), self.aot_group)
+    ]
+    self._pre_mods = (
+        model.proj_in, model.audio_proj_in,
+        model.time_embed, model.audio_time_embed,
+        model.prompt_adaln, model.audio_prompt_adaln,
+        model.av_cross_attn_video_scale_shift, model.av_cross_attn_video_a2v_gate,
+        model.av_cross_attn_audio_scale_shift, model.av_cross_attn_audio_v2a_gate,
+    )
+    self._post_mods = (
+        model.proj_out, model.audio_proj_out,
+        model.scale_shift_table, model.audio_scale_shift_table,
+    )
+
     persist_dir = os.environ.get("DT_AOT_PERSIST", "").strip()
     if persist_dir == "0":
       persist_dir = ""
 
     if not use_compile:
+      self._pre_fn = _top_ltx2_pre
       self._group_fn = _top_ltx2_group
+      self._post_fn = _top_ltx2_post
+      self._euler_fn = _top_ltx2_euler_step
       return
 
-    compiled = _wrap_spmd_compile(_top_ltx2_group, use_spmd_safe=use_spmd_safe)
-    if not persist_dir or not hasattr(compiled, "aot_compile"):
-      self._group_fn = compiled
+    c_pre = _wrap_spmd_compile(_top_ltx2_pre, use_spmd_safe=use_spmd_safe)
+    c_grp = _wrap_spmd_compile(_top_ltx2_group, use_spmd_safe=use_spmd_safe)
+    c_post = _wrap_spmd_compile(_top_ltx2_post, use_spmd_safe=use_spmd_safe)
+    c_euler = _wrap_spmd_compile(_top_ltx2_euler_step, use_spmd_safe=use_spmd_safe)
+
+    if not persist_dir or not hasattr(c_grp, "aot_compile"):
+      self._pre_fn = c_pre
+      self._group_fn = c_grp
+      self._post_fn = c_post
+      self._euler_fn = c_euler
       return
 
-    salt = (
-        "ltx2_v1",
+    os.makedirs(persist_dir, exist_ok=True)
+    base_salt = (
+        "ltx2_v2",
         self.aot_group,
         self.cfg_rank,
         self.sp_size,
@@ -400,89 +525,113 @@ class CompiledLTX2RunnerTT:
         bool(fp8),
         bool(hooks.qk_fp8),
     )
-    h = hashlib.sha1(repr(salt).encode("utf-8")).hexdigest()[:16]
-    os.makedirs(persist_dir, exist_ok=True)
-    bin_path = os.path.join(persist_dir, f"ltx2_g{self.aot_group}_{h}.bin")
-    art_holder: list[Any] = [None]
-    tried: list[bool] = [False]
 
-    def _call_persisted(*args):
-      if art_holder[0] is not None:
-        return art_holder[0](*args)
-      if not tried[0]:
-        tried[0] = True
-        if os.path.exists(bin_path) and hasattr(torch.compiler, "load_compiled_function"):
-          t_ld = time.perf_counter()
+    def _wrap_persist(tag: str, compiled_fn: Any) -> Any:
+      h = hashlib.sha1(repr((tag,) + base_salt).encode("utf-8")).hexdigest()[:16]
+      bin_path = os.path.join(persist_dir, f"ltx2_{tag}_g{self.aot_group}_{h}.bin")
+      art_holder: list[Any] = [None]
+      tried: list[bool] = [False]
+
+      def _call(*args):
+        if art_holder[0] is not None:
+          return art_holder[0](*args)
+        if not tried[0]:
+          tried[0] = True
+          if os.path.exists(bin_path) and hasattr(torch.compiler, "load_compiled_function"):
+            t_ld = time.perf_counter()
+            try:
+              with open(bin_path, "rb") as f:
+                art = torch.compiler.load_compiled_function(f, f_globals=globals())
+              art_holder[0] = art
+              if self.cfg_rank == 0 and self.sp_rank == 0:
+                print(f"  [aot/ltx2] loaded {os.path.basename(bin_path)} in {time.perf_counter() - t_ld:.2f}s", flush=True)
+              return art(*args)
+            except Exception as exc:
+              if self.cfg_rank == 0 and self.sp_rank == 0:
+                print(f"  [aot/ltx2] cached {os.path.basename(bin_path)} unusable ({type(exc).__name__}); recompiling", flush=True)
           try:
-            with open(bin_path, "rb") as f:
-              art = torch.compiler.load_compiled_function(f, f_globals=globals())
+            art = compiled_fn.aot_compile((args, {}))
             art_holder[0] = art
-            if self.cfg_rank == 0 and self.sp_rank == 0:
-              print(f"  [aot/ltx2] loaded {os.path.basename(bin_path)} in {time.perf_counter() - t_ld:.2f}s", flush=True)
+            if self.sp_rank == 0 and hasattr(art, "save_compiled_function"):
+              tmp_p = f"{bin_path}.tmp.{os.getpid()}"
+              art.save_compiled_function(tmp_p)
+              os.replace(tmp_p, bin_path)
+              if self.cfg_rank == 0:
+                print(f"  [aot/ltx2] saved {os.path.basename(bin_path)}", flush=True)
             return art(*args)
           except Exception as exc:
             if self.cfg_rank == 0 and self.sp_rank == 0:
-              print(f"  [aot/ltx2] cached {os.path.basename(bin_path)} unusable ({type(exc).__name__}); recompiling", flush=True)
-        try:
-          art = compiled.aot_compile((args, {}))
-          art_holder[0] = art
-          if self.sp_rank == 0 and hasattr(art, "save_compiled_function"):
-            tmp_p = f"{bin_path}.tmp.{os.getpid()}"
-            art.save_compiled_function(tmp_p)
-            os.replace(tmp_p, bin_path)
-            if self.cfg_rank == 0:
-              print(f"  [aot/ltx2] saved {os.path.basename(bin_path)}", flush=True)
-          return art(*args)
-        except Exception as exc:
-          if self.cfg_rank == 0 and self.sp_rank == 0:
-            print(f"  [aot/ltx2] fallback to torch.compile ({type(exc).__name__}: {str(exc)[:120]})", flush=True)
-      return compiled(*args)
+              print(f"  [aot/ltx2] {tag} fallback to torch.compile ({type(exc).__name__}: {str(exc)[:120]})", flush=True)
+        return compiled_fn(*args)
 
-    self._group_fn = _call_persisted
+      return _call
+
+    self._pre_fn = _wrap_persist("pre", c_pre)
+    self._group_fn = _wrap_persist("grp", c_grp)
+    self._post_fn = _wrap_persist("post", c_post)
+    self._euler_fn = _wrap_persist("euler", c_euler)
 
   @torch.no_grad()
   def forward_local(
       self,
-      x_local: torch.Tensor,  # [1, S_loc, 128] bf16
-      a_in: torch.Tensor,  # [1, N_a, 128] bf16
-      ctx_row: torch.Tensor,  # [1, 1024, 4096] bf16
-      actx_row: torch.Tensor,  # [1, 1024, 2048] bf16
-      t_val: float,
+      x_full: torch.Tensor,   # [1, N_vid, 128] f32/bf16 on TPU
+      a_full: torch.Tensor,   # [1, N_aud, 128] f32/bf16 on TPU
+      sp_idx: torch.Tensor,   # [S_loc] int64 on TPU
+      ctx_row: torch.Tensor,  # [rows_per_group, 1024, 4096] bf16
+      actx_row: torch.Tensor,  # [rows_per_group, 1024, 2048] bf16
+      tv: torch.Tensor,       # [1, 2] f32 on TPU
+      tt: torch.Tensor,       # [1] f32 on TPU
+      rows_per_group: int,
       token_t_local: torch.Tensor,  # [S_loc] int64
       ropes_local: dict[str, tuple[torch.Tensor, torch.Tensor]],
-      stg_flags_all: torch.Tensor,  # [48, 1] bool
-      iso_keep: torch.Tensor,  # [1, 1, 1] bf16
+      stg_chunks: list[torch.Tensor],
+      iso_keep: torch.Tensor,  # [rows_per_group, 1, 1] bf16
   ) -> tuple[torch.Tensor, torch.Tensor]:
     global _ACTIVE_LTX2_HOOKS
     _ACTIVE_LTX2_HOOKS = self.hooks
 
-    dev = x_local.device
-    tv = torch.tensor([[0.0, t_val]], device=dev, dtype=torch.float32)
-    tt = torch.tensor([t_val], device=dev, dtype=torch.float32)
-    cond = self.model.conditioning(tv, tt, tt)
-
-    x = self.model.proj_in(x_local)
-    a = self.model.audio_proj_in(a_in)
+    x, a, temb, emb, temb_a, emb_a, tp, tpa, cav, cavg, caa, caag = self._pre_fn(
+        *self._pre_mods, x_full, a_full, sp_idx, tv, tt, rows_per_group,
+    )
 
     rv_c, rv_s = ropes_local["video"]
     ra_c, ra_s = ropes_local["audio"]
     rcv_c, rcv_s = ropes_local["ca_video"]
     rca_c, rca_s = ropes_local["ca_audio"]
 
-    g = self.aot_group
-    n_blk = len(self.model.blocks)
-    for start in range(0, n_blk, g):
-      chunk = [self.model.blocks[i] for i in range(start, start + g)]
+    for chunk, stg_c in zip(self._blk_chunks, stg_chunks):
       x, a = self._group_fn(
           chunk,
           x, a, ctx_row, actx_row,
-          cond["temb"], cond["temb_a"], cond["tp"], cond["tpa"],
-          cond["cav"], cond["cavg"], cond["caa"], cond["caag"],
+          temb, temb_a, tp, tpa, cav, cavg, caa, caag,
           token_t_local,
           rv_c, rv_s, ra_c, ra_s, rcv_c, rcv_s, rca_c, rca_s,
-          stg_flags_all[start : start + g], iso_keep,
+          stg_c, iso_keep,
       )
-    return self.model.output_heads(x, a, cond["emb"], cond["emb_a"], token_t_local)
+    return self._post_fn(*self._post_mods, x, a, emb, emb_a, token_t_local)
+
+  @torch.no_grad()
+  def euler_step(
+      self,
+      x: torch.Tensor,
+      a: torch.Tensor,
+      pv_4: torch.Tensor,
+      pa_4: torch.Tensor,
+      first_t: torch.Tensor,
+      s_cur: torch.Tensor,
+      ds: torch.Tensor,
+      cfg_v: float,
+      stg_v: float,
+      mod_v: float,
+      cfg_a: float,
+      stg_a: float,
+      mod_a: float,
+      rescale: float,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    return self._euler_fn(
+        x, a, pv_4, pa_4, first_t, s_cur, ds,
+        cfg_v, stg_v, mod_v, cfg_a, stg_a, mod_a, rescale,
+    )
 
 
 def _guide_x0_np(
@@ -590,12 +739,13 @@ def main(argv: list[str] | None = None) -> None:
   s_loc = n_vid // sp
   lo, hi = sp_rank * s_loc, (sp_rank + 1) * s_loc
 
-  # 2. Stream-load 48-block DiT directly onto TPU (with optional on-TPU W8A8 FP8).
+  # 2. Stream-load 48-block DiT directly onto TPU (with optional on-TPU W8A8 FP8 + pre-transposed BF16).
   t_ld = time.perf_counter()
   model = load_torch_ltx2_dit(
       args.repo,
       dtype=torch.bfloat16,
       fp8=args.fp8,
+      pretranspose_bf16=True,
       device=device,
       h2d_fn=_fast_h2d_no_pin,
       sync_fn=_sync,
@@ -651,6 +801,8 @@ def main(argv: list[str] | None = None) -> None:
       ),
   }
   token_t_local = torch.from_numpy(np.ascontiguousarray(token_t_np[lo:hi])).to(device)
+  sp_idx_t = torch.arange(lo, hi, device=device, dtype=torch.int64)
+  first_t = torch.from_numpy(np.ascontiguousarray(first_np)).to(device=device, dtype=torch.float32)
 
   # Map 4 CFG rows across cp groups (default cp=4: 1 row per group!).
   rows_per_group = 4 // cp
@@ -664,56 +816,92 @@ def main(argv: list[str] | None = None) -> None:
     if r_start + local_r == 2:
       stg_all_np[args.stg_block, local_r] = True
   stg_flags_all = torch.from_numpy(stg_all_np).to(device)
+  stg_chunks = [
+      stg_flags_all[s : s + args.aot_group].contiguous()
+      for s in range(0, len(model.blocks), args.aot_group)
+  ]
 
   iso_keep_np = np.array(
       [0.0 if (r_start + lr == 3) else 1.0 for lr in range(rows_per_group)], dtype=np.float32
   ).reshape(rows_per_group, 1, 1)
   iso_keep = torch.from_numpy(iso_keep_np).to(device=device, dtype=torch.bfloat16)
 
-  def _fwd_4rows(x_np: np.ndarray, a_np: np.ndarray, sigma: float) -> tuple[np.ndarray, np.ndarray]:
-    t_val = float(sigma) * 1000.0
-    x_loc_t = torch.from_numpy(np.ascontiguousarray(np.repeat(x_np[:, lo:hi, :], rows_per_group, axis=0))).to(
-        device=device, dtype=torch.bfloat16
-    )
-    a_in_t = torch.from_numpy(np.ascontiguousarray(np.repeat(a_np, rows_per_group, axis=0))).to(
-        device=device, dtype=torch.bfloat16
-    )
+  # Pre-place all per-step schedule scalars on TPU once (zero H2D inside the denoising loop).
+  n_steps = len(sigmas) - 1
+  tv_list = [
+      torch.tensor([[0.0, float(sigmas[i]) * 1000.0]], device=device, dtype=torch.float32)
+      for i in range(n_steps)
+  ]
+  tt_list = [
+      torch.tensor([float(sigmas[i]) * 1000.0], device=device, dtype=torch.float32)
+      for i in range(n_steps)
+  ]
+  s_list = [
+      torch.tensor([[[float(sigmas[i])]]], device=device, dtype=torch.float32)
+      for i in range(n_steps)
+  ]
+  ds_list = [
+      torch.tensor([[[float(sigmas[i + 1] - sigmas[i])]]], device=device, dtype=torch.float32)
+      for i in range(n_steps)
+  ]
+
+  v_out_ch = int(model.cfg["out_channels"])
+  a_out_ch = int(model.cfg["audio_out_channels"])
+  pv_sp_buf = (
+      torch.empty((sp, rows_per_group, s_loc, v_out_ch), device=device, dtype=torch.bfloat16)
+      if sp > 1 else None
+  )
+  pv_4_buf = (
+      torch.empty((4, n_vid, v_out_ch), device=device, dtype=torch.bfloat16)
+      if cp > 1 else None
+  )
+  pa_4_buf = (
+      torch.empty((4, n_aud, a_out_ch), device=device, dtype=torch.bfloat16)
+      if cp > 1 else None
+  )
+
+  def _fwd_4rows_tpu(
+      x_t: torch.Tensor, a_t: torch.Tensor, tv_t: torch.Tensor, tt_t: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor]:
     pv_loc, pa_loc = runner.forward_local(
-        x_loc_t, a_in_t, ctx_row, actx_row, t_val,
-        token_t_local, ropes_local, stg_flags_all, iso_keep,
+        x_t, a_t, sp_idx_t, ctx_row, actx_row, tv_t, tt_t, rows_per_group,
+        token_t_local, ropes_local, stg_chunks, iso_keep,
     )
     # Gather video tokens across sp_group -> [rows_per_group, n_vid, 128]
     if sp > 1:
-      pv_sp = torch.empty((sp, rows_per_group, s_loc, pv_loc.shape[-1]), device=device, dtype=pv_loc.dtype)
-      dist.all_gather_into_tensor(pv_sp, pv_loc.contiguous(), group=sp_pg)
-      pv_grp = pv_sp.permute(1, 0, 2, 3).contiguous().reshape(rows_per_group, n_vid, -1)
+      dist.all_gather_into_tensor(pv_sp_buf, pv_loc, group=sp_pg)
+      if rows_per_group == 1:
+        pv_grp = pv_sp_buf.view(1, n_vid, v_out_ch)
+      else:
+        pv_grp = pv_sp_buf.permute(1, 0, 2, 3).contiguous().view(rows_per_group, n_vid, v_out_ch)
     else:
       pv_grp = pv_loc
 
     # Gather 4 CFG rows across cfg_group -> [4, n_vid, 128] and [4, n_aud, 128]
     if cp > 1:
-      pv_4 = torch.empty((4, n_vid, pv_grp.shape[-1]), device=device, dtype=pv_grp.dtype)
-      pa_4 = torch.empty((4, n_aud, pa_loc.shape[-1]), device=device, dtype=pa_loc.dtype)
-      dist.all_gather_into_tensor(pv_4, pv_grp.contiguous(), group=cfg_pg)
-      dist.all_gather_into_tensor(pa_4, pa_loc.contiguous(), group=cfg_pg)
-    else:
-      pv_4, pa_4 = pv_grp, pa_loc
-    return pv_4.float().cpu().numpy(), pa_4.float().cpu().numpy()
+      dist.all_gather_into_tensor(pv_4_buf, pv_grp, group=cfg_pg)
+      dist.all_gather_into_tensor(pa_4_buf, pa_loc, group=cfg_pg)
+      return pv_4_buf, pa_4_buf
+    return pv_grp, pa_loc
+
+  x_init_t = torch.from_numpy(np.ascontiguousarray(x_init)).to(device=device, dtype=torch.float32)
+  a_init_t = torch.from_numpy(np.ascontiguousarray(a_init)).to(device=device, dtype=torch.float32)
 
   if args.mode == "bench":
     say(f"[torchtpu_ltx2] Running {args.warmup} warmup forward(s) (includes AOT compile) ...")
     t_w = time.perf_counter()
-    pv, pa = _fwd_4rows(x_init, a_init, float(sigmas[0]))
+    pv_t, pa_t = _fwd_4rows_tpu(x_init_t, a_init_t, tv_list[0], tt_list[0])
     _sync()
     t_comp = time.perf_counter() - t_w
-    say(f"[torchtpu_ltx2] Compile/warmup done in {t_comp:.2f}s | pv std={float(pv.std()):.4f} pa std={float(pa.std()):.4f}")
+    pv_np, pa_np = pv_t.float().cpu().numpy(), pa_t.float().cpu().numpy()
+    say(f"[torchtpu_ltx2] Compile/warmup done in {t_comp:.2f}s | pv std={float(pv_np.std()):.4f} pa std={float(pa_np.std()):.4f}")
     for _ in range(max(0, args.warmup - 1)):
-      _fwd_4rows(x_init, a_init, float(sigmas[0]))
+      _fwd_4rows_tpu(x_init_t, a_init_t, tv_list[0], tt_list[0])
       _sync()
     ts = []
     for it in range(args.bench_iters):
       t0 = time.perf_counter()
-      pv, pa = _fwd_4rows(x_init, a_init, float(sigmas[0]))
+      _fwd_4rows_tpu(x_init_t, a_init_t, tv_list[0], tt_list[0])
       _sync()
       dt = (time.perf_counter() - t0) * 1000.0
       ts.append(dt)
@@ -723,26 +911,43 @@ def main(argv: list[str] | None = None) -> None:
         f"load={load_s:.2f}s compile={t_comp:.2f}s median={float(np.median(ts)):.1f} ms min={min(ts):.1f} ms"
     )
   else:
-    n_steps = len(sigmas) - 1
     for run_i in range(args.runs):
-      x, a = x_init.copy(), a_init.copy()
+      x_t = x_init_t.clone()
+      a_t = a_init_t.clone()
+      _sync()
       t_run0 = time.perf_counter()
-      step_ms = []
-      for i in range(n_steps):
-        ts0 = time.perf_counter()
-        s_cur, s_nxt = float(sigmas[i]), float(sigmas[i + 1])
-        pv_4, pa_4 = _fwd_4rows(x, a, s_cur)
-        v = _guide_x0_np(x, pv_4, s_cur, args.guidance, args.stg, args.modality, args.rescale)
-        va = _guide_x0_np(a, pa_4, s_cur, args.audio_guidance, args.audio_stg, args.audio_modality, args.rescale)
-        x_new = x + (s_nxt - s_cur) * v
-        x = first_np * x + (1.0 - first_np) * x_new
-        a = a + (s_nxt - s_cur) * va
-        step_ms.append((time.perf_counter() - ts0) * 1000.0)
-      tot_s = time.perf_counter() - t_run0
-      steady_ms = float(np.median(step_ms[1:])) if len(step_ms) > 1 else step_ms[0]
+
+      # Step 0 (synced to separate AOT compile / load time cleanly)
+      pv_4, pa_4 = _fwd_4rows_tpu(x_t, a_t, tv_list[0], tt_list[0])
+      x_t, a_t = runner.euler_step(
+          x_t, a_t, pv_4, pa_4, first_t, s_list[0], ds_list[0],
+          args.guidance, args.stg, args.modality,
+          args.audio_guidance, args.audio_stg, args.audio_modality,
+          args.rescale,
+      )
+      _sync()
+      t_after0 = time.perf_counter()
+      step0_ms = (t_after0 - t_run0) * 1000.0
+
+      # Steps 1..N-1 pipelined 100% on-TPU (zero host sync / D2H / H2D)
+      for i in range(1, n_steps):
+        pv_4, pa_4 = _fwd_4rows_tpu(x_t, a_t, tv_list[i], tt_list[i])
+        x_t, a_t = runner.euler_step(
+            x_t, a_t, pv_4, pa_4, first_t, s_list[i], ds_list[i],
+            args.guidance, args.stg, args.modality,
+            args.audio_guidance, args.audio_stg, args.audio_modality,
+            args.rescale,
+        )
+      _sync()
+      t_end = time.perf_counter()
+      tot_s = t_end - t_run0
+      steady_ms = (t_end - t_after0) * 1000.0 / max(1, n_steps - 1)
+
+      x = x_t.float().cpu().numpy()
+      a = a_t.float().cpu().numpy()
       say(
           f"[torchtpu_ltx2] run {run_i}: {n_steps} steps in {tot_s:.2f}s "
-          f"(step0={step_ms[0]:.1f}ms, median={steady_ms:.1f}ms/step) | "
+          f"(step0={step0_ms:.1f}ms, steady={steady_ms:.1f}ms/step) | "
           f"x std={float(x.std()):.4f} a std={float(a.std()):.4f}"
       )
 

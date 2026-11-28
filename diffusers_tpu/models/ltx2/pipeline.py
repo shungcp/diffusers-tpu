@@ -97,7 +97,7 @@ class Generator:
   def __init__(self, repo, mesh, height=512, width=768, frames=129, fps=24.0, steps=30,
                guidance=3.0, stg=1.0, rescale=0.7, stg_blocks=(28,), crf=None, resident=None, modality=1.0,
                audio_guidance=7.0, audio_stg=1.0, audio_modality=3.0, fp8=False, qk_fp8=False,
-               load_dit=True, load_text=True):
+               dit_backend="jax", load_dit=True, load_text=True):
     import json
     import torch
     import torchax
@@ -117,6 +117,7 @@ class Generator:
     self.audio_stg, self.audio_modality = float(audio_stg), float(audio_modality)
     self.rows = 4 if max(self.modality, self.audio_modality) > 1.0 else 3
     self.crf = crf
+    self.dit_backend = str(dit_backend)
     self.times = {}
     self.keep_steps = False  # tests: keep every step's packed video latents in .record
     if len(mesh.axis_names) == 2:
@@ -141,18 +142,34 @@ class Generator:
       self.cparams = None
       self._connect = None
 
+    self._torchax_fwd = None
     if load_dit:
-      dp, self.cfg = jd.load(os.path.join(snap, "transformer"), jnp.bfloat16)
+      with open(os.path.join(snap, "transformer", "config.json")) as f:
+        self.cfg = json.load(f)
       if resident is None or resident < 0:
         resident = _default_resident(self.cfg["num_layers"], mesh.shape[self.cfg_axis] if self.cfg_axis else 1)
       self.resident = min(int(resident), self.cfg["num_layers"])
       # Blocks kept whole on every chip (evenly spaced): no all-gather for them.
       res = (set(np.linspace(0, self.cfg["num_layers"] - 1, self.resident).round().astype(int).tolist())
              if self.resident else set())
-      self.params = jax_sp.place(dp, mesh, self.axis, res, fp8=fp8)
-      del dp
-      self.blocks_fn = jax_sp.make_blocks_fn(mesh, self.cfg, self.params, self.axis, res, stg_blocks,
-                                             cfg_axis=self.cfg_axis, qk_fp8=qk_fp8)
+      if self.dit_backend == "torchax":
+        from . import torchax_dit
+        self._ta_model, self.params, self.cfg = torchax_dit.load_and_place_torchax_dit(
+            snap, mesh, self.axis, res, fp8=fp8,
+        )
+        self._torchax_fwd = torchax_dit.make_torchax_forward(
+            self._ta_model, self.params, mesh, self.axis, res, stg_blocks,
+            cfg_axis=self.cfg_axis, fp8=fp8, qk_fp8=qk_fp8,
+        )
+        self.blocks_fn = None
+      elif self.dit_backend == "jax":
+        dp, self.cfg = jd.load(os.path.join(snap, "transformer"), jnp.bfloat16)
+        self.params = jax_sp.place(dp, mesh, self.axis, res, fp8=fp8)
+        del dp
+        self.blocks_fn = jax_sp.make_blocks_fn(mesh, self.cfg, self.params, self.axis, res, stg_blocks,
+                                               cfg_axis=self.cfg_axis, qk_fp8=qk_fp8)
+      else:
+        raise ValueError(f"Unsupported dit_backend={self.dit_backend!r} (expected 'jax' or 'torchax')")
     else:
       with open(os.path.join(snap, "transformer", "config.json")) as f:
         self.cfg = json.load(f)
@@ -220,9 +237,13 @@ class Generator:
     iso = jnp.asarray([False, False, False, True][:rows])
     xin = jnp.repeat(x, rows, 0).astype(jnp.bfloat16)
     ain = jnp.repeat(a, rows, 0).astype(jnp.bfloat16)
-    pv, pa = jd.forward(params, self.cfg, xin, ain, ctx, actx, tv, tt, tt, self.rope, stg=stg,
-                        stg_blocks=self.stg_blocks, token_t=self.token_t, blocks_fn=self.blocks_fn,
-                        isolate=iso if rows == 4 else None)
+    if self._torchax_fwd is not None:
+      pv, pa = self._torchax_fwd(params, xin, ain, ctx, actx, tv, tt, tt, self.token_t, self.rope,
+                                 stg, iso if rows == 4 else None)
+    else:
+      pv, pa = jd.forward(params, self.cfg, xin, ain, ctx, actx, tv, tt, tt, self.rope, stg=stg,
+                          stg_blocks=self.stg_blocks, token_t=self.token_t, blocks_fn=self.blocks_fn,
+                          isolate=iso if rows == 4 else None)
 
     def guide(sample, out, cfg, stg_scale, mod):
       x0 = sample - out.astype(jnp.float32) * s  # [rows, ...]
@@ -360,6 +381,8 @@ def main():
                  help="CFG-parallel groups over the 4 DiT rows (default: auto = 4 on v7x, 2 on a v6e-8)")
   p.add_argument("--fp8", action="store_true", help="Quantize large DiT block linears to v7x float8_e4m3fn (W8A8)")
   p.add_argument("--qk-fp8", action="store_true", help="Cast Q and K to float8_e4m3fn inside Pallas splash attention")
+  p.add_argument("--dit-backend", choices=("jax", "torchax"), default="jax",
+                 help="DiT execution backend: native JAX (jax) or PyTorch via torchax (torchax)")
   p.add_argument("--encode-only", default="", help="Stage 0 only: save conditioning + initial noise to .npz and exit (skips DiT)")
   p.add_argument("--decode-latents", default="", help="Stage 3 only: decode denoised latents .npz to --output mp4 (skips text & DiT)")
   p.add_argument("--output", default="ltx2.mp4")
@@ -391,10 +414,10 @@ def main():
   t0 = time.perf_counter()
   gen = Generator(args.repo, mesh, height=args.height, width=args.width, frames=args.frames, fps=args.fps,
                   steps=args.steps, guidance=args.guidance, stg=args.stg, rescale=args.rescale, crf=args.crf,
-                  resident=args.resident, fp8=args.fp8, qk_fp8=args.qk_fp8,
+                  resident=args.resident, fp8=args.fp8, qk_fp8=args.qk_fp8, dit_backend=args.dit_backend,
                   load_dit=load_dit, load_text=load_text)
-  print(f"load: {time.perf_counter() - t0:.1f}s (resident={gen.resident}, fp8={args.fp8}, qk_fp8={args.qk_fp8})",
-        flush=True)
+  print(f"load: {time.perf_counter() - t0:.1f}s (backend={args.dit_backend}, resident={gen.resident}, "
+        f"fp8={args.fp8}, qk_fp8={args.qk_fp8})", flush=True)
 
   if args.encode_only:
     t0 = time.perf_counter()

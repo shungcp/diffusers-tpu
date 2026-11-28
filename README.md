@@ -4,9 +4,9 @@ Fast inference for open diffusion models on Cloud TPU, built on top of [huggingf
 
 基于 [huggingface/diffusers](https://github.com/huggingface/diffusers),在 Cloud TPU 上高速运行开源扩散模型。
 
-Nine models are supported today: **MiniMax-H3** (video + audio), **MiniMax-H3-Image** (image and image editing), **Qwen-Image-2.1** (image), **MOSS-Image** (image, torchax backend), **MOSS-SoundEffect-v2** (text-to-audio, JAX), **MOVA** (image + text to video with audio, JAX), **OmniVAE T2AV** (text to video with audio, JAX), **VideoGym-LTX-2.3** (image + text to video, LTX-2.3, JAX / torch_tpu) and **MAGI-2-preview** (113.93B Multi-Head Latent MoE video + audio + 1080p refiner, JAX / torchax / torch_tpu).
+Nine models are supported today: **MiniMax-H3** (video + audio), **MiniMax-H3-Image** (image and image editing), **Qwen-Image-2.1** (image), **MOSS-Image** (image, torchax backend), **MOSS-SoundEffect-v2** (text-to-audio, JAX), **MOVA** (image + text to video with audio, JAX), **OmniVAE T2AV** (text to video with audio, JAX), **VideoGym-LTX-2.3** (image + text to video, LTX-2.3, JAX / torchax / torch_tpu) and **MAGI-2-preview** (113.93B Multi-Head Latent MoE video + audio + 1080p refiner, JAX / torchax / torch_tpu).
 
-目前支持九个模型:**MiniMax-H3**(视频 + 音频)、**MiniMax-H3-Image**(图像与图像编辑)、**Qwen-Image-2.1**(图像)、**MOSS-Image**(图像,torchax 后端)、**MOSS-SoundEffect-v2**(文生音效,JAX)、**MOVA**(图 + 文生成带同步音频的视频,JAX)、**OmniVAE T2AV**(文生带同步音频的视频,JAX)、**VideoGym-LTX-2.3**(图 + 文生视频,LTX-2.3,JAX / torch_tpu)和 **MAGI-2-preview**(113.93B 多头潜空间 MoE 音视频生成 + 1080p 超分,JAX / torchax / torch_tpu 三后端)。
+目前支持九个模型:**MiniMax-H3**(视频 + 音频)、**MiniMax-H3-Image**(图像与图像编辑)、**Qwen-Image-2.1**(图像)、**MOSS-Image**(图像,torchax 后端)、**MOSS-SoundEffect-v2**(文生音效,JAX)、**MOVA**(图 + 文生成带同步音频的视频,JAX)、**OmniVAE T2AV**(文生带同步音频的视频,JAX)、**VideoGym-LTX-2.3**(图 + 文生视频,LTX-2.3,JAX / torchax / torch_tpu 三后端)和 **MAGI-2-preview**(113.93B 多头潜空间 MoE 音视频生成 + 1080p 超分,JAX / torchax / torch_tpu 三后端)。
 
 MiniMax-H3 also runs with the six-step **Pika-H3-Flex** adapters.
 
@@ -30,6 +30,9 @@ Newest first. Each entry links a date to what changed.
 
 最新的在最上面。每条记录写明日期和变化。
 
+- **2026-11-28** — **VideoGym-LTX-2.3 reaches full 3/3 framework parity (`JAX / torchax / torch_tpu`) + `2.28×` native `torch_tpu` BF16 speedup on TPU `v7x-8`** ([usage](#run-videogym-ltx-23--运行-videogym-ltx-23), [v7x ledger](docs/tpu_v7x.md#9-videogym-ltx-23-22b-audio-video-dit-on-tpu-v7x-8--videogym-ltx-23-在-v7x-8-上的优化台账)): added **`torchax`** backend (`ltx2/torchax_dit.py`, `--dit-backend torchax`, `scripts/run_ltx2_torchax.sh`) tracing pure-PyTorch `LTX2TransformerTorch` into the fused 2D `4×2` `shard_map` + Pallas Splash (**`7.04 s` BF16 `PSNR 45.64 dB`**, **`6.07 s` `--fp8` `PSNR 40.10 dB`**, within `4.7%` of Native JAX, CPU FP32 `max|d|=2.68e-7`); and optimized **`torch_tpu`** v2 (`torchtpu_ltx2.py` + `torch_dit.py`) by compiling `pre` (`conditioning` + `proj_in`), `post` (`output_heads`), and on-TPU `x0` Euler guidance (zero per-step D2H/H2D), pre-transposing BF16 linears on-TPU `(in, out)` (`torch.matmul`), and running BF16 MXU dense attention — cutting `torch_tpu` BF16 **`650 -> 285.3 ms/step`** (**`2.28×`**, **`8.58 s`** steady / `11.38 s` warm-AOT, `PSNR 38.25 dB`) and `--fp8` **`295 -> 255.2 ms/step`** (**`1.16×`**, **`7.67 s`** steady / `11.27 s` warm-AOT, `PSNR 36.51 dB`).
+
+  **2026-11-28** — **VideoGym-LTX-2.3 达成三框架全覆盖（`JAX / torchax / torch_tpu`）且原生 `torch_tpu` BF16 提速 `2.28×`（TPU `v7x-8`）**([用法](#run-videogym-ltx-23--运行-videogym-ltx-23),[台账](docs/tpu_v7x.md#9-videogym-ltx-23-22b-audio-video-dit-on-tpu-v7x-8--videogym-ltx-23-在-v7x-8-上的优化台账)):新增 **`torchax`** 后端(`ltx2/torchax_dit.py`、`--dit-backend torchax`、`scripts/run_ltx2_torchax.sh`),将纯 PyTorch `LTX2TransformerTorch` 追踪进融合 2D `4×2` `shard_map` + Pallas Splash(**BF16 `7.04 s` / `PSNR 45.64 dB`**,**`--fp8` `6.07 s` / `PSNR 40.10 dB`**,距原生 JAX 仅 `4.7%`,CPU FP32 `max|d|=2.68e-7`);同时优化 **`torch_tpu`** v2:全图编译 `pre`/`post` 与片上 `x0` Euler 引导(消除每步 D2H/H2D)、TPU 端 BF16 权重预转置 `(in, out)` 走 `torch.matmul`、以及 BF16 MXU 稠密注意力,将 `torch_tpu` BF16 从 `650 ms/步` 压至 **`285.3 ms/步`（`2.28×`**,30 步稳态 **`8.58 s`** / 含 AOT 热加载 `11.38 s`,`PSNR 38.25 dB`),`--fp8` 从 `295 ms/步` 压至 **`255.2 ms/步`（`1.16×`**,30 步稳态 **`7.67 s`** / 含热加载 `11.27 s`,`PSNR 36.51 dB`)。
 - **2026-11-27** — **MOVA-720p on TPU `v7x-8`: `788 s -> 588.1 s` lossless / `552.2 s` FP8 / `204.8 s` (`3.85×`) `--fp8 --lossy`** ([usage](#run-mova--运行-mova), [v7x ledger](docs/tpu_v7x.md#10-mova-720p-214b-dual-expert-video--audio-dit-on-tpu-v7x-8--mova-720p-在-v7x-8-上的优化台账)): on `>=64 GiB` `v7x-8`, auto `cfg=2 × tensor=4` + `resident=True` (eliminating 640 weight all-gathers/step), single fused 40-layer `shard_map`, precomputed sharded RoPE, fast `ml_dtypes` loader, and Wan2.1 VAE width-sharding (`160 % 8 == 0`, fixing 720p `90 % 8 != 0`) + on-TPU `uint8` D2H (`2.14 GB -> 534 MB`, **193-frame 720p + 8s 48kHz audio decode in `2.5–2.6 s`** warm). Verified at official `1280×720×193` (50 steps, CFG 5): **Tier 1 lossless BF16 `588.1 s`** (`68.4 GiB` HBM, CPU FP32 `4.77e-7`); **Tier 2 `--fp8 --qk-fp8` `552.2 s`** (`38.5 GiB` HBM, `-29.9 GiB`); **Tier 3 `--fp8 --lossy`** (hardware-optimal `5888×2048×2048` temporal-window `sparse_splash` `--sparse-window 12` + expert-boundary-safe audio+video TeaCache) **`204.8 s`** (**`3.85×`** vs `v6e-8`, `38.7 GiB` HBM, audio `corr 0.9544`).
 
   **2026-11-27** — **MOVA-720p TPU `v7x-8` 优化:`788 s -> 588.1 s` 无损 / `552.2 s` FP8 / `204.8 s`（`3.85×`）`--fp8 --lossy`**([用法](#run-mova--运行-mova),[台账](docs/tpu_v7x.md#10-mova-720p-214b-dual-expert-video--audio-dit-on-tpu-v7x-8--mova-720p-在-v7x-8-上的优化台账)):在 `>=64 GiB` `v7x-8` 上自动启用 `cfg=2 × tensor=4` + `resident=True`(消除每步 640 次权重 all-gather)、40 层单融合 `shard_map`、预计算分片 RoPE、修复 720p Wan2.1 VAE 宽度分片(`160 % 8 == 0`)与 TPU 端直出 `uint8`(193 帧 720p + 8 s 48 kHz 音频热解码仅 **`2.5–2.6 s`**)。官方 `1280×720×193`(50 步,CFG 5)实测:**Tier 1 无损 BF16 `588.1 s`**(峰值 `68.4 GiB`,CPU FP32 `4.77e-7`);**Tier 2 `--fp8 --qk-fp8` `552.2 s`**(峰值 `38.5 GiB`,省 `29.9 GiB`);**Tier 3 `--fp8 --lossy`**(`v7x` 最优 `5888×2048×2048` 滑窗 `sparse_splash` `--sparse-window 12` + 遵守高低噪专家边界的音视频 TeaCache)**`204.8 s`**(较 `v6e-8` 提速 **`3.85×`**,峰值 `38.7 GiB`,音频相关性 `0.9544`)。
@@ -682,7 +685,9 @@ hf download OpenMOSS-Team/VideoGym-LTX-2.3      # ~96 GB (Gemma-3-12B in float32
 bash scripts/run_ltx2.sh --image canvas.png --prompt "Move the red dot along the white path to the green square."
 # On TPU v7x-8, run_ltx2.sh auto-selects resident=48 & 4x2 CFG-parallel (6.60 s BF16); add --fp8 for 5.82 s E2E:
 bash scripts/run_ltx2.sh --image canvas.png --prompt "..." --fp8
-# Native torch_tpu backend (8-rank torchrun, 4x2 CFG-parallel, DT_AOT_PERSIST):
+# torchax backend (PyTorch DiT traced through JAX shard_map + Pallas Splash; 7.04 s BF16 / 6.07 s FP8):
+bash scripts/run_ltx2_torchax.sh --image canvas.png --prompt "..." --fp8 --output ltx2_torchax_fp8.mp4
+# Native torch_tpu backend (8-rank torchrun, 4x2 CFG-parallel, DT_AOT_PERSIST; 8.58 s BF16 / 7.67 s FP8 steady):
 bash scripts/run_ltx2_torchtpu.sh --image canvas.png --prompt "..." --fp8 --output ltx2_tt_fp8.mp4
 ```
 
@@ -690,14 +695,16 @@ bash scripts/run_ltx2_torchtpu.sh --image canvas.png --prompt "..." --fp8 --outp
 
 `--image` 为 768x512 画布(512x512 谜题居中、两侧黑边,同模型卡);与 diffusers / ltx-pipelines 一样先做 H.264 CRF 33 重压缩(`--crf 0` 跳过)。输出 H.264 mp4,附带模型的音频(未训练,接近静音)。可按需设置 `--frames`(8k + 1)、`--steps`、`--guidance`、`--stg`、`--seed`;`--resident` 为每个 chip 上整份常驻的 DiT 块数,`--cfg-parallel` 为 CFG 分组数(自动:v6e-8 为 16 / 2,v7x 为 48 / 4)。复用 `--compile-cache-dir` 时首跑仅需 `36 秒`(`v6e-8`) / `29.6 秒`(`v7x-8`)。完整 `v7x-8` 优化台账见 [docs/tpu_v7x.md 第 9 节](docs/tpu_v7x.md#9-videogym-ltx-23-22b-audio-video-dit-on-tpu-v7x-8--videogym-ltx-23-在-v7x-8-上的优化台账)。
 
-| VideoGym-LTX-2.3 (`768×512×129 @ 24 fps`, 30 steps, 4 rows) | Warm E2E | Denoise (30 steps) | Decode (`video + audio`) | Peak HBM |
+| VideoGym-LTX-2.3 (`768×512×129 @ 24 fps`, 30 steps, 4 rows) | Warm E2E | Denoise (30 steps) | Decode (`video + audio`) | Peak HBM / Load |
 |---|---|---|---|---|
 | `v6e-8` (`1×8, res=20`, BF16) | `15.03 s` | `14.10 s` (`0.470 s/step`) | `0.84 s` | `27.6 GiB` |
 | `v7x-8` (`1×8, res=48`, BF16) | `8.79 s` | `7.37 s` (`0.246 s/step`) | `1.39 s` (CPU `uint8`) | `44.2 GiB` |
 | **`v7x-8` Native JAX auto default (`4×2, res=48`, BF16 lossless)** | **`6.60 s`** (`2.28×`) | **`6.06 s`** (`0.202 s/step`) | **`0.49 s`** (`0.255 s` vid + `0.230 s` aud) | `44.2 GiB` |
 | **`v7x-8` Native JAX `--fp8` (`4×2, res=48`, W8A8 E4M3)** | **`5.82 s`** (`2.58×`) | **`5.29 s`** (`0.176 s/step`) | **`0.49 s`** (`PSNR 40.00 dB` vs `1×8`) | **`27.0 GiB`** |
-| **`v7x-8` `torch_tpu` (`8-rank`, `4×2`, BF16, `DT_AOT_PERSIST`)** | `21.41 s` denoise | `21.41 s` (`0.650 s/step` steady, `1.45 s` AOT) | `6.93 s` proc (`PSNR 38.32 dB` vs JAX `1×8`) | `10.88 s` load |
-| **`v7x-8` `torch_tpu` (`8-rank`, `4×2`, `--fp8`, `DT_AOT_PERSIST`)** | **`11.81 s`** denoise (`8.86 s` steady) | **`11.81 s`** (**`0.295 s/step`** steady, `1.77 s` AOT) | `6.87 s` proc (`PSNR 36.71 dB` vs JAX BF16) | **`10.46 s`** load |
+| **`v7x-8` `torchax` (`4×2, res=48`, BF16)** | **`7.04 s`** (`2.13×`) | **`6.51 s`** (`0.217 s/step`) | **`0.49 s`** (`PSNR 45.64 dB` vs JAX `4×2`) | `44.2 GiB` |
+| **`v7x-8` `torchax` `--fp8` (`4×2, res=48`, W8A8 E4M3)** | **`6.07 s`** (`2.48×`) | **`5.54 s`** (`0.185 s/step`) | **`0.49 s`** (`PSNR 40.10 dB` vs JAX BF16) | **`27.0 GiB`** |
+| **`v7x-8` `torch_tpu` v2 (`8-rank`, `4×2`, BF16, `DT_AOT_PERSIST`)** | **`8.58 s` steady** (`11.38 s` warm-AOT) | **`8.58 s`** (**`0.285 s/step`**, **`2.28×`** vs v1, `1.74 s` AOT) | `6.9 s` proc (`PSNR 38.25 dB` vs JAX `4×2`) | `11.61 s` load |
+| **`v7x-8` `torch_tpu` v2 (`8-rank`, `4×2`, `--fp8`, `DT_AOT_PERSIST`)** | **`7.67 s` steady** (`11.27 s` warm-AOT) | **`7.67 s`** (**`0.255 s/step`**, **`1.16×`** vs v1, `2.00 s` AOT) | `6.9 s` proc (`PSNR 36.51 dB` vs JAX BF16) | **`10.84 s`** load |
 
 ---
 
