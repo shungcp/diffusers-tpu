@@ -103,9 +103,9 @@ class TextEncoder:
 
 
 def make_step(vconf, aconf, bconf, video_fps, attention=jax_dit.dense_attention, video_layer=None,
-              blocks_fn=None, ropes=None, return_vel=False):
+              blocks_fn=None, ropes=None, return_vel=False, return_delta=False):
   """jitted ``(video, audio, bridge, latents_v, latents_a, condition, context, t,
-  s_from, s_to, guidance) -> (latents_v, latents_a[, v_pred, a_pred])``."""
+  s_from, s_to, guidance) -> (latents_v, latents_a[, v_pred, a_pred[, dv, da]])``."""
 
   def step(video, audio, bridge, lat_v, lat_a, condition, context, t, s_from, s_to, guidance):
     batch = context.shape[0]
@@ -116,14 +116,39 @@ def make_step(vconf, aconf, bconf, video_fps, attention=jax_dit.dense_attention,
                                        t, t, video_fps, attention=attention,
                                        video_layer=video_layer, blocks_fn=blocks_fn, ropes=ropes)
     v_pred, a_pred = v_pred.astype(jnp.float32), a_pred.astype(jnp.float32)
+    dv = da = None
     if batch > 1:
-      v_pred = v_pred[1:2] + guidance * (v_pred[0:1] - v_pred[1:2])
-      a_pred = a_pred[1:2] + guidance * (a_pred[0:1] - a_pred[1:2])
+      dv = v_pred[0:1] - v_pred[1:2]
+      da = a_pred[0:1] - a_pred[1:2]
+      v_pred = v_pred[0:1] + (guidance - 1.0) * dv
+      a_pred = a_pred[0:1] + (guidance - 1.0) * da
     dt = s_to - s_from
     out_v, out_a = lat_v + dt * v_pred, lat_a + dt * a_pred
+    if return_delta:
+      return out_v, out_a, v_pred, a_pred, dv, da
     if return_vel:
       return out_v, out_a, v_pred, a_pred
     return out_v, out_a
+
+  return jax.jit(step)
+
+
+def make_cond_step(vconf, aconf, bconf, video_fps, attention=jax_dit.dense_attention,
+                   blocks_fn=None, ropes=None):
+  """jitted ``cond-only`` (``batch=1`` on ``1x8`` tensor-parallel mesh) step with cached CFG delta."""
+
+  def step(video, audio, bridge, lat_v, lat_a, condition, pos_context, t, s_from, s_to,
+           guidance, delta_scale, cached_dv, cached_da):
+    x = jnp.concatenate([lat_v, condition], 1)
+    v_pos, a_pos = jax_dit.dual_step(video, vconf, audio, aconf, bridge, bconf, x, lat_a, pos_context,
+                                     t, t, video_fps, attention=attention,
+                                     blocks_fn=blocks_fn, ropes=ropes)
+    v_pos, a_pos = v_pos.astype(jnp.float32), a_pos.astype(jnp.float32)
+    scale = (guidance - 1.0) * delta_scale
+    v_pred = v_pos + scale * cached_dv
+    a_pred = a_pos + scale * cached_da
+    dt = s_to - s_from
+    return lat_v + dt * v_pred, lat_a + dt * a_pred, v_pred, a_pred
 
   return jax.jit(step)
 
@@ -198,12 +223,15 @@ class Generator:
   def __init__(self, repo=REPO, mesh=None, env=None, height=352, width=640, frames=193,
                video_fps=24.0, vae_chunk=None, seq_parallel=True, resident=None,
                fp8=False, qk_fp8=False, block_kv=None, sparse_window=0,
-               sparse_dense_steps=8, step_cache_thresh=0.0, step_cache_max_skip=2):
+               sparse_dense_steps=8, step_cache_thresh=0.0, step_cache_max_skip=2,
+               cfg_skip_after=0.0, cfg_skip_refresh=0, dit_backend="jax",
+               load_dit=True, load_text=True):
     import contextlib
+    import json
 
     import torch
     import torchax
-    from jax.sharding import NamedSharding
+    from jax.sharding import Mesh, NamedSharding
     from jax.sharding import PartitionSpec as P
     from transformers import AutoTokenizer, UMT5EncoderModel
 
@@ -223,117 +251,175 @@ class Generator:
     self.sparse_dense_steps = max(0, int(sparse_dense_steps))
     self.step_cache_thresh = max(0.0, float(step_cache_thresh))
     self.step_cache_max_skip = max(0, int(step_cache_max_skip))
+    self.cfg_skip_after = float(cfg_skip_after)
+    self.cfg_skip_refresh = max(0, int(cfg_skip_refresh))
+    self.dit_backend = str(dit_backend)
     if vae_chunk is None:
       vae_chunk = 8 if high_hbm else 4
     _repo_path = os.path.expanduser(repo)
     snap = _repo_path if os.path.isdir(_repo_path) else local_snapshot(repo)
+    self.snap = snap
     self.times = {}
 
     # Text: embedding lookup on the host, the blocks through torchax.
-    self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(snap, "tokenizer"))
-    with contextlib.suppress(RuntimeError):
+    if load_text:
+      self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(snap, "tokenizer"))
+      with contextlib.suppress(RuntimeError):
+        torchax.disable_globally()
+      t5 = UMT5EncoderModel.from_pretrained(os.path.join(snap, "text_encoder"), dtype=torch.bfloat16,
+                                            attn_implementation="eager").eval()
+      self._embed = t5.encoder.embed_tokens
+      for blk in t5.encoder.block:
+        blk.layer[1].DenseReluDense.wo.float()
+      torchax.enable_globally()
+      self.env._mesh = mesh
+      self.env.default_device_or_sharding = NamedSharding(mesh, P())
+      core = _text_core_class()(t5.encoder)
+      _move_module(core, self.env)
+      core = torchax.compile(core)
+      core.params = _shard(core.params, TEXT_SHARDINGS, mesh)
+      core.buffers = _shard(core.buffers, TEXT_SHARDINGS, mesh)
+      self._text = core
+      self._prompts = {}
       torchax.disable_globally()
-    t5 = UMT5EncoderModel.from_pretrained(os.path.join(snap, "text_encoder"), dtype=torch.bfloat16,
-                                          attn_implementation="eager").eval()
-    self._embed = t5.encoder.embed_tokens
-    for blk in t5.encoder.block:
-      blk.layer[1].DenseReluDense.wo.float()
-    torchax.enable_globally()
-    self.env._mesh = mesh
-    self.env.default_device_or_sharding = NamedSharding(mesh, P())
-    core = _text_core_class()(t5.encoder)
-    _move_module(core, self.env)
-    core = torchax.compile(core)
-    core.params = _shard(core.params, TEXT_SHARDINGS, mesh)
-    core.buffers = _shard(core.buffers, TEXT_SHARDINGS, mesh)
-    self._text = core
-    self._prompts = {}
-    torchax.disable_globally()
-
-    # DiT: both experts + audio + bridge (whole-resident on v7x, optional W8A8 FP8).
-    self.audio, self.aconf = jax_dit.load_tower(os.path.join(snap, "audio_dit"))
-    self.bridge, self.bconf = jax_dit.load_bridge(os.path.join(snap, "dual_tower_bridge"))
-    self.audio = jax_dit.place(self.audio, mesh, resident=self.resident, fp8=self.fp8)
-    self.bridge = jax_dit.place(self.bridge, mesh, resident=self.resident, fp8=self.fp8)
-    self.experts = []
-    for d in ("video_dit", "video_dit_2"):
-      v, self.vconf = jax_dit.load_tower(os.path.join(snap, d))
-      self.experts.append(jax_dit.place(v, mesh, resident=self.resident, fp8=self.fp8))
-      del v
+    else:
+      self.tokenizer = None
+      self._embed = None
+      self._text = None
+      self._prompts = {}
 
     self.audio_len, self.audio_samples = audio_frames(frames, video_fps)
-    patch = tuple(self.vconf["patch_size"])
-    grid = (((frames - 1) // 4 + 1) // patch[0], (height // 8) // patch[1], (width // 8) // patch[2])
-    tokens = grid[0] * grid[1] * grid[2]
-    parts = mesh.shape["tensor"]
+    self._cond_step = None
+    self._vel_rel = None
+    self.sparse_density = 1.0
 
-    # Precompute sharded RoPE tables once on the mesh (avoids baking 271 MB into HLO).
-    vhd = self.vconf["dim"] // self.vconf["num_heads"]
-    ahd = self.aconf["dim"] // self.aconf["num_heads"]
-    vcos_np, vsin_np = jax_dit.video_rope(*grid, vhd)
-    acos_np, asin_np = jax_dit.audio_rope(self.audio_len, ahd)
-    (bvc_np, bvs_np), (bac_np, bas_np) = jax_dit.bridge_rope(
-        grid, self.audio_len, video_fps, self.bconf["audio_fps"], self.bconf["head_dim"]
-    )
-    use_sp = seq_parallel and tokens % parts == 0 and self.vconf["num_heads"] % parts == 0
-    v_rope_spec = P("tensor", None) if use_sp else P()
-    self._ropes = (
-        self._put(vcos_np, v_rope_spec),
-        self._put(vsin_np, v_rope_spec),
-        self._put(acos_np),
-        self._put(asin_np),
-        (self._put(bvc_np, v_rope_spec), self._put(bvs_np, v_rope_spec)),
-        (self._put(bac_np), self._put(bas_np)),
-    )
+    # DiT: both experts + audio + bridge (whole-resident on v7x, optional W8A8 FP8).
+    if load_dit:
+      self.audio, self.aconf = jax_dit.load_tower(os.path.join(snap, "audio_dit"))
+      self.bridge, self.bconf = jax_dit.load_bridge(os.path.join(snap, "dual_tower_bridge"))
+      self.audio = jax_dit.place(self.audio, mesh, resident=self.resident, fp8=self.fp8)
+      self.bridge = jax_dit.place(self.bridge, mesh, resident=self.resident, fp8=self.fp8)
+      self.experts = []
+      for d in ("video_dit", "video_dit_2"):
+        v, self.vconf = jax_dit.load_tower(os.path.join(snap, d))
+        self.experts.append(jax_dit.place(v, mesh, resident=self.resident, fp8=self.fp8))
+        del v
 
-    need_vel = self.step_cache_thresh > 0.0
-    attn = jax_dit.make_attention(mesh, qk_fp8=self.qk_fp8, block_kv=self.block_kv)
-    if use_sp:
-      blocks_dense = jax_dit.make_dual_blocks_fn(
-          mesh, self.vconf, self.aconf, self.bconf,
-          self.experts[0], self.audio, self.bridge,
-          resident=self.resident, qk_fp8=self.qk_fp8, block_kv=self.block_kv,
+      patch = tuple(self.vconf["patch_size"])
+      grid = (((frames - 1) // 4 + 1) // patch[0], (height // 8) // patch[1], (width // 8) // patch[2])
+      tokens = grid[0] * grid[1] * grid[2]
+      parts = mesh.shape["tensor"]
+
+      # Precompute sharded RoPE tables once on the mesh (avoids baking 271 MB into HLO).
+      vhd = self.vconf["dim"] // self.vconf["num_heads"]
+      ahd = self.aconf["dim"] // self.aconf["num_heads"]
+      vcos_np, vsin_np = jax_dit.video_rope(*grid, vhd)
+      acos_np, asin_np = jax_dit.audio_rope(self.audio_len, ahd)
+      (bvc_np, bvs_np), (bac_np, bas_np) = jax_dit.bridge_rope(
+          grid, self.audio_len, video_fps, self.bconf["audio_fps"], self.bconf["head_dim"]
       )
-      self._step = make_step(self.vconf, self.aconf, self.bconf, video_fps,
-                             attention=attn, blocks_fn=blocks_dense, ropes=self._ropes,
-                             return_vel=need_vel)
-      if self.sparse_window > 0:
-        bq_sp, bkv_sp, _ = jax_dit.resolve_mova_sparse_blocks(
-            tokens, self.vconf["dim"] // self.vconf["num_heads"], block_kv=self.block_kv
-        )
-        sp_table = jax_dit.build_mova_sparse_kv_table(
-            grid, self.sparse_window, block_q=bq_sp, block_kv=bkv_sp
-        )
-        kept = sum(len(r) for r in sp_table)
-        tot = len(sp_table) * (-(-tokens // min(bkv_sp, tokens)))
-        self.sparse_density = kept / max(1, tot)
-        blocks_sp = jax_dit.make_dual_blocks_fn(
+      use_sp = seq_parallel and tokens % parts == 0 and self.vconf["num_heads"] % parts == 0
+      v_rope_spec = P("tensor", None) if use_sp else P()
+      self._ropes = (
+          self._put(vcos_np, v_rope_spec),
+          self._put(vsin_np, v_rope_spec),
+          self._put(acos_np),
+          self._put(asin_np),
+          (self._put(bvc_np, v_rope_spec), self._put(bvs_np, v_rope_spec)),
+          (self._put(bac_np), self._put(bas_np)),
+      )
+
+      if self.dit_backend == "torchax":
+        from . import torchax_dit
+        blocks_builder = torchax_dit.make_torchax_dual_blocks_fn
+      elif self.dit_backend == "jax":
+        blocks_builder = jax_dit.make_dual_blocks_fn
+      else:
+        raise ValueError(f"Unsupported dit_backend={self.dit_backend!r} (expected 'jax' or 'torchax')")
+
+      use_cfg_skip = (
+          0.0 < self.cfg_skip_after < 1.0
+          and use_sp
+          and self.resident
+          and mesh.shape["cfg"] > 1
+          and tokens % mesh.size == 0
+          and self.vconf["num_heads"] % mesh.size == 0
+      )
+      need_vel = self.step_cache_thresh > 0.0
+      attn = jax_dit.make_attention(mesh, qk_fp8=self.qk_fp8, block_kv=self.block_kv)
+      sp_table = None
+      if use_sp:
+        blocks_dense = blocks_builder(
             mesh, self.vconf, self.aconf, self.bconf,
             self.experts[0], self.audio, self.bridge,
             resident=self.resident, qk_fp8=self.qk_fp8, block_kv=self.block_kv,
-            sparse_kv_table=sp_table,
         )
-        self._sparse_step = make_step(self.vconf, self.aconf, self.bconf, video_fps,
-                                      attention=attn, blocks_fn=blocks_sp, ropes=self._ropes,
-                                      return_vel=need_vel)
-      else:
-        self._sparse_step = None
-        self.sparse_density = 1.0
-    else:
-      self._step = make_step(self.vconf, self.aconf, self.bconf, video_fps,
-                             attention=attn, ropes=self._ropes, return_vel=need_vel)
-      self._sparse_step = None
-      self.sparse_density = 1.0
+        self._step = make_step(self.vconf, self.aconf, self.bconf, video_fps,
+                               attention=attn, blocks_fn=blocks_dense, ropes=self._ropes,
+                               return_vel=need_vel, return_delta=use_cfg_skip)
+        if self.sparse_window > 0:
+          bq_sp, bkv_sp, _ = jax_dit.resolve_mova_sparse_blocks(
+              tokens, self.vconf["dim"] // self.vconf["num_heads"], block_kv=self.block_kv
+          )
+          sp_table = jax_dit.build_mova_sparse_kv_table(
+              grid, self.sparse_window, block_q=bq_sp, block_kv=bkv_sp
+          )
+          kept = sum(len(r) for r in sp_table)
+          tot = len(sp_table) * (-(-tokens // min(bkv_sp, tokens)))
+          self.sparse_density = kept / max(1, tot)
+          blocks_sp = blocks_builder(
+              mesh, self.vconf, self.aconf, self.bconf,
+              self.experts[0], self.audio, self.bridge,
+              resident=self.resident, qk_fp8=self.qk_fp8, block_kv=self.block_kv,
+              sparse_kv_table=sp_table,
+          )
+          self._sparse_step = make_step(self.vconf, self.aconf, self.bconf, video_fps,
+                                        attention=attn, blocks_fn=blocks_sp, ropes=self._ropes,
+                                        return_vel=need_vel, return_delta=use_cfg_skip)
+        else:
+          self._sparse_step = None
 
-    if need_vel:
-      @jax.jit
-      def _vel_rel(vc, vp, ac, ap):
-        rv = jnp.sum(jnp.abs(vc - vp)) / jnp.maximum(jnp.sum(jnp.abs(vc)), jnp.float32(1e-6))
-        ra = jnp.sum(jnp.abs(ac - ap)) / jnp.maximum(jnp.sum(jnp.abs(ac)), jnp.float32(1e-6))
-        return rv, ra
-      self._vel_rel = _vel_rel
+        if use_cfg_skip:
+          # Second 1x8 mesh over the exact same devices: shares resident=True replicated weights (0 extra HBM!),
+          # halves per-chip video tokens & heads (10 -> 5 heads/chip) for ~2x faster late cond-only steps.
+          mesh_1x8 = Mesh(mesh.devices.reshape(1, mesh.size), ("cfg", "tensor"))
+          put_1x8 = lambda a, sp=None: jax.device_put(a, NamedSharding(mesh_1x8, sp or P()))
+          ropes_1x8 = (
+              put_1x8(vcos_np, P("tensor", None)),
+              put_1x8(vsin_np, P("tensor", None)),
+              put_1x8(acos_np),
+              put_1x8(asin_np),
+              (put_1x8(bvc_np, P("tensor", None)), put_1x8(bvs_np, P("tensor", None))),
+              (put_1x8(bac_np), put_1x8(bas_np)),
+          )
+          blocks_cond = blocks_builder(
+              mesh_1x8, self.vconf, self.aconf, self.bconf,
+              self.experts[0], self.audio, self.bridge,
+              resident=True, qk_fp8=self.qk_fp8, block_kv=self.block_kv,
+              sparse_kv_table=sp_table,
+          )
+          self._cond_step = make_cond_step(
+              self.vconf, self.aconf, self.bconf, video_fps,
+              attention=attn, blocks_fn=blocks_cond, ropes=ropes_1x8,
+          )
+      else:
+        self._step = make_step(self.vconf, self.aconf, self.bconf, video_fps,
+                               attention=attn, ropes=self._ropes, return_vel=need_vel)
+        self._sparse_step = None
+
+      if need_vel:
+        @jax.jit
+        def _vel_rel(vc, vp, ac, ap):
+          rv = jnp.sum(jnp.abs(vc - vp)) / jnp.maximum(jnp.sum(jnp.abs(vc)), jnp.float32(1e-6))
+          ra = jnp.sum(jnp.abs(ac - ap)) / jnp.maximum(jnp.sum(jnp.abs(ac)), jnp.float32(1e-6))
+          return rv, ra
+        self._vel_rel = _vel_rel
     else:
-      self._vel_rel = None
+      with open(os.path.join(snap, "video_dit", "config.json")) as f:
+        self.vconf = json.load(f)
+      self.experts = []
+      self.audio = self.bridge = None
+      self._step = self._sparse_step = None
 
     # VAEs: shard on height if (H/8) divides mesh.size, else on width if (W/8) divides mesh.size
     # (fixes 720p where 90 % 8 != 0 while 160 % 8 == 0!), with on-TPU uint8 NDHWC decode (4x smaller D2H).
@@ -398,19 +484,28 @@ class Generator:
     sinusoids = jax_dit.time_sinusoid(t)
     guidance = self._put(np.float32(cfg_scale))
     use_cache = self.step_cache_thresh > 0.0 and self._vel_rel is not None
+    use_cfg_skip = self._cond_step is not None
+    cfg_skip_start = int(round(steps * self.cfg_skip_after)) if use_cfg_skip else steps
     cache_start = max(6, int(round(steps * 0.14)))
     cache_end = steps - max(4, int(round(steps * 0.10)))
     prev_v = prev_a = None
+    cached_dv = cached_da = None
     prev_expert = -1
     accum_err = 0.0
     last_rate = 1.0
     consec = 0
     n_cached = 0
+    n_cond_only = 0
+    cond_since_refresh = 0
+    pos_context = context[0:1] if use_cfg_skip else None
 
     for i in range(steps):
       ex = int(expert[i])
-      # Never reuse cached velocity across the high-noise -> low-noise expert boundary!
+      # Never reuse cached velocity or CFG delta across the high-noise -> low-noise expert boundary!
       same_expert = (ex == prev_expert)
+      if not same_expert:
+        cached_dv = cached_da = None
+        cond_since_refresh = 0
       can_cache = (
           use_cache
           and prev_v is not None
@@ -428,12 +523,59 @@ class Generator:
         n_cached += 1
         continue
 
+      want_cond_only = (
+          use_cfg_skip
+          and i >= cfg_skip_start
+          and same_expert
+          and cached_dv is not None
+          and (self.cfg_skip_refresh == 0 or cond_since_refresh < self.cfg_skip_refresh)
+      )
+      if want_cond_only:
+        # Pure conditional velocity in late low-noise tail avoids integrating stale CFG delta into audio/video latents.
+        delta_scale = self._put(np.float32(0.0))
+        lat_v, lat_a, v_cur, a_cur = self._cond_step(
+            self.experts[ex], self.audio, self.bridge, lat_v, lat_a,
+            condition, pos_context, self._put(sinusoids[i:i + 1]),
+            self._put(s_from[i]), self._put(s_to[i]), guidance,
+            delta_scale, cached_dv, cached_da,
+        )
+        n_cond_only += 1
+        cond_since_refresh += 1
+        if use_cache:
+          if prev_v is not None and same_expert:
+            rv_j, ra_j = self._vel_rel(v_cur, prev_v, a_cur, prev_a)
+            last_rate = max(float(rv_j), 0.7 * float(ra_j)) / float(consec + 1)
+          else:
+            last_rate = 1.0
+          accum_err = 0.0
+          consec = 0
+          prev_v, prev_a = v_cur, a_cur
+        prev_expert = ex
+        continue
+
       step_fn = (
           self._sparse_step
           if (self._sparse_step is not None and i >= self.sparse_dense_steps)
           else self._step
       )
-      if use_cache:
+      if use_cfg_skip:
+        lat_v, lat_a, v_cur, a_cur, cached_dv, cached_da = step_fn(
+            self.experts[ex], self.audio, self.bridge, lat_v, lat_a,
+            condition, context, self._put(sinusoids[i:i + 1]),
+            self._put(s_from[i]), self._put(s_to[i]), guidance,
+        )
+        cond_since_refresh = 0
+        if use_cache:
+          if prev_v is not None and same_expert:
+            rv_j, ra_j = self._vel_rel(v_cur, prev_v, a_cur, prev_a)
+            last_rate = max(float(rv_j), 0.7 * float(ra_j)) / float(consec + 1)
+          else:
+            last_rate = 1.0
+          accum_err = 0.0
+          consec = 0
+          prev_v, prev_a = v_cur, a_cur
+        prev_expert = ex
+      elif use_cache:
         lat_v, lat_a, v_cur, a_cur = step_fn(
             self.experts[ex], self.audio, self.bridge, lat_v, lat_a,
             condition, context, self._put(sinusoids[i:i + 1]),
@@ -453,8 +595,11 @@ class Generator:
             condition, context, self._put(sinusoids[i:i + 1]),
             self._put(s_from[i]), self._put(s_to[i]), guidance,
         )
-    if use_cache:
-      print(f"  [mova/cache] steps={steps} eval={steps - n_cached} cached={n_cached}", flush=True)
+        prev_expert = ex
+    if use_cache or use_cfg_skip:
+      n_full = steps - n_cached - n_cond_only
+      print(f"  [mova/sched] steps={steps} full_cfg={n_full} cond_only_1x8={n_cond_only} cached={n_cached}",
+            flush=True)
     return lat_v, lat_a
 
   def decode(self, lat_v, lat_a):
@@ -506,8 +651,8 @@ def main():
   p = argparse.ArgumentParser(description=__doc__,
                               formatter_class=argparse.RawDescriptionHelpFormatter)
   p.add_argument("--repo", default=REPO)
-  p.add_argument("--image", required=True)
-  p.add_argument("--prompt", required=True)
+  p.add_argument("--image", default="")
+  p.add_argument("--prompt", default="")
   p.add_argument("--negative-prompt", default=NEGATIVE_PROMPT)
   p.add_argument("--height", type=int, default=352)
   p.add_argument("--width", type=int, default=640)
@@ -534,12 +679,22 @@ def main():
   p.add_argument("--step-cache-thresh", type=float, default=0.0,
                  help="Audio+video Velocity TeaCache threshold (0 disables; --lossy uses 0.25)")
   p.add_argument("--step-cache-max-skip", type=int, default=2)
+  p.add_argument("--cfg-skip-after", type=float, default=0.0,
+                 help="Fraction of steps after which to run 1x8 cond-only with smoothly decayed cached CFG delta (0 disables; e.g. 0.60)")
+  p.add_argument("--cfg-skip-refresh", type=int, default=0,
+                 help="Optional full-CFG refresh cadence during --cfg-skip-after (0 = pure smooth decay)")
+  p.add_argument("--dit-backend", choices=("jax", "torchax"), default="jax",
+                 help="DiT execution backend: native JAX (jax) or PyTorch via torchax (torchax)")
   p.add_argument("--lossy", action="store_true",
                  help="Enable MOVA fast preset (--qk-fp8 --sparse-window 12 --sparse-dense-steps 8 --step-cache-thresh 0.25)")
+  p.add_argument("--encode-only", default="", help="Stage 0 only: save condition + text context + noise to .npz and exit (skips 31B DiT)")
+  p.add_argument("--decode-latents", default="", help="Stage 3 only: decode denoised latents .npz to --output mp4 (skips text & DiT)")
   p.add_argument("--vae-chunk", type=int, default=None, help="Wan VAE chunk size in latent frames (default: 8 on v7x, 4 on v6e)")
   p.add_argument("--output", default="mova.mp4")
   p.add_argument("--compile-cache-dir", default="~/.cache/mova_jax")
   args = p.parse_args()
+  if not args.decode_latents and (not args.image or not args.prompt):
+    p.error("--image and --prompt are required unless --decode-latents is set")
   if args.lossy:
     args.qk_fp8 = True
     if args.sparse_window == 0:
@@ -555,7 +710,7 @@ def main():
     jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
   n = len(jax.devices())
   if not args.cfg:
-    hbm = jax.devices()[0].memory_stats().get("bytes_limit", 0)
+    hbm = (jax.devices()[0].memory_stats() or {}).get("bytes_limit", 0)
     big = args.height * args.width > 480 * 832 and hbm < 64 * 2**30
     args.cfg = 2 if n >= 8 and not big else 1
   cfg = args.cfg
@@ -563,6 +718,9 @@ def main():
     raise SystemExit(f"--cfg must be 1 or 2 and divide the {n} chips (got {cfg})")
   mesh = Mesh(mesh_utils.create_device_mesh((cfg, n // cfg)), ("cfg", "tensor"))
   print(f"mesh cfg={cfg} x tensor={n // cfg}, {jax.devices()[0].device_kind}", flush=True)
+
+  load_dit = not (args.encode_only or args.decode_latents)
+  load_text = not bool(args.decode_latents)
   t0 = time.perf_counter()
   gen = Generator(
       args.repo, mesh, height=args.height, width=args.width, frames=args.frames,
@@ -570,13 +728,55 @@ def main():
       resident=args.resident, fp8=args.fp8, qk_fp8=args.qk_fp8, block_kv=args.block_kv,
       sparse_window=args.sparse_window, sparse_dense_steps=args.sparse_dense_steps,
       step_cache_thresh=args.step_cache_thresh, step_cache_max_skip=args.step_cache_max_skip,
+      cfg_skip_after=args.cfg_skip_after, cfg_skip_refresh=args.cfg_skip_refresh,
+      dit_backend=args.dit_backend, load_dit=load_dit, load_text=load_text,
   )
   print(
-      f"load: {time.perf_counter() - t0:.1f}s (resident={gen.resident}, fp8={gen.fp8}, "
-      f"qk_fp8={gen.qk_fp8}, sparse_w={gen.sparse_window} [{gen.sparse_density:.1%}], "
-      f"cache={gen.step_cache_thresh})",
+      f"load: {time.perf_counter() - t0:.1f}s (backend={gen.dit_backend}, resident={gen.resident}, "
+      f"fp8={gen.fp8}, qk_fp8={gen.qk_fp8}, sparse_w={gen.sparse_window} [{gen.sparse_density:.1%}], "
+      f"cache={gen.step_cache_thresh}, cfg_skip={gen.cfg_skip_after})",
       flush=True,
   )
+
+  if args.encode_only:
+    t0 = time.perf_counter()
+    image = crop_and_resize(Image.open(args.image), args.height, args.width)
+    pos = gen.encode_text(args.prompt)
+    neg = gen.encode_text(args.negative_prompt)
+    context = jnp.concatenate([pos, neg], 0)
+    condition = gen.condition(image)
+    lat_v, lat_a = gen.noise(args.seed)
+    t_sched, s_from, s_to, expert = schedule(args.steps, args.shift)
+    sinusoids = jax_dit.time_sinusoid(t_sched)
+    os.makedirs(os.path.dirname(os.path.abspath(args.encode_only)), exist_ok=True)
+    np.savez(
+        args.encode_only,
+        context=np.asarray(context, dtype=np.float32),
+        condition=np.asarray(condition, dtype=np.float32),
+        lat_v=np.asarray(lat_v, dtype=np.float32),
+        lat_a=np.asarray(lat_a, dtype=np.float32),
+        t=t_sched.astype(np.float32),
+        s_from=s_from.astype(np.float32),
+        s_to=s_to.astype(np.float32),
+        expert=expert.astype(np.int32),
+        sinusoids=sinusoids.astype(np.float32),
+        height=np.int32(args.height),
+        width=np.int32(args.width),
+        frames=np.int32(args.frames),
+        fps=np.float32(args.fps),
+    )
+    print(f"wrote Stage 0 conditioning to {args.encode_only} in {time.perf_counter() - t0:.2f}s", flush=True)
+    return
+
+  if args.decode_latents:
+    t0 = time.perf_counter()
+    lat = np.load(args.decode_latents, allow_pickle=False)
+    frames, audio = gen.decode(jnp.asarray(lat["lat_v"]), jnp.asarray(lat["lat_a"]))
+    save_mp4(args.output, frames, audio, args.fps)
+    print(f"decoded {args.decode_latents} -> {args.output} in {time.perf_counter() - t0:.2f}s "
+          f"({frames.shape}, {len(audio) / 48000:.2f} s audio)", flush=True)
+    return
+
   image = crop_and_resize(Image.open(args.image), args.height, args.width)
   for i in range(args.runs):
     t0 = time.perf_counter()
